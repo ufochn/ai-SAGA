@@ -3,8 +3,6 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 持久化存储服务
-/// 用于保存页面内容状态，app关闭后数据不丢失
-/// 各项内容分别存储在不同的 key 中
 class StorageService {
   static const String _keyMainText = 'main_text';
   static const String _keyButton1Content = 'button1_content';
@@ -16,8 +14,11 @@ class StorageService {
   static const String _keyPartnerName = 'partner_name';
   static const String _keyPartnerGender = 'partner_gender';
   static const String _keyPartnerTraits = 'partner_traits';
+  static const String _keyRegion = 'region';
   //用来限制用户调取ai api频率的标识码
   static const String _keyUserUniqueId = 'user_unique_id';
+  // 夜间模式
+  static const String _keyIsDarkMode = 'is_dark_mode';
 
   static late SharedPreferences _prefs;
 
@@ -53,6 +54,30 @@ class StorageService {
   /// 获取用户唯一标识
   static String getUserUniqueId() {
     return _prefs.getString(_keyUserUniqueId) ?? '';
+  }
+
+  // ---- 夜间模式 ----
+
+  /// 保存夜间模式偏好
+  static Future<void> saveIsDarkMode(bool isDarkMode) async {
+    await _prefs.setBool(_keyIsDarkMode, isDarkMode);
+  }
+
+  /// 读取夜间模式偏好
+  static bool getIsDarkMode() {
+    return _prefs.getBool(_keyIsDarkMode) ?? false;
+  }
+
+  // ---- 地区 ----
+
+  /// 保存用户选择的地区
+  static Future<void> saveRegion(String region) async {
+    await _prefs.setString(_keyRegion, region);
+  }
+
+  /// 读取用户选择的地区
+  static String getRegion() {
+    return _prefs.getString(_keyRegion) ?? '';
   }
 
   // ---- 主文本内容（初始"正"字） ----
@@ -180,6 +205,11 @@ class StorageService {
     return _prefs.getString(_keyPartnerTraits) ?? '';
   }
 
+  /// 仅重置初始化状态（不清除其他数据），用于返回地区选择页面
+  static Future<void> resetInitialization() async {
+    await _prefs.setBool(_keyIsInitialized, false);
+  }
+
   /// 清除所有持久化数据（将所有内容设为空字符串）
   /// 注意：不删除用户唯一标识
   static Future<void> clearAll() async {
@@ -192,6 +222,7 @@ class StorageService {
     await _prefs.setString(_keyPartnerName, '');
     await _prefs.setString(_keyPartnerGender, '');
     await _prefs.setString(_keyPartnerTraits, '');
+    await _prefs.setString(_keyRegion, '');
     await _prefs.setBool(_keyIsInitialized, false);
   }
 }

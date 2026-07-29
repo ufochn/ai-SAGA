@@ -1,6 +1,8 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/sound_service.dart';
 
-/// 输入框和确定输入按钮组件
+/// 输入框和确定输入按钮组件（iOS风格）
 class TextInputPanel extends StatefulWidget {
   final void Function(String text) onConfirm;
 
@@ -22,54 +24,84 @@ class _TextInputPanelState extends State<TextInputPanel> {
   @override
   Widget build(BuildContext context) {
     final bool hasText = _textController.text.isNotEmpty;
+    final isDark = AppTheme.isDark(context);
 
     return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 8,
-        horizontal: MediaQuery.of(context).size.width * 0.025,
-      ),
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // 输入框（支持多行自动换行，占据剩余空间）
+          // 输入框（iOS风格）
           Expanded(
-            child: TextField(
-              controller: _textController,
-              maxLines: 5,
-              minLines: 1,
-              keyboardType: TextInputType.multiline,
-              textInputAction: TextInputAction.newline,
-              decoration: const InputDecoration(
-                hintText: '输入文字...',
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
+            child: Container(
+              decoration: BoxDecoration(
+                color: isDark
+                    ? AppTheme.fieldBackgroundDark
+                    : AppTheme.fieldBackgroundLight,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: isDark
+                      ? AppTheme.inputBorderDark
+                      : AppTheme.inputBorderLight,
+                  width: 1.0,
                 ),
               ),
-              onChanged: (_) => setState(() {}),
+              child: CupertinoTextField(
+                controller: _textController,
+                maxLines: 5,
+                minLines: 1,
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                placeholder: '输入文字...',
+                placeholderStyle: TextStyle(
+                  color: isDark
+                      ? AppTheme.tertiaryTextDark
+                      : AppTheme.tertiaryTextLight,
+                ),
+                padding: const EdgeInsets.all(12),
+                decoration: null,
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.primaryTextDark
+                      : AppTheme.primaryTextLight,
+                  fontSize: 17,
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
             ),
           ),
-          const SizedBox(width: 12),
-          // 确定输入按钮（在输入框右侧）
+          const SizedBox(width: 10),
+          // 确定输入按钮
           SizedBox(
-            width: 100,
-            child: ElevatedButton(
+            width: 80,
+            height: 44,
+            child: CupertinoButton.filled(
               onPressed: hasText
                   ? () {
+                      SoundService.playConfirm();
                       widget.onConfirm(_textController.text);
                       _textController.clear();
                       setState(() {});
                     }
                   : null,
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 12),
-              ),
+              borderRadius: BorderRadius.circular(10),
+              padding: EdgeInsets.zero,
+              color: isDark
+                  ? AppTheme.buttonFillDark
+                  : AppTheme.buttonFillLight,
+              disabledColor: isDark
+                  ? const Color(0xFF2C2C2E)
+                  : const Color(0xFFF2F2F7),
               child: Text(
-                '确定输入',
+                '确定',
                 style: TextStyle(
-                  fontSize: 16,
-                  color: hasText ? null : Colors.grey,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: hasText
+                      ? AppTheme.buttonText
+                      : (isDark
+                            ? AppTheme.buttonDisabledTextDark
+                            : AppTheme.buttonDisabledTextLight),
                 ),
               ),
             ),

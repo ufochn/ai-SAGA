@@ -1,6 +1,8 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/sound_service.dart';
 
-/// 页面中的通用按钮组件
+/// 页面中的通用按钮组件（iOS风格）
 class PositionButton extends StatelessWidget {
   final String label;
   final VoidCallback? onPressed;
@@ -9,16 +11,38 @@ class PositionButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = AppTheme.isDark(context);
     return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 8,
-        horizontal: MediaQuery.of(context).size.width * 0.025,
-      ),
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
       child: SizedBox(
         width: double.infinity,
-        child: ElevatedButton(
-          onPressed: onPressed,
-          child: Text(label, style: const TextStyle(fontSize: 16)),
+        height: 44,
+        child: CupertinoButton.filled(
+          onPressed: onPressed != null
+              ? () {
+                  SoundService.playClick();
+                  onPressed!();
+                }
+              : null,
+          borderRadius: BorderRadius.circular(12),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          color: isDark ? AppTheme.buttonFillDark : AppTheme.buttonFillLight,
+          disabledColor: isDark
+              ? const Color(0xFF2C2C2E)
+              : const Color(0xFFF2F2F7),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+              color: onPressed != null
+                  ? AppTheme.buttonText
+                  : (isDark
+                        ? AppTheme.buttonDisabledTextDark
+                        : AppTheme.buttonDisabledTextLight),
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
         ),
       ),
     );

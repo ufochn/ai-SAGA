@@ -1,10 +1,14 @@
-import 'package:flutter/material.dart';
-import 'package:flutter_application_1/widgets/character_text.dart';
-import 'package:flutter_application_1/widgets/position_button.dart';
-import 'package:flutter_application_1/widgets/text_input_panel.dart';
-import 'package:flutter_application_1/widgets/initialization_page.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:ai_saga/widgets/character_text.dart';
+import 'package:ai_saga/widgets/position_button.dart';
+import 'package:ai_saga/widgets/text_input_panel.dart';
+import 'package:ai_saga/widgets/initialization_page.dart';
+import 'package:ai_saga/widgets/character_setup_page.dart';
 
-import 'package:flutter_application_1/logic/storage_service.dart';
+import 'package:ai_saga/logic/storage_service.dart';
+
+/// 用于控制菜单按钮显示/隐藏的通知器
+final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
 
 /// 字符流生成器 - 用于生成重复的字符序列
 class CharacterStream {
@@ -20,8 +24,6 @@ class CharacterStream {
 }
 
 /// 页面主体内容组件 - 综合文字、按钮和输入框的混合布局
-/// 固定布局格式：文字 → 按钮1 → 按钮2 → 输入框(含附属按钮)
-/// 输入框限制了最大高度，保证下方按钮始终在屏幕内
 class HomeContent extends StatefulWidget {
   const HomeContent({super.key});
 
@@ -35,12 +37,14 @@ class _HomeContentState extends State<HomeContent> {
   String _button2Content = '';
   String _inputContent = '';
   final ScrollController _scrollController = ScrollController();
-  bool _showInitialization = false;
+  late final PageController _pageController;
+
+  /// 0=地区选择, 1=角色设定, 2=完成
+  int _setupStep = 0;
 
   @override
   void initState() {
     super.initState();
-    // 从存储恢复各项内容
     if (StorageService.hasMainText()) {
       _mainText = StorageService.getMainText();
     } else {
@@ -52,12 +56,18 @@ class _HomeContentState extends State<HomeContent> {
     _button2Content = StorageService.getButton2Content();
     _inputContent = StorageService.getInputContent();
 
-    // 如果主文本为空且未初始化，显示初始化页面
-    if (_mainText.isEmpty && !StorageService.isInitialized()) {
-      _showInitialization = true;
+    if (!StorageService.isInitialized()) {
+      _setupStep = 0;
+      showMenuNotifier.value = false;
+    } else {
+      _setupStep = 2;
+      showMenuNotifier.value = true;
     }
 
-    // 首次加载完成后滚动到底部
+    _pageController = PageController(
+      initialPage: _setupStep < 2 ? _setupStep : 0,
+    );
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -68,6 +78,7 @@ class _HomeContentState extends State<HomeContent> {
   @override
   void dispose() {
     _scrollController.dispose();
+    _pageController.dispose();
     super.dispose();
   }
 
@@ -98,37 +109,74 @@ class _HomeContentState extends State<HomeContent> {
 
   @override
   Widget build(BuildContext context) {
-    if (_showInitialization) {
-      return InitializationPage(
-        onComplete: () {
-          setState(() {
-            _showInitialization = false;
-          });
-        },
-      );
-    }
-
-    return SingleChildScrollView(
-      controller: _scrollController,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // 文字
-          CharacterText(text: _fullText),
-          // 与按钮1之间的空行间距
-          const SizedBox(height: 20),
-          // 按钮1 - 在文本末尾添加"按钮1"
-          PositionButton(label: '按钮', onPressed: _onButton1Pressed),
-          // 与按钮2之间的空行间距
-          const SizedBox(height: 20),
-          // 按钮2 - 在文本末尾添加"按钮2"
-          PositionButton(label: '按钮', onPressed: _onButton2Pressed),
-          // 与输入框之间的空行间距
-          const SizedBox(height: 20),
-          // 输入框和确定输入按钮（输入框最大5行，不会无限撑高）
-          TextInputPanel(onConfirm: _onInputConfirm),
-        ],
-      ),
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 600),
+      switchInCurve: const Cubic(0.22, 1.0, 0.36, 1.0),
+      switchOutCurve: const Cubic(0.22, 1.0, 0.36, 1.0),
+      transitionBuilder: (Widget child, Animation<double> animation) {
+        return FadeTransition(opacity: animation, child: child);
+      },
+      child: _setupStep < 2
+          ? KeyedSubtree(
+              key: const ValueKey('setup_pages'),
+              child: PageView(
+                controller: _pageController,
+                physics: const NeverScrollableScrollPhysics(),
+                onPageChanged: (page) {
+                  setState(() {
+                    _setupStep = page;
+                    showMenuNotifier.value = false;
+                  });
+                },
+                children: [
+                  // 第0页：地区选择
+                  InitializationPage(
+                    onComplete: () {
+                      _pageController.animateToPage(
+                        1,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                  ),
+                  // 第1页：角色设定
+                  CharacterSetupPage(
+                    onComplete: () {
+                      setState(() {
+                        _setupStep = 2;
+                        showMenuNotifier.value = true;
+                      });
+                    },
+                    onBack: () {
+                      _pageController.animateToPage(
+                        0,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                  ),
+                ],
+              ),
+            )
+          : KeyedSubtree(
+              key: const ValueKey('main_content'),
+              child: SingleChildScrollView(
+                controller: _scrollController,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    CharacterText(text: _fullText),
+                    const SizedBox(height: 12),
+                    PositionButton(label: '按钮', onPressed: _onButton1Pressed),
+                    const SizedBox(height: 12),
+                    PositionButton(label: '按钮', onPressed: _onButton2Pressed),
+                    const SizedBox(height: 12),
+                    TextInputPanel(onConfirm: _onInputConfirm),
+                    const SizedBox(height: 24),
+                  ],
+                ),
+              ),
+            ),
     );
   }
 }

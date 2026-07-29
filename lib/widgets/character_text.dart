@@ -1,6 +1,7 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:ai_saga/logic/app_theme.dart';
 
-/// 字符文本显示组件
+/// 字符文本显示组件（iOS风格）
 class CharacterText extends StatelessWidget {
   final String text;
 
@@ -8,12 +9,29 @@ class CharacterText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = AppTheme.isDark(context);
     return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: 1,
-        horizontal: MediaQuery.of(context).size.width * 0.025,
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: isDark
+              ? AppTheme.cardBackgroundDark
+              : AppTheme.cardBackgroundLight,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(
+            fontSize: 17,
+            color: isDark
+                ? AppTheme.primaryTextDark
+                : AppTheme.primaryTextLight,
+            height: 1.5,
+          ),
+        ),
       ),
-      child: Text(text, style: const TextStyle(fontSize: 18)),
     );
   }
 }

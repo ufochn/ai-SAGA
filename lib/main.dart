@@ -1,10 +1,22 @@
-import 'package:flutter/material.dart';
-import 'package:flutter_application_1/logic/home_content.dart';
-import 'package:flutter_application_1/logic/storage_service.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:ai_saga/logic/home_content.dart';
+import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/sound_service.dart';
+
+/// 全局主题亮度通知器
+final ValueNotifier<Brightness> themeBrightnessNotifier =
+    ValueNotifier<Brightness>(
+      StorageService.getIsDarkMode() ? Brightness.dark : Brightness.light,
+    );
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await StorageService.init();
+  // 初始化时读取存储的夜间模式偏好
+  themeBrightnessNotifier.value = StorageService.getIsDarkMode()
+      ? Brightness.dark
+      : Brightness.light;
   runApp(const MyApp());
 }
 
@@ -13,12 +25,40 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Hello World',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const SplashScreen(),
+    return ListenableBuilder(
+      listenable: themeBrightnessNotifier,
+      builder: (context, _) {
+        final isDark = themeBrightnessNotifier.value == Brightness.dark;
+        return CupertinoApp(
+          title: 'Hello World',
+          debugShowCheckedModeBanner: false,
+          theme: CupertinoThemeData(
+            brightness: themeBrightnessNotifier.value,
+            primaryColor: isDark
+                ? AppTheme.accentBlueDark
+                : AppTheme.accentBlueLight,
+            scaffoldBackgroundColor: isDark
+                ? AppTheme.pageBackgroundDark
+                : AppTheme.pageBackgroundLight,
+            textTheme: CupertinoTextThemeData(
+              textStyle: TextStyle(
+                fontFamily: '.SF Pro Display',
+                fontSize: 17,
+                color: isDark
+                    ? AppTheme.primaryTextDark
+                    : AppTheme.primaryTextLight,
+              ),
+              primaryColor: isDark
+                  ? AppTheme.accentBlueDark
+                  : AppTheme.accentBlueLight,
+            ),
+            barBackgroundColor: isDark
+                ? AppTheme.pageBackgroundDark
+                : AppTheme.pageBackgroundLight,
+          ),
+          home: const SplashScreen(),
+        );
+      },
     );
   }
 }
@@ -40,29 +80,42 @@ class _SplashScreenState extends State<SplashScreen>
     super.initState();
     _animationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1000),
+      duration: const Duration(milliseconds: 1600),
     );
     _fadeOutAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(parent: _animationController, curve: Curves.easeInOut),
+      CurvedAnimation(
+        parent: _animationController,
+        curve: const Cubic(0.22, 1.0, 0.36, 1.0), // Apple easeInOutCubic
+      ),
     );
 
-    // Wait 14 seconds, then start the 1-second fade-out animation
-    Future.delayed(const Duration(seconds: 14), () {
+    // 2秒后开始封面淡出
+    Future.delayed(const Duration(seconds: 2), () {
       _animationController.forward();
     });
 
-    // After the fade animation completes (15 seconds total), navigate to main page
-    Future.delayed(const Duration(seconds: 15), () {
+    // 淡出动画结束后执行页面切换（与淡出重叠），同时播放恐怖音效
+    Future.delayed(const Duration(milliseconds: 2600), () {
+      SoundService.playHorror();
       if (mounted) {
         Navigator.of(context).pushReplacement(
+          // Apple 风格的交叉溶解过渡（cross dissolve）
           PageRouteBuilder(
             pageBuilder: (context, animation, secondaryAnimation) =>
                 const MyHomePage(),
             transitionsBuilder:
                 (context, animation, secondaryAnimation, child) {
-                  return FadeTransition(opacity: animation, child: child);
+                  return FadeTransition(
+                    opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
+                      CurvedAnimation(
+                        parent: animation,
+                        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+                      ),
+                    ),
+                    child: child,
+                  );
                 },
-            transitionDuration: const Duration(milliseconds: 1000),
+            transitionDuration: const Duration(milliseconds: 1200),
           ),
         );
       }
@@ -75,20 +128,96 @@ class _SplashScreenState extends State<SplashScreen>
     super.dispose();
   }
 
+  /// 根据地区返回对应语言的标题
+  String _getLocalizedTitle(String region) {
+    switch (region) {
+      case 'taiwan':
+      case 'hongkong':
+        return 'AI 傳奇';
+      case 'singapore':
+      case 'usa':
+        return 'AI SAGA';
+      case 'japan':
+        return 'AI サーガ';
+      case 'korea':
+        return 'AI 사가';
+      default:
+        return 'AI SAGA';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final isDark = AppTheme.isDark(context);
+    final region = StorageService.getRegion();
+    final hasRegion = region.isNotEmpty;
+
     return FadeTransition(
       opacity: _fadeOutAnimation,
-      child: Scaffold(
-        body: Center(
-          child: Text(
-            '封面',
-            style: TextStyle(
-              fontSize: 48,
-              fontWeight: FontWeight.bold,
-              color: Theme.of(context).colorScheme.primary,
-            ),
-          ),
+      child: CupertinoPageScaffold(
+        backgroundColor: isDark
+            ? AppTheme.pageBackgroundDark
+            : AppTheme.pageBackgroundLight,
+        child: Center(
+          child: hasRegion
+              ? Text(
+                  _getLocalizedTitle(region),
+                  style: TextStyle(
+                    fontSize: 48,
+                    fontWeight: FontWeight.w600,
+                    color: isDark
+                        ? AppTheme.accentBlueDark
+                        : AppTheme.accentBlueLight,
+                  ),
+                )
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'AI SAGA',
+                      style: TextStyle(
+                        fontSize: 48,
+                        fontWeight: FontWeight.w600,
+                        color: isDark
+                            ? AppTheme.accentBlueDark
+                            : AppTheme.accentBlueLight,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'AI 傳奇',
+                      style: TextStyle(
+                        fontSize: 48,
+                        fontWeight: FontWeight.w600,
+                        color: isDark
+                            ? AppTheme.accentBlueDark
+                            : AppTheme.accentBlueLight,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'AI サーガ',
+                      style: TextStyle(
+                        fontSize: 48,
+                        fontWeight: FontWeight.w600,
+                        color: isDark
+                            ? AppTheme.accentBlueDark
+                            : AppTheme.accentBlueLight,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'AI 사가',
+                      style: TextStyle(
+                        fontSize: 48,
+                        fontWeight: FontWeight.w600,
+                        color: isDark
+                            ? AppTheme.accentBlueDark
+                            : AppTheme.accentBlueLight,
+                      ),
+                    ),
+                  ],
+                ),
         ),
       ),
     );
@@ -105,284 +234,517 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   int _homeContentKey = 0;
 
-  void _showMenuDialog() {
-    showDialog(
+  // ---- 菜单文本本地化 ----
+
+  /// 菜单标题
+  String _getMenuTitle() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '選單';
+      case 'singapore':
+      case 'usa':
+        return 'Menu';
+      case 'japan':
+        return 'メニュー';
+      case 'korea':
+        return '메뉴';
+      default:
+        return '菜单';
+    }
+  }
+
+  /// 订阅管理
+  String _getSubscriptionText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '訂閱管理';
+      case 'singapore':
+      case 'usa':
+        return 'Subscription';
+      case 'japan':
+        return 'サブスクリプション';
+      case 'korea':
+        return '구독 관리';
+      default:
+        return '订阅管理';
+    }
+  }
+
+  /// 日间模式
+  String _getDayModeText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '日間模式';
+      case 'singapore':
+      case 'usa':
+        return 'Light Mode';
+      case 'japan':
+        return 'ライトモード';
+      case 'korea':
+        return '라이트 모드';
+      default:
+        return '日间模式';
+    }
+  }
+
+  /// 夜间模式
+  String _getNightModeText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '夜間模式';
+      case 'singapore':
+      case 'usa':
+        return 'Dark Mode';
+      case 'japan':
+        return 'ダークモード';
+      case 'korea':
+        return '다크 모드';
+      default:
+        return '夜间模式';
+    }
+  }
+
+  /// 重新开始
+  String _getRestartText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '重新開始';
+      case 'singapore':
+      case 'usa':
+        return 'Restart';
+      case 'japan':
+        return '最初から';
+      case 'korea':
+        return '다시 시작';
+      default:
+        return '重新开始';
+    }
+  }
+
+  /// 继续游玩
+  String _getContinuePlayingText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '繼續遊玩';
+      case 'singapore':
+      case 'usa':
+        return 'Continue Playing';
+      case 'japan':
+        return '続けて遊ぶ';
+      case 'korea':
+        return '계속하기';
+      default:
+        return '继续游玩';
+    }
+  }
+
+  void _showMenuSheet() {
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    showCupertinoModalPopup(
       context: context,
-      builder: (context) => AlertDialog(
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                  _showSubscriptionDialog();
-                },
-                child: const Text('订阅管理'),
+      builder: (context) => CupertinoActionSheet(
+        title: Text(
+          _getMenuTitle(),
+          style: TextStyle(
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: isDark
+                ? AppTheme.primaryTextDark
+                : AppTheme.primaryTextLight,
+          ),
+        ),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _showSubscriptionSheet();
+            },
+            child: Text(
+              _getSubscriptionText(),
+              style: TextStyle(
+                color: isDark
+                    ? AppTheme.primaryTextDark
+                    : AppTheme.primaryTextLight,
               ),
             ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                  _showConfirmRestartDialog();
-                },
-                child: const Text('重新开始'),
+          ),
+          // 夜间模式切换
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _toggleDarkMode();
+            },
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  isDark
+                      ? CupertinoIcons.sun_max_fill
+                      : CupertinoIcons.moon_fill,
+                  size: 18,
+                  color: isDark
+                      ? AppTheme.primaryTextDark
+                      : AppTheme.primaryTextLight,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  isDark ? _getDayModeText() : _getNightModeText(),
+                  style: TextStyle(
+                    color: isDark
+                        ? AppTheme.primaryTextDark
+                        : AppTheme.primaryTextLight,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _showConfirmRestartDialog();
+            },
+            child: Text(
+              _getRestartText(),
+              style: TextStyle(
+                color: isDark
+                    ? AppTheme.destructiveRedDark
+                    : AppTheme.destructiveRedLight,
               ),
             ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                },
-                child: const Text('继续游玩'),
-              ),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          isDefaultAction: true,
+          onPressed: () {
+            Navigator.of(context).pop();
+          },
+          child: Text(
+            _getContinuePlayingText(),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.accentBlueDark
+                  : AppTheme.accentBlueLight,
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 
-  void _showSubscriptionDialog() {
-    showDialog(
+  void _toggleDarkMode() {
+    final newBrightness = themeBrightnessNotifier.value == Brightness.dark
+        ? Brightness.light
+        : Brightness.dark;
+    themeBrightnessNotifier.value = newBrightness;
+    StorageService.saveIsDarkMode(newBrightness == Brightness.dark);
+  }
+
+  // ---- 订阅/充值相关本地化 ----
+
+  String _getSubscriptionMessage() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '請選擇一個充值方案\n所有價格已含稅，將通過 iTunes 帳戶支付';
+      case 'singapore':
+      case 'usa':
+        return 'Choose a plan\nAll prices include tax, billed through your iTunes account';
+      case 'japan':
+        return 'プランを選択してください\nすべての価格は税込みです。iTunesアカウントから支払われます';
+      case 'korea':
+        return '요금제를 선택하세요\n모든 가격은 세금 포함이며 iTunes 계정으로 결제됩니다';
+      default:
+        return '选择一个充值方案\n所有价格已含税，将通过 iTunes 账户支付';
+    }
+  }
+
+  String _getCaseText(int count) {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '$count 個案件';
+      case 'singapore':
+      case 'usa':
+        return '$count Case${count > 1 ? 's' : ''}';
+      case 'japan':
+        return '$count 件';
+      case 'korea':
+        return '$count개';
+      default:
+        return '$count 个案件';
+    }
+  }
+
+  String _getBestValueText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '超值推薦';
+      case 'singapore':
+      case 'usa':
+        return 'Best Value';
+      case 'japan':
+        return 'おすすめ';
+      case 'korea':
+        return '추천';
+      default:
+        return '超值推荐';
+    }
+  }
+
+  String _getRestorePurchaseText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '恢復購買';
+      case 'singapore':
+      case 'usa':
+        return 'Restore Purchase';
+      case 'japan':
+        return '購入を復元';
+      case 'korea':
+        return '구매 복원';
+      default:
+        return '恢复购买';
+    }
+  }
+
+  String _getCloseText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '關閉';
+      case 'singapore':
+      case 'usa':
+        return 'Close';
+      case 'japan':
+        return '閉じる';
+      case 'korea':
+        return '닫기';
+      default:
+        return '关闭';
+    }
+  }
+
+  String _getRestartConfirmText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '重新開始會清空現在所有進度，遊戲完全重新開始，請再次確認！';
+      case 'singapore':
+      case 'usa':
+        return 'This will clear all progress and restart the game completely. Are you sure?';
+      case 'japan':
+        return 'すべての進行状況がクリアされ、ゲームが最初からやり直しになります。本当によろしいですか？';
+      case 'korea':
+        return '모든 진행 상황이 지워지고 게임이 완전히 다시 시작됩니다. 다시 확인해주세요!';
+      default:
+        return '重新开始会清空现在所有进度，游戏完全重新开始，请再次确认！';
+    }
+  }
+
+  String _getConfirmRestartButtonText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '確認重新開始';
+      case 'singapore':
+      case 'usa':
+        return 'Confirm Restart';
+      case 'japan':
+        return '最初から始める';
+      case 'korea':
+        return '다시 시작 확인';
+      default:
+        return '确认重新开始';
+    }
+  }
+
+  String _getCancelText() {
+    switch (StorageService.getRegion()) {
+      case 'taiwan':
+      case 'hongkong':
+        return '放棄';
+      case 'singapore':
+      case 'usa':
+        return 'Cancel';
+      case 'japan':
+        return 'キャンセル';
+      case 'korea':
+        return '취소';
+      default:
+        return '放弃';
+    }
+  }
+
+  void _showSubscriptionSheet() {
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    showCupertinoModalPopup(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('订阅管理', textAlign: TextAlign.center),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+      builder: (context) => CupertinoActionSheet(
+        title: Text(
+          _getSubscriptionText(),
+          style: TextStyle(
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: isDark
+                ? AppTheme.primaryTextDark
+                : AppTheme.primaryTextLight,
+          ),
+        ),
+        message: Text(
+          _getSubscriptionMessage(),
+          style: TextStyle(
+            fontSize: 13,
+            color: isDark
+                ? AppTheme.secondaryTextDark
+                : AppTheme.secondaryTextLight,
+          ),
+        ),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // 商品列表标题
-                const Text(
-                  '选择一个充值方案',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  '所有价格已含税，将通过 iTunes 账户支付',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                ),
-                const SizedBox(height: 20),
-                // 方案1：0.49美元/1案件
-                Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey.shade300),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      const Text(
-                        '1 个案件',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '¥3.50',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '≈ \$0.49 USD',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade600,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () {
-                            // 0.49美元购买1个案件 - 预留IAP支付功能
-                            Navigator.of(context).pop();
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Theme.of(
-                              context,
-                            ).colorScheme.primary,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                          child: const Text('购买'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                // 方案2：2.99美元/10案件
-                Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: Theme.of(context).colorScheme.primary,
-                      width: 2,
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.primary,
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: const Text(
-                          '超值推荐',
-                          style: TextStyle(color: Colors.white, fontSize: 12),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        '10 个案件',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '¥21.00',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '≈ \$2.99 USD  (每个仅 \$0.299)',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade600,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () {
-                            // 2.99美元购买10个案件 - 预留IAP支付功能
-                            Navigator.of(context).pop();
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Theme.of(
-                              context,
-                            ).colorScheme.primary,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                          child: const Text('购买'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 20),
-                // 恢复购买按钮
-                SizedBox(
-                  width: double.infinity,
-                  child: OutlinedButton(
-                    onPressed: () {
-                      // 预留恢复购买功能
-                      Navigator.of(context).pop();
-                    },
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                    child: const Text('恢复购买'),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                // 隐私政策与使用条款
-                const Text(
-                  '购买确认后，款项将从您的 iTunes 账户扣除。\n'
-                  '除非在当前订阅期结束前至少 24 小时关闭自动续订，否则订阅将自动续订。\n'
-                  '在当前订阅期结束前 24 小时内，将按所选价格向您的账户收取续订费用。\n'
-                  '您可以在购买后前往 App Store 的「账户设置」管理或取消订阅。',
-                  style: TextStyle(fontSize: 11, color: Colors.grey),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 12),
-                // 隐私政策与使用条款链接
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    GestureDetector(
-                      onTap: () {
-                        // 预留 - 打开隐私政策链接
-                      },
-                      child: const Text(
-                        '隐私政策',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue,
-                          decoration: TextDecoration.underline,
-                        ),
+                    Text(
+                      _getCaseText(1),
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                        color: isDark
+                            ? AppTheme.primaryTextDark
+                            : AppTheme.primaryTextLight,
                       ),
                     ),
-                    const Text('  |  ', style: TextStyle(fontSize: 12)),
-                    GestureDetector(
-                      onTap: () {
-                        // 预留 - 打开使用条款链接
-                      },
-                      child: const Text(
-                        '使用条款',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue,
-                          decoration: TextDecoration.underline,
-                        ),
-                      ),
-                    ),
-                    const Text('  |  ', style: TextStyle(fontSize: 12)),
-                    GestureDetector(
-                      onTap: () {
-                        // 预留 - 打开Apple标准许可协议
-                      },
-                      child: const Text(
-                        'Apple 标准许可协议',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.blue,
-                          decoration: TextDecoration.underline,
-                        ),
+                    Text(
+                      '≈ \$0.49 USD',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: isDark
+                            ? AppTheme.secondaryTextDark
+                            : AppTheme.secondaryTextLight,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 16),
-                // 关闭按钮
-                SizedBox(
-                  width: double.infinity,
-                  child: TextButton(
-                    onPressed: () {
-                      Navigator.of(context).pop();
-                    },
-                    child: const Text('关闭'),
+                Text(
+                  '¥3.50',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: isDark
+                        ? AppTheme.accentBlueDark
+                        : AppTheme.accentBlueLight,
                   ),
                 ),
               ],
+            ),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          margin: const EdgeInsets.only(right: 6),
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.accentBlueDark
+                                : AppTheme.accentBlueLight,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            _getBestValueText(),
+                            style: TextStyle(
+                              color: AppTheme.buttonText,
+                              fontSize: 10,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          _getCaseText(10),
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w500,
+                            color: isDark
+                                ? AppTheme.primaryTextDark
+                                : AppTheme.primaryTextLight,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      '≈ \$2.99 USD (每个仅 \$0.299)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: isDark
+                            ? AppTheme.secondaryTextDark
+                            : AppTheme.secondaryTextLight,
+                      ),
+                    ),
+                  ],
+                ),
+                Text(
+                  '¥21.00',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: isDark
+                        ? AppTheme.accentBlueDark
+                        : AppTheme.accentBlueLight,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            child: Text(
+              _getRestorePurchaseText(),
+              style: TextStyle(
+                color: isDark
+                    ? AppTheme.primaryTextDark
+                    : AppTheme.primaryTextLight,
+              ),
+            ),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          isDefaultAction: true,
+          onPressed: () {
+            Navigator.of(context).pop();
+          },
+          child: Text(
+            _getCloseText(),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.accentBlueDark
+                  : AppTheme.accentBlueLight,
             ),
           ),
         ),
@@ -391,57 +753,110 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _showConfirmRestartDialog() {
-    showDialog(
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    showCupertinoDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              '重新开始会清空现在所有进度，游戏完全重新开始，请再次确认！',
-              style: TextStyle(fontSize: 16),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                  StorageService.clearAll();
-                  setState(() {
-                    _homeContentKey++;
-                  });
-                },
-                child: const Text('确认重新开始游玩'),
-              ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.of(context).pop();
-                },
-                child: const Text('放弃'),
-              ),
-            ),
-          ],
+      builder: (context) => CupertinoAlertDialog(
+        title: Text(
+          _getRestartText(),
+          style: TextStyle(
+            color: isDark
+                ? AppTheme.primaryTextDark
+                : AppTheme.primaryTextLight,
+          ),
         ),
+        content: Text(
+          _getRestartConfirmText(),
+          style: TextStyle(
+            color: isDark
+                ? AppTheme.secondaryTextDark
+                : AppTheme.secondaryTextLight,
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              StorageService.clearAll();
+              setState(() {
+                _homeContentKey++;
+              });
+            },
+            child: Text(
+              _getConfirmRestartButtonText(),
+              style: TextStyle(
+                color: isDark
+                    ? AppTheme.destructiveRedDark
+                    : AppTheme.destructiveRedLight,
+              ),
+            ),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            child: Text(
+              _getCancelText(),
+              style: TextStyle(
+                color: isDark
+                    ? AppTheme.accentBlueDark
+                    : AppTheme.accentBlueLight,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Hello World'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        actions: [
-          IconButton(icon: const Icon(Icons.menu), onPressed: _showMenuDialog),
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    return CupertinoPageScaffold(
+      backgroundColor: isDark
+          ? AppTheme.pageBackgroundDark
+          : AppTheme.pageBackgroundLight,
+      child: Stack(
+        children: [
+          SafeArea(
+            bottom: false,
+            child: HomeContent(key: ValueKey(_homeContentKey)),
+          ),
+          // 右上角菜单按钮（设置过程中隐藏）
+          ValueListenableBuilder<bool>(
+            valueListenable: showMenuNotifier,
+            builder: (context, showMenu, child) {
+              if (!showMenu) return const SizedBox.shrink();
+              return Positioned(
+                top: MediaQuery.of(context).padding.top + 8,
+                right: 16,
+                child: GestureDetector(
+                  onTap: _showMenuSheet,
+                  child: Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: isDark
+                          ? AppTheme.cardBackgroundDark
+                          : AppTheme.cardBackgroundLight,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Icon(
+                      CupertinoIcons.line_horizontal_3,
+                      color: isDark
+                          ? AppTheme.accentBlueDark
+                          : AppTheme.accentBlueLight,
+                      size: 18,
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
         ],
       ),
-      body: HomeContent(key: ValueKey(_homeContentKey)),
     );
   }
 }

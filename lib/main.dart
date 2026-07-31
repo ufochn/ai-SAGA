@@ -128,18 +128,21 @@ class _SplashScreenState extends State<SplashScreen>
     super.dispose();
   }
 
-  /// 根据地区返回对应语言的标题
-  String _getLocalizedTitle(String region) {
-    switch (region) {
-      case 'taiwan':
-      case 'hongkong':
+  /// 根据语言返回对应语言的标题
+  String _getLocalizedTitle(String language) {
+    switch (language) {
+      case 'zh-TW':
+      case 'yue':
         return 'AI 傳奇';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'AI SAGA';
-      case 'japan':
+      case 'ja':
         return 'AI サーガ';
-      case 'korea':
+      case 'ko':
         return 'AI 사가';
       default:
         return 'AI SAGA';
@@ -149,8 +152,8 @@ class _SplashScreenState extends State<SplashScreen>
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
-    final region = StorageService.getRegion();
-    final hasRegion = region.isNotEmpty;
+    final language = StorageService.getLanguage();
+    final hasLanguage = language.isNotEmpty;
 
     return FadeTransition(
       opacity: _fadeOutAnimation,
@@ -159,9 +162,9 @@ class _SplashScreenState extends State<SplashScreen>
             ? AppTheme.pageBackgroundDark
             : AppTheme.pageBackgroundLight,
         child: Center(
-          child: hasRegion
+          child: hasLanguage
               ? Text(
-                  _getLocalizedTitle(region),
+                  _getLocalizedTitle(language),
                   style: TextStyle(
                     fontSize: 48,
                     fontWeight: FontWeight.w600,
@@ -238,16 +241,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 菜单标题
   String _getMenuTitle() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '選單';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Menu';
-      case 'japan':
+      case 'ja':
         return 'メニュー';
-      case 'korea':
+      case 'ko':
         return '메뉴';
       default:
         return '菜单';
@@ -256,16 +262,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 订阅管理
   String _getSubscriptionText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '訂閱管理';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Subscription';
-      case 'japan':
+      case 'ja':
         return 'サブスクリプション';
-      case 'korea':
+      case 'ko':
         return '구독 관리';
       default:
         return '订阅管理';
@@ -274,16 +283,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 日间模式
   String _getDayModeText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '日間模式';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Light Mode';
-      case 'japan':
+      case 'ja':
         return 'ライトモード';
-      case 'korea':
+      case 'ko':
         return '라이트 모드';
       default:
         return '日间模式';
@@ -292,16 +304,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 夜间模式
   String _getNightModeText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '夜間模式';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Dark Mode';
-      case 'japan':
+      case 'ja':
         return 'ダークモード';
-      case 'korea':
+      case 'ko':
         return '다크 모드';
       default:
         return '夜间模式';
@@ -310,16 +325,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 重新开始
   String _getRestartText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '重新開始';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Restart';
-      case 'japan':
+      case 'ja':
         return '最初から';
-      case 'korea':
+      case 'ko':
         return '다시 시작';
       default:
         return '重新开始';
@@ -328,16 +346,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
   /// 继续游玩
   String _getContinuePlayingText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '繼續遊玩';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Continue Playing';
-      case 'japan':
+      case 'ja':
         return '続けて遊ぶ';
-      case 'korea':
+      case 'ko':
         return '계속하기';
       default:
         return '继续游玩';
@@ -448,16 +469,19 @@ class _MyHomePageState extends State<MyHomePage> {
   // ---- 订阅/充值相关本地化 ----
 
   String _getSubscriptionMessage() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '請選擇一個充值方案\n所有價格已含稅，將通過 iTunes 帳戶支付';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Choose a plan\nAll prices include tax, billed through your iTunes account';
-      case 'japan':
+      case 'ja':
         return 'プランを選択してください\nすべての価格は税込みです。iTunesアカウントから支払われます';
-      case 'korea':
+      case 'ko':
         return '요금제를 선택하세요\n모든 가격은 세금 포함이며 iTunes 계정으로 결제됩니다';
       default:
         return '选择一个充值方案\n所有价格已含税，将通过 iTunes 账户支付';
@@ -465,16 +489,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getCaseText(int count) {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '$count 個案件';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return '$count Case${count > 1 ? 's' : ''}';
-      case 'japan':
+      case 'ja':
         return '$count 件';
-      case 'korea':
+      case 'ko':
         return '$count개';
       default:
         return '$count 个案件';
@@ -482,16 +509,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getBestValueText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '超值推薦';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Best Value';
-      case 'japan':
+      case 'ja':
         return 'おすすめ';
-      case 'korea':
+      case 'ko':
         return '추천';
       default:
         return '超值推荐';
@@ -499,16 +529,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getRestorePurchaseText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '恢復購買';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Restore Purchase';
-      case 'japan':
+      case 'ja':
         return '購入を復元';
-      case 'korea':
+      case 'ko':
         return '구매 복원';
       default:
         return '恢复购买';
@@ -516,16 +549,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getCloseText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '關閉';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Close';
-      case 'japan':
+      case 'ja':
         return '閉じる';
-      case 'korea':
+      case 'ko':
         return '닫기';
       default:
         return '关闭';
@@ -533,16 +569,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getRestartConfirmText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '重新開始會清空現在所有進度，遊戲完全重新開始，請再次確認！';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'This will clear all progress and restart the game completely. Are you sure?';
-      case 'japan':
+      case 'ja':
         return 'すべての進行状況がクリアされ、ゲームが最初からやり直しになります。本当によろしいですか？';
-      case 'korea':
+      case 'ko':
         return '모든 진행 상황이 지워지고 게임이 완전히 다시 시작됩니다. 다시 확인해주세요!';
       default:
         return '重新开始会清空现在所有进度，游戏完全重新开始，请再次确认！';
@@ -550,16 +589,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getConfirmRestartButtonText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '確認重新開始';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Confirm Restart';
-      case 'japan':
+      case 'ja':
         return '最初から始める';
-      case 'korea':
+      case 'ko':
         return '다시 시작 확인';
       default:
         return '确认重新开始';
@@ -567,16 +609,19 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _getCancelText() {
-    switch (StorageService.getRegion()) {
-      case 'taiwan':
-      case 'hongkong':
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
         return '放棄';
-      case 'singapore':
-      case 'usa':
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
         return 'Cancel';
-      case 'japan':
+      case 'ja':
         return 'キャンセル';
-      case 'korea':
+      case 'ko':
         return '취소';
       default:
         return '放弃';

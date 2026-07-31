@@ -3,6 +3,9 @@ import 'package:ai_saga/widgets/character_text.dart';
 import 'package:ai_saga/widgets/position_button.dart';
 import 'package:ai_saga/widgets/text_input_panel.dart';
 import 'package:ai_saga/widgets/initialization_page.dart';
+import 'package:ai_saga/widgets/location_setup_page.dart';
+import 'package:ai_saga/widgets/era_setup_page.dart';
+import 'package:ai_saga/widgets/player_setup_page.dart';
 import 'package:ai_saga/widgets/character_setup_page.dart';
 
 import 'package:ai_saga/logic/storage_service.dart';
@@ -39,7 +42,10 @@ class _HomeContentState extends State<HomeContent> {
   final ScrollController _scrollController = ScrollController();
   late final PageController _pageController;
 
-  /// 0=地区选择, 1=角色设定, 2=完成
+  /// 主角性别: 0=男, 1=女, null=未设定（用于传递给搭档页面决定默认性别）
+  int? _playerGenderIndex;
+
+  /// 0=语言选择, 1=地点设定, 2=年代设定, 3=主角设定, 4=搭档设定, 5=完成
   int _setupStep = 0;
 
   @override
@@ -60,7 +66,7 @@ class _HomeContentState extends State<HomeContent> {
       _setupStep = 0;
       showMenuNotifier.value = false;
     } else {
-      _setupStep = 2;
+      _setupStep = 5;
       showMenuNotifier.value = true;
     }
 
@@ -116,7 +122,7 @@ class _HomeContentState extends State<HomeContent> {
       transitionBuilder: (Widget child, Animation<double> animation) {
         return FadeTransition(opacity: animation, child: child);
       },
-      child: _setupStep < 2
+      child: _setupStep < 5
           ? KeyedSubtree(
               key: const ValueKey('setup_pages'),
               child: PageView(
@@ -129,7 +135,7 @@ class _HomeContentState extends State<HomeContent> {
                   });
                 },
                 children: [
-                  // 第0页：地区选择
+                  // 第0页：语言选择
                   InitializationPage(
                     onComplete: () {
                       _pageController.animateToPage(
@@ -139,17 +145,73 @@ class _HomeContentState extends State<HomeContent> {
                       );
                     },
                   ),
-                  // 第1页：角色设定
+                  // 第1页：地点设定
+                  LocationSetupPage(
+                    onComplete: () {
+                      _pageController.animateToPage(
+                        2,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                    onBack: () {
+                      _pageController.animateToPage(
+                        0,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                  ),
+                  // 第2页：年代设定
+                  EraSetupPage(
+                    onComplete: () {
+                      _pageController.animateToPage(
+                        3,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                    onBack: () {
+                      _pageController.animateToPage(
+                        1,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                  ),
+                  // 第3页：主角设定（性别 + 姓名）
+                  PlayerSetupPage(
+                    onComplete: () {
+                      final genderStr = StorageService.getPlayerGender();
+                      setState(() {
+                        _playerGenderIndex = genderStr == '女' ? 1 : 0;
+                      });
+                      _pageController.animateToPage(
+                        4,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                    onBack: () {
+                      _pageController.animateToPage(
+                        2,
+                        duration: const Duration(milliseconds: 500),
+                        curve: Curves.easeInOut,
+                      );
+                    },
+                  ),
+                  // 第4页：搭档设定（性别 + 姓名 + 特质）
                   CharacterSetupPage(
+                    playerGenderIndex: _playerGenderIndex,
                     onComplete: () {
                       setState(() {
-                        _setupStep = 2;
+                        _setupStep = 5;
                         showMenuNotifier.value = true;
                       });
                     },
                     onBack: () {
                       _pageController.animateToPage(
-                        0,
+                        3,
                         duration: const Duration(milliseconds: 500),
                         curve: Curves.easeInOut,
                       );

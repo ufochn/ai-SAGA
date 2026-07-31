@@ -14,7 +14,9 @@ class StorageService {
   static const String _keyPartnerName = 'partner_name';
   static const String _keyPartnerGender = 'partner_gender';
   static const String _keyPartnerTraits = 'partner_traits';
-  static const String _keyRegion = 'region';
+  static const String _keyLanguage = 'language';
+  static const String _keyLocation = 'location';
+  static const String _keyEra = 'era';
   //用来限制用户调取ai api频率的标识码
   static const String _keyUserUniqueId = 'user_unique_id';
   // 夜间模式
@@ -68,17 +70,44 @@ class StorageService {
     return _prefs.getBool(_keyIsDarkMode) ?? false;
   }
 
-  // ---- 地区 ----
+  // ---- 语言 ----
 
-  /// 保存用户选择的地区
-  static Future<void> saveRegion(String region) async {
-    await _prefs.setString(_keyRegion, region);
+  /// 保存用户选择的语言
+  static Future<void> saveLanguage(String language) async {
+    await _prefs.setString(_keyLanguage, language);
   }
 
-  /// 读取用户选择的地区
-  static String getRegion() {
-    return _prefs.getString(_keyRegion) ?? '';
+  /// 读取用户选择的语言
+  static String getLanguage() {
+    return _prefs.getString(_keyLanguage) ?? '';
   }
+
+  // ---- 地点 ----
+
+  /// 保存用户选择的地点
+  static Future<void> saveLocation(String location) async {
+    await _prefs.setString(_keyLocation, location);
+  }
+
+  /// 读取用户选择的地点
+  static String getLocation() {
+    return _prefs.getString(_keyLocation) ?? '';
+  }
+
+  // ---- 年代 ----
+
+  /// 保存用户选择的年代
+  static Future<void> saveEra(String era) async {
+    await _prefs.setString(_keyEra, era);
+  }
+
+  /// 读取用户选择的年代
+  static String getEra() {
+    return _prefs.getString(_keyEra) ?? '';
+  }
+
+  /// 保留旧的 getRegion 别名以兼容现有代码
+  static String getRegion() => getLanguage();
 
   // ---- 主文本内容（初始"正"字） ----
 
@@ -222,7 +251,9 @@ class StorageService {
     await _prefs.setString(_keyPartnerName, '');
     await _prefs.setString(_keyPartnerGender, '');
     await _prefs.setString(_keyPartnerTraits, '');
-    await _prefs.setString(_keyRegion, '');
+    await _prefs.setString(_keyLocation, '');
+    await _prefs.setString(_keyEra, '');
+    await _prefs.setString(_keyLanguage, '');
     await _prefs.setBool(_keyIsInitialized, false);
   }
 }

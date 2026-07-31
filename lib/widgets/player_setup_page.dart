@@ -3,60 +3,47 @@ import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 
-/// 搭档设定页面 - 性别 + 姓名 + 特质（iOS风格表单）
-class CharacterSetupPage extends StatefulWidget {
+/// 主角设定页面 - 性别 + 姓名（iOS风格表单）
+class PlayerSetupPage extends StatefulWidget {
   final VoidCallback onComplete;
   final VoidCallback? onBack;
-  final int? playerGenderIndex; // 主角性别: 0=男, 1=女, null=未知
 
-  const CharacterSetupPage({
-    super.key,
-    required this.onComplete,
-    this.onBack,
-    this.playerGenderIndex,
-  });
+  const PlayerSetupPage({super.key, required this.onComplete, this.onBack});
 
   @override
-  State<CharacterSetupPage> createState() => _CharacterSetupPageState();
+  State<PlayerSetupPage> createState() => _PlayerSetupPageState();
 }
 
-class _CharacterSetupPageState extends State<CharacterSetupPage> {
-  final TextEditingController _partnerNameController = TextEditingController();
-  final TextEditingController _partnerTraitsController =
-      TextEditingController();
-  final FocusNode _partnerNameFocusNode = FocusNode();
+class _PlayerSetupPageState extends State<PlayerSetupPage> {
+  final TextEditingController _playerNameController = TextEditingController();
+  final FocusNode _playerNameFocusNode = FocusNode();
 
-  int _partnerGenderIndex = 1; // 0=男, 1=女，默认女
+  int _playerGenderIndex = 0; // 0=男, 1=女
 
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
-  bool _partnerNameEdited = false;
+  bool _playerNameEdited = false;
 
   @override
   void initState() {
     super.initState();
 
-    // 根据主角性别决定搭档默认性别（相反）
-    if (widget.playerGenderIndex != null) {
-      _partnerGenderIndex = widget.playerGenderIndex == 0 ? 1 : 0;
-    }
-
     // 初始化默认姓名
-    _partnerNameController.text = _getDefaultName(
-      genderIndex: _partnerGenderIndex,
+    _playerNameController.text = _getDefaultName(
+      genderIndex: _playerGenderIndex,
     );
 
-    // 搭档姓名监听
-    _partnerNameFocusNode.addListener(() {
-      if (_partnerNameFocusNode.hasFocus) {
+    // 玩家姓名监听：光标全选
+    _playerNameFocusNode.addListener(() {
+      if (_playerNameFocusNode.hasFocus) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _partnerNameController.selection = TextSelection(
+          _playerNameController.selection = TextSelection(
             baseOffset: 0,
-            extentOffset: _partnerNameController.text.length,
+            extentOffset: _playerNameController.text.length,
           );
         });
-        if (!_partnerNameEdited) {
+        if (!_playerNameEdited) {
           setState(() {
-            _partnerNameEdited = true;
+            _playerNameEdited = true;
           });
         }
       }
@@ -65,26 +52,9 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
 
   @override
   void dispose() {
-    _partnerNameController.dispose();
-    _partnerTraitsController.dispose();
-    _partnerNameFocusNode.dispose();
+    _playerNameController.dispose();
+    _playerNameFocusNode.dispose();
     super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(covariant CharacterSetupPage oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.playerGenderIndex != null &&
-        widget.playerGenderIndex != oldWidget.playerGenderIndex) {
-      setState(() {
-        _partnerGenderIndex = widget.playerGenderIndex == 0 ? 1 : 0;
-        if (!_partnerNameEdited) {
-          _partnerNameController.text = _getDefaultName(
-            genderIndex: _partnerGenderIndex,
-          );
-        }
-      });
-    }
   }
 
   // ──────────────────────────────────────────────
@@ -94,100 +64,96 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   /// 获取当前语言的代码
   String get _language => StorageService.getLanguage();
 
-  /// 获取搭档的默认姓名
+  /// 获取主角的默认姓名
   String _getDefaultName({required int genderIndex}) {
     final lang = _language;
     final isMale = genderIndex == 0;
 
-    return isMale
-        ? _getPartnerMaleDefault(lang)
-        : _getPartnerFemaleDefault(lang);
+    return isMale ? _getPlayerMaleDefault(lang) : _getPlayerFemaleDefault(lang);
   }
 
-  /// 搭档 - 男性默认姓名
-  String _getPartnerMaleDefault(String language) {
+  /// 玩家 - 男性默认姓名
+  String _getPlayerMaleDefault(String language) {
     switch (language) {
       case 'zh-TW':
       case 'yue':
-        return '陳子豪';
+        return '陸一鳴';
       case 'en':
       case 'es':
       case 'fr':
       case 'de':
       case 'pt':
-        return 'James';
+        return 'Jimmy';
       case 'ja':
-        return '大輔';
+        return '蓮';
       case 'ko':
-        return '준호';
+        return '민준';
       default:
-        return '陈子豪';
+        return '陆一鸣';
     }
   }
 
-  /// 搭档 - 女性默认姓名
-  String _getPartnerFemaleDefault(String language) {
+  /// 玩家 - 女性默认姓名
+  String _getPlayerFemaleDefault(String language) {
     switch (language) {
       case 'zh-TW':
       case 'yue':
-        return '陳雨晴';
+        return '林語嫣';
       case 'en':
       case 'es':
       case 'fr':
       case 'de':
       case 'pt':
-        return 'Emma';
+        return 'Aurora';
       case 'ja':
-        return '結衣';
+        return '琴音';
       case 'ko':
-        return '은지';
+        return '아린';
       default:
-        return '陈雨晴';
+        return '林语嫣';
     }
   }
 
   /// 当性别切换时更新默认姓名（仅当用户未手动编辑过）
-  void _onPartnerGenderChanged(int? value) {
-    if (value == null || value == _partnerGenderIndex) return;
+  void _onPlayerGenderChanged(int? value) {
+    if (value == null || value == _playerGenderIndex) return;
     setState(() {
-      _partnerGenderIndex = value;
-      if (!_partnerNameEdited) {
-        _partnerNameController.text = _getDefaultName(genderIndex: value);
+      _playerGenderIndex = value;
+      if (!_playerNameEdited) {
+        _playerNameController.text = _getDefaultName(genderIndex: value);
       }
     });
   }
 
   void _onSubmit() {
     SoundService.playHorror2();
-    StorageService.savePartnerName(_partnerNameController.text);
-    StorageService.savePartnerGender(_partnerGenderIndex == 0 ? '男' : '女');
-    StorageService.savePartnerTraits(_partnerTraitsController.text);
-    StorageService.setInitialized();
+    StorageService.savePlayerName(_playerNameController.text);
+    StorageService.savePlayerGender(_playerGenderIndex == 0 ? '男' : '女');
     widget.onComplete();
   }
 
-  /// 根据语言返回本地化的标题
+  /// 根据语言返回本地化的欢迎标题
   String _getTitleText() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '接下來，設定您的搭檔。';
+        return '歡迎您進入這個冒險探案戀愛遊戲。';
       case 'en':
-        return 'Now, set up your partner.';
+        return 'Welcome to this adventure detective romance game.';
       case 'es':
-        return 'Ahora, configura a tu compañero/a.';
+        return 'Bienvenido a este juego de aventura, detectives y romance.';
       case 'fr':
-        return 'Maintenant, configurez votre partenaire.';
+        return 'Bienvenue dans ce jeu d\'aventure, de détective et de romance.';
       case 'de':
-        return 'Jetzt richtest du deinen Partner ein.';
+        return 'Willkommen zu diesem Abenteuer-Detektiv-Liebes-Spiel.';
       case 'pt':
-        return 'Agora, configure seu parceiro/sua parceira.';
+        return 'Bem-vindo a este jogo de aventura, detetive e romance.';
       case 'ja':
-        return '次に、パートナーを設定しましょう。';
+        return 'この冒険探偵恋愛ゲームへようこそ。';
       case 'ko':
-        return '이제 파트너를 설정해보세요.';
+        return '이 모험 탐정 연애 게임에 오신 것을 환영합니다.';
       default:
-        return '接下来，设定您的搭档。';
+        return '欢迎您进入这个冒险探案恋爱游戏。';
     }
   }
 
@@ -196,23 +162,23 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '他（她）將是您在遊戲中的搭檔及曖昧對象。';
+        return '先來設定您自己的角色吧。';
       case 'en':
-        return 'They will be your partner and love interest in the game.';
+        return 'First, let\'s set up your own character.';
       case 'es':
-        return 'Será tu compañero/a e interés amoroso en el juego.';
+        return 'Primero, configuremos tu propio personaje.';
       case 'fr':
-        return 'Il/Elle sera votre partenaire et intérêt amoureux dans le jeu.';
+        return 'D\'abord, configurons votre personnage.';
       case 'de':
-        return 'Er/Sie wird dein Partner und Liebesinteresse im Spiel sein.';
+        return 'Lass uns zuerst deinen eigenen Charakter einrichten.';
       case 'pt':
-        return 'Ele/Ela será seu parceiro e interesse amoroso no jogo.';
+        return 'Primeiro, vamos configurar seu próprio personagem.';
       case 'ja':
-        return 'ゲーム中のパートナーであり恋愛対象です。';
+        return 'まずはあなた自身のキャラクターを設定しましょう。';
       case 'ko':
-        return '그或그녀는 게임에서 당신의 파트너이자 연애 상대입니다.';
+        return '먼저 자신의 캐릭터를 설정해보세요.';
       default:
-        return '他（她）将是您在游戏中的搭档及暧昧对象。';
+        return '先来设定您自己的角色吧。';
     }
   }
 
@@ -221,23 +187,23 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '搭檔及曖昧對象姓名';
+        return '您在遊戲中的姓名';
       case 'en':
-        return 'Partner & Love Interest Name';
+        return 'Your Name';
       case 'es':
-        return 'Nombre del Compañero/a e Interés Amoroso';
+        return 'Tu Nombre';
       case 'fr':
-        return 'Nom du Partenaire et Intérêt Amoureux';
+        return 'Votre Nom';
       case 'de':
-        return 'Name des Partners & Liebesinteresses';
+        return 'Dein Name';
       case 'pt':
-        return 'Nome do Parceiro e Interesse Amoroso';
+        return 'Seu Nome';
       case 'ja':
-        return 'パートナー＆恋愛対象の名前';
+        return 'あなたの名前';
       case 'ko':
-        return '파트너 및 연애 상대 이름';
+        return '당신의 이름';
       default:
-        return '搭档及暧昧对象姓名';
+        return '您在游戏中的姓名';
     }
   }
 
@@ -246,23 +212,23 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '他（她）的性別';
+        return '您的性別';
       case 'en':
-        return 'Their Gender';
+        return 'Your Gender';
       case 'es':
-        return 'Su Género';
+        return 'Tu Género';
       case 'fr':
-        return 'Leur Genre';
+        return 'Votre Genre';
       case 'de':
-        return 'Ihr Geschlecht';
+        return 'Dein Geschlecht';
       case 'pt':
-        return 'O Gênero Dele/Dela';
+        return 'Seu Gênero';
       case 'ja':
-        return 'パートナーの性別';
+        return 'あなたの性別';
       case 'ko':
-        return '파트너의 성별';
+        return '당신의 성별';
       default:
-        return '他（她）的性别';
+        return '您的性别';
     }
   }
 
@@ -315,103 +281,53 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     }
   }
 
-  /// 根据语言返回本地化的"完成設定"文字
-  String _getSubmitText() {
+  /// 根据语言返回本地化的"下一步"文字
+  String _getNextText() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '完成設定';
+        return '下一步';
       case 'en':
-        return 'Done';
+        return 'Next';
       case 'es':
-        return 'Hecho';
+        return 'Siguiente';
       case 'fr':
-        return 'Terminé';
+        return 'Suivant';
       case 'de':
-        return 'Fertig';
+        return 'Weiter';
       case 'pt':
-        return 'Concluído';
+        return 'Próximo';
       case 'ja':
-        return '設定完了';
+        return '次へ';
       case 'ko':
-        return '설정 완료';
+        return '다음';
       default:
-        return '完成设定';
+        return '下一步';
     }
   }
 
-  /// 根据语言返回特质标签
-  String _getTraitsLabel() {
+  /// 根据语言返回 placeholder
+  String _getNamePlaceholder() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '他（她）的個人特質';
+        return '請輸入姓名';
       case 'en':
-        return 'Their Personal Traits';
+        return 'Enter name';
       case 'es':
-        return 'Sus Rasgos Personales';
+        return 'Introduce tu nombre';
       case 'fr':
-        return 'Leurs Traits Personnels';
+        return 'Entrez votre nom';
       case 'de':
-        return 'Ihre Persönlichen Eigenschaften';
+        return 'Name eingeben';
       case 'pt':
-        return 'Suas Características Pessoais';
+        return 'Insira seu nome';
       case 'ja':
-        return 'パートナーの特徴';
+        return '名前を入力';
       case 'ko':
-        return '파트너의 특징';
+        return '이름 입력';
       default:
-        return '他（她）的个人特质';
-    }
-  }
-
-  /// 根据语言返回特质提示
-  String _getTraitsHint() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '性格、外貌、喜好等，請隨意輸入。不輸入則系統隨機生成。';
-      case 'en':
-        return 'Personality, appearance, hobbies, etc. Leave empty for random generation.';
-      case 'es':
-        return 'Personalidad, apariencia, pasatiempos, etc. Déjalo vacío para generación aleatoria.';
-      case 'fr':
-        return 'Personnalité, apparence, loisirs, etc. Laissez vide pour une génération aléatoire.';
-      case 'de':
-        return 'Persönlichkeit, Aussehen, Hobbys usw. Leer lassen für zufällige Generierung.';
-      case 'pt':
-        return 'Personalidade, aparência, hobbies, etc. Deixe em branco para geração aleatória.';
-      case 'ja':
-        return '性格、外見、趣味など自由に入力してください。空欄の場合はランダム生成されます。';
-      case 'ko':
-        return '성격, 외모, 취미 등을 자유롭게 입력하세요. 입력하지 않으면 무작위 생성됩니다.';
-      default:
-        return '性格、外貌、喜好等，请随意输入。不输入则系统随机生成。';
-    }
-  }
-
-  /// 根据语言返回"选填"
-  String _getOptionalText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '選填';
-      case 'en':
-        return 'Optional';
-      case 'es':
-        return 'Opcional';
-      case 'fr':
-        return 'Facultatif';
-      case 'de':
-        return 'Optional';
-      case 'pt':
-        return 'Opcional';
-      case 'ja':
-        return '任意';
-      case 'ko':
-        return '선택사항';
-      default:
-        return '选填';
+        return '请输入姓名';
     }
   }
 
@@ -504,13 +420,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                       context,
                       label: _getGenderLabel(),
                       child: CupertinoSlidingSegmentedControl<int>(
-                        groupValue: _partnerGenderIndex,
+                        groupValue: _playerGenderIndex,
                         children: {
                           0: Text(
                             _getMaleText(),
                             style: TextStyle(
                               fontSize: 14,
-                              color: _partnerGenderIndex == 0
+                              color: _playerGenderIndex == 0
                                   ? (isDark
                                         ? AppTheme.primaryTextDark
                                         : AppTheme.primaryTextLight)
@@ -523,7 +439,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                             _getFemaleText(),
                             style: TextStyle(
                               fontSize: 14,
-                              color: _partnerGenderIndex == 1
+                              color: _playerGenderIndex == 1
                                   ? (isDark
                                         ? AppTheme.primaryTextDark
                                         : AppTheme.primaryTextLight)
@@ -533,7 +449,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                             ),
                           ),
                         },
-                        onValueChanged: _onPartnerGenderChanged,
+                        onValueChanged: _onPlayerGenderChanged,
                       ),
                     ),
                   ],
@@ -554,8 +470,8 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                       context,
                       label: _getNameLabel(),
                       child: CupertinoTextField(
-                        controller: _partnerNameController,
-                        focusNode: _partnerNameFocusNode,
+                        controller: _playerNameController,
+                        focusNode: _playerNameFocusNode,
                         placeholder: _getNamePlaceholder(),
                         placeholderStyle: TextStyle(
                           color: isDark
@@ -606,79 +522,8 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                   ],
                 ),
               ),
-              const SizedBox(height: 16),
-              // 个人特质卡片
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _getTraitsLabel(),
-                            style: TextStyle(
-                              fontSize: 15,
-                              color: isDark
-                                  ? AppTheme.primaryTextDark
-                                  : AppTheme.primaryTextLight,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _getTraitsHint(),
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: isDark
-                                  ? AppTheme.secondaryTextDark
-                                  : AppTheme.secondaryTextLight,
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          CupertinoTextField(
-                            controller: _partnerTraitsController,
-                            placeholder: _getOptionalText(),
-                            placeholderStyle: TextStyle(
-                              color: isDark
-                                  ? AppTheme.tertiaryTextDark
-                                  : AppTheme.tertiaryTextLight,
-                            ),
-                            maxLines: 3,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: isDark
-                                  ? AppTheme.fieldBackgroundDark
-                                  : AppTheme.fieldBackgroundLight,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: isDark
-                                    ? AppTheme.inputBorderDark
-                                    : AppTheme.inputBorderLight,
-                                width: 0.5,
-                              ),
-                            ),
-                            style: TextStyle(
-                              color: isDark
-                                  ? AppTheme.primaryTextDark
-                                  : AppTheme.primaryTextLight,
-                              fontSize: 17,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
               const SizedBox(height: 24),
-              // iOS风格完成按钮
+              // iOS风格下一步按钮
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
@@ -689,7 +534,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                       ? AppTheme.buttonFillDark
                       : AppTheme.buttonFillLight,
                   child: Text(
-                    _getSubmitText(),
+                    _getNextText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
@@ -705,27 +550,6 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
         ),
       ),
     );
-  }
-
-  /// 根据语言返回 placeholder
-  String _getNamePlaceholder() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '請輸入姓名';
-      case 'en':
-      case 'es':
-      case 'fr':
-      case 'de':
-      case 'pt':
-        return 'Enter name';
-      case 'ja':
-        return '名前を入力';
-      case 'ko':
-        return '이름 입력';
-      default:
-        return '请输入姓名';
-    }
   }
 
   Widget _buildFormRow(

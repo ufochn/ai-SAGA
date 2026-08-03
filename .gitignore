@@ -43,3 +43,30 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# ============================================================
+# 环境变量 / 密钥：严禁提交到 GitHub
+# ============================================================
+# 真实环境变量文件（含服务器地址、鉴权密钥等敏感信息）
+.env
+# 各类本地/环境专属变量文件
+.env.*
+# 但保留提交模板
+!.env.example
+
+# 密钥 / 凭据 / 签名文件（如未来使用）
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+!debug.keystore
+# iOS 相关：推送密钥 / 证书 / 描述文件（导出后请勿入库）
+*.p8
+*.cer
+*.mobileprovision
+secrets.*
+credentials.*
+id_rsa
+id_ed25519

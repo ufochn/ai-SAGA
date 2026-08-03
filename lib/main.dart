@@ -1,4 +1,5 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:ai_saga/logic/home_content.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/app_theme.dart';
@@ -12,6 +13,13 @@ final ValueNotifier<Brightness> themeBrightnessNotifier =
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 加载环境变量配置（.env 已加入 .gitignore，不随仓库上传；
+  // 缺少时保持空配置，不影响应用启动）
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (_) {
+    // .env 缺失时不阻塞启动，审核时会有明确提示
+  }
   await StorageService.init();
   // 初始化时读取存储的夜间模式偏好
   themeBrightnessNotifier.value = StorageService.getIsDarkMode()

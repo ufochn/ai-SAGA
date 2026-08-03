@@ -1,6 +1,11 @@
+import 'dart:convert';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart' show SelectableText;
+import 'package:http/http.dart' as http;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 
@@ -263,196 +268,18 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
     if (location.isEmpty) return;
     SoundService.playConfirm();
 
-    // 构建包含用户输入的 JSON
-    final locationJson = {
-      'action': 'location_review',
-      'input': location,
-      'status': 'pending_review',
-    };
-    final jsonString = _prettyPrintJson(locationJson);
-
-    // 弹出审查弹窗
-    _showReviewDialog(jsonString, location);
-  }
-
-  /// 将 Map 转为格式化的 JSON 字符串
-  String _prettyPrintJson(Map<String, dynamic> map) {
-    // 手动构建格式化的 JSON，避免引入 dart:convert 以外的依赖
-    final buffer = StringBuffer();
-    buffer.write('{\n');
-    final entries = map.entries.toList();
-    for (int i = 0; i < entries.length; i++) {
-      final entry = entries[i];
-      final value = entry.value is String
-          ? '"${entry.value}"'
-          : '${entry.value}';
-      buffer.write('  "${entry.key}": $value');
-      if (i < entries.length - 1) buffer.write(',');
-      buffer.write('\n');
-    }
-    buffer.write('}');
-    return buffer.toString();
-  }
-
-  /// 显示版权审查弹窗
-  void _showReviewDialog(String jsonString, String location) {
-    final language = StorageService.getLanguage();
-
-    // 根据语言获取提示文字
-    String getReviewTitle() {
-      switch (language) {
-        case 'zh-TW':
-        case 'yue':
-          return '版權審查中';
-        case 'en':
-          return 'Copyright Review';
-        case 'es':
-          return 'Revisión de Derechos de Autor';
-        case 'fr':
-          return 'Examen des Droits d\'Auteur';
-        case 'de':
-          return 'Urheberrechtsprüfung';
-        case 'pt':
-          return 'Revisão de Direitos Autorais';
-        case 'ja':
-          return '著作権審査中';
-        case 'ko':
-          return '저작권 심사 중';
-        default:
-          return '版权审查中';
-      }
-    }
-
-    String getReviewMessage() {
-      switch (language) {
-        case 'zh-TW':
-        case 'yue':
-          return '正在檢查輸入地址是否有版權侵權或違規，請稍候…';
-        case 'en':
-          return 'Checking if the input address has copyright infringement or violations, please wait…';
-        case 'es':
-          return 'Verificando si la dirección ingresada tiene infracción de derechos de autor o violaciones, espere…';
-        case 'fr':
-          return 'Vérification de la violation des droits d\'auteur ou des infractions de l\'adresse saisie, veuillez patienter…';
-        case 'de':
-          return 'Prüfung der eingegebenen Adresse auf Urheberrechtsverletzungen, bitte warten…';
-        case 'pt':
-          return 'Verificando se o endereço inserido possui violação de direitos autorais, aguarde…';
-        case 'ja':
-          return '入力された住所に著作権侵害や違反がないか確認しています。少々お待ちください…';
-        case 'ko':
-          return '입력한 주소에 저작권 침해 또는 위반이 있는지 확인 중입니다. 잠시 기다려 주세요…';
-        default:
-          return '正在检查输入地址是否有版权侵权或违规，请稍候…';
-      }
-    }
-
+    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
+    // 审核通过（Action: NONE）时保存地点并进入下一步，未通过时弹窗警告
     showCupertinoDialog(
       context: context,
-      builder: (context) {
-        final isDark = AppTheme.isDark(context);
-        return CupertinoAlertDialog(
-          title: Text(
-            getReviewTitle(),
-            style: TextStyle(
-              fontSize: 17,
-              fontWeight: FontWeight.w600,
-              color: isDark
-                  ? AppTheme.primaryTextDark
-                  : AppTheme.primaryTextLight,
-            ),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 8),
-              // 审查提示文字
-              Row(
-                children: [
-                  const CupertinoActivityIndicator(),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      getReviewMessage(),
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: isDark
-                            ? AppTheme.secondaryTextDark
-                            : AppTheme.secondaryTextLight,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              // JSON 预览标签
-              Text(
-                switch (language) {
-                  'zh-TW' || 'yue' => '📄 生成的審查資料：',
-                  'en' => '📄 Generated review data:',
-                  'ja' => '📄 生成された審査データ：',
-                  'ko' => '📄 생성된 심사 데이터:',
-                  _ => '📄 生成的审查数据：',
-                },
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: isDark
-                      ? AppTheme.tertiaryTextDark
-                      : AppTheme.tertiaryTextLight,
-                ),
-              ),
-              const SizedBox(height: 6),
-              // JSON 内容显示框
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? const Color(0xFF2C2C2E)
-                      : const Color(0xFFF2F2F7),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: SelectableText(
-                  jsonString,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontFamily: 'monospace',
-                    color: isDark
-                        ? AppTheme.primaryTextDark
-                        : AppTheme.primaryTextLight,
-                    height: 1.4,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            CupertinoDialogAction(
-              child: Text(
-                switch (language) {
-                  'zh-TW' || 'yue' => '關閉',
-                  'en' => 'Close',
-                  'ja' => '閉じる',
-                  'ko' => '닫기',
-                  _ => '关闭',
-                },
-                style: TextStyle(
-                  color: isDark
-                      ? AppTheme.accentBlueDark
-                      : AppTheme.accentBlueLight,
-                ),
-              ),
-              onPressed: () {
-                Navigator.of(context).pop();
-                // 暂存地点数据，用户后续会告知如何处理
-                StorageService.saveLocation(location);
-              },
-            ),
-          ],
-        );
-      },
+      barrierDismissible: false,
+      builder: (dialogContext) => _AuditDialog(
+        text: location,
+        onApproved: () {
+          StorageService.saveLocation(location);
+          widget.onComplete();
+        },
+      ),
     );
   }
 
@@ -773,6 +600,520 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 审核弹窗 - 调取服务器审核器（AWS Guard）进行审核。
+/// 等待期间显示"正在审核输入，请稍后"；收到结果后：
+/// - 若为 Action: NONE（通过）→ 自动保存地点并进入下一步；
+/// - 若不为 Action: NONE（不通过）→ 以当前语言弹出警告，提示内容可能不合适需修改。
+class _AuditDialog extends StatefulWidget {
+  final String text;
+  final VoidCallback onApproved;
+
+  const _AuditDialog({required this.text, required this.onApproved});
+
+  @override
+  State<_AuditDialog> createState() => _AuditDialogState();
+}
+
+class _AuditDialogState extends State<_AuditDialog> {
+  /// 审核服务器地址（读取自 .env 环境变量）
+  String get _auditApiUrl => dotenv.env['AUDIT_API_URL'] ?? '';
+
+  bool _loading = true;
+  bool _approved = false;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _callAuditServer();
+  }
+
+  /// 调用审核服务器，等待审核结果
+  Future<void> _callAuditServer() async {
+    try {
+      // 环境变量缺失时给出明确提示，避免用空配置发起请求
+      if (_auditApiUrl.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _errorMessage = getConfigMissingMessage();
+        });
+        return;
+      }
+
+      // 获取服务器签发的审核令牌（未注册或已过期时自动注册），
+      // 令牌保存在系统安全存储中，不再在 App 内保存任何共享密钥
+      final token = await AuthService.ensureToken();
+
+      final response = await http
+          .post(
+            Uri.parse(_auditApiUrl),
+            headers: {
+              'accept': 'application/json',
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $token',
+            },
+            body: jsonEncode({
+              'user_id': StorageService.getUserUniqueId(),
+              'text': widget.text,
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
+
+      if (!mounted) return;
+
+      if (_isActionNone(response.body)) {
+        // 审核通过：短暂展示通过提示后，自动关闭弹窗并进入下一步
+        setState(() {
+          _loading = false;
+          _approved = true;
+        });
+        Future.delayed(const Duration(milliseconds: 900), () {
+          if (!mounted) return;
+          Navigator.of(context).pop();
+          widget.onApproved();
+        });
+      } else {
+        // 审核未通过：以当前语言弹出警告（未通过为默认状态）
+        setState(() {
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _errorMessage = e.toString();
+      });
+    }
+  }
+
+  /// 判断服务器返回的审核结果是否为 Action: NONE（通过）。
+  /// 兼容 JSON 字段（如 action / guardrailAction = NONE）与文本（如 "Action: NONE"）。
+  bool _isActionNone(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      return _findActionNone(decoded);
+    } catch (_) {
+      // 非 JSON，直接全文搜索
+      return body.toLowerCase().contains('action: none');
+    }
+  }
+
+  /// 递归搜索 JSON 中表示"审核通过（NONE）"的节点
+  bool _findActionNone(dynamic node) {
+    if (node is Map) {
+      for (final entry in node.entries) {
+        final key = entry.key.toString().toLowerCase();
+        final value = entry.value;
+        // 字段名含 action 且值为 NONE（AWS Guard 常返回 guardrailAction）
+        if (key.contains('action') &&
+            value is String &&
+            value.trim().toUpperCase() == 'NONE') {
+          return true;
+        }
+        if (_findActionNone(value)) return true;
+      }
+    } else if (node is List) {
+      for (final item in node) {
+        if (_findActionNone(item)) return true;
+      }
+    } else if (node is String && node.toLowerCase().contains('action: none')) {
+      return true;
+    }
+    return false;
+  }
+
+  String get _language => StorageService.getLanguage();
+
+  // 等待时的标题文字
+  String getWaitingTitle() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '正在審核輸入，請稍後';
+      case 'en':
+        return 'Auditing Input, Please Wait…';
+      case 'es':
+        return 'Auditando la Entrada, Espere…';
+      case 'fr':
+        return 'Audit de la Saisie, Veuillez Patienter…';
+      case 'de':
+        return 'Eingabe wird geprüft, bitte warten…';
+      case 'pt':
+        return 'Auditando a Entrada, Aguarde…';
+      case 'ja':
+        return '入力を審査中です。少々お待ちください…';
+      case 'ko':
+        return '입력을 심사 중입니다. 잠시 기다려 주세요…';
+      default:
+        return '正在审核输入，请稍后';
+    }
+  }
+
+  // 等待时的说明文字
+  String getWaitingMessage() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '正在等待服務器返回審核結果…';
+      case 'en':
+        return 'Waiting for the audit server response…';
+      case 'es':
+        return 'Esperando la respuesta del servidor de auditoría…';
+      case 'fr':
+        return 'En attente de la réponse du serveur d\'audit…';
+      case 'de':
+        return 'Warten auf die Antwort des Prüfservers…';
+      case 'pt':
+        return 'Aguardando a resposta do servidor de auditoria…';
+      case 'ja':
+        return '審査サーバーの応答を待っています…';
+      case 'ko':
+        return '심사 서버 응답을 기다리는 중…';
+      default:
+        return '正在等待服务器返回审核结果…';
+    }
+  }
+
+  // 审核失败时的标题文字
+  String getErrorTitle() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '審核失敗';
+      case 'en':
+        return 'Audit Failed';
+      case 'es':
+        return 'Error de Auditoría';
+      case 'fr':
+        return 'Échec de l\'Audit';
+      case 'de':
+        return 'Prüfung fehlgeschlagen';
+      case 'pt':
+        return 'Falha na Auditoria';
+      case 'ja':
+        return '審査に失敗しました';
+      case 'ko':
+        return '심사 실패';
+      default:
+        return '审核失败';
+    }
+  }
+
+  // 环境变量缺失时的提示文字
+  String getConfigMissingMessage() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '伺服器設定缺失，請在 .env 中設定 AUDIT_API_URL 與 REGISTER_API_URL。';
+      case 'en':
+        return 'Server configuration is missing. Please set AUDIT_API_URL and REGISTER_API_URL in the .env file.';
+      case 'es':
+        return 'Falta la configuración del servidor. Configure AUDIT_API_URL y REGISTER_API_URL en el archivo .env.';
+      case 'fr':
+        return 'La configuration du serveur est manquante. Définissez AUDIT_API_URL et REGISTER_API_URL dans le fichier .env.';
+      case 'de':
+        return 'Serverkonfiguration fehlt. Bitte setzen Sie AUDIT_API_URL und REGISTER_API_URL in der .env-Datei.';
+      case 'pt':
+        return 'Falta a configuração do servidor. Defina AUDIT_API_URL e REGISTER_API_URL no arquivo .env.';
+      case 'ja':
+        return 'サーバー設定がありません。.env ファイルで AUDIT_API_URL と REGISTER_API_URL を設定してください。';
+      case 'ko':
+        return '서버 설정이 없습니다. .env 파일에서 AUDIT_API_URL과 REGISTER_API_URL을 설정해 주세요.';
+      default:
+        return '服务器配置缺失，请在 .env 中设置 AUDIT_API_URL 与 REGISTER_API_URL。';
+    }
+  }
+
+  // 审核通过时的标题文字
+  String getApprovedTitle() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '審核通過';
+      case 'en':
+        return 'Approved';
+      case 'es':
+        return 'Aprobado';
+      case 'fr':
+        return 'Approuvé';
+      case 'de':
+        return 'Genehmigt';
+      case 'pt':
+        return 'Aprovado';
+      case 'ja':
+        return '審査に合格しました';
+      case 'ko':
+        return '승인됨';
+      default:
+        return '审核通过';
+    }
+  }
+
+  // 审核通过时的说明文字
+  String getApprovedMessage() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '您輸入的地點已通過審核，即將進入下一步…';
+      case 'en':
+        return 'Your location has been approved. Moving on…';
+      case 'es':
+        return 'Su ubicación ha sido aprobada. Continuando…';
+      case 'fr':
+        return 'Votre lieu a été approuvé. Continuons…';
+      case 'de':
+        return 'Ihr Standort wurde genehmigt. Weiter…';
+      case 'pt':
+        return 'Seu local foi aprovado. Continuando…';
+      case 'ja':
+        return '入力した場所は審査に合格しました。次のステップへ進みます…';
+      case 'ko':
+        return '입력한 장소가 승인되었습니다. 다음 단계로 이동합니다…';
+      default:
+        return '您输入的地点已通过审核，即将进入下一步…';
+    }
+  }
+
+  // 审核未通过时的标题文字
+  String getRejectedTitle() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '請修改您的內容';
+      case 'en':
+        return 'Please Revise Your Input';
+      case 'es':
+        return 'Revise Su Entrada';
+      case 'fr':
+        return 'Veuillez Modifier Votre Saisie';
+      case 'de':
+        return 'Bitte Eingabe Überarbeiten';
+      case 'pt':
+        return 'Revise Sua Entrada';
+      case 'ja':
+        return '入力内容を修正してください';
+      case 'ko':
+        return '입력 내용을 수정해 주세요';
+      default:
+        return '请修改您的内容';
+    }
+  }
+
+  // 审核未通过时的警告文字
+  String getRejectedMessage() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '您輸入的內容可能有些不合適，請修改後再試。';
+      case 'en':
+        return 'Your input may not be suitable. Please review and revise it before trying again.';
+      case 'es':
+        return 'Su entrada puede no ser adecuada. Revísela y modifíquela antes de volver a intentarlo.';
+      case 'fr':
+        return 'Votre saisie peut ne pas convenir. Veuillez la revoir et la modifier avant de réessayer.';
+      case 'de':
+        return 'Ihre Eingabe ist möglicherweise nicht geeignet. Bitte überprüfen und ändern Sie sie, bevor Sie es erneut versuchen.';
+      case 'pt':
+        return 'Sua entrada pode não ser adequada. Revise-a e modifique-a antes de tentar novamente.';
+      case 'ja':
+        return '入力した内容が適切でない可能性があります。修正してからもう一度お試しください。';
+      case 'ko':
+        return '입력한 내용이 적절하지 않을 수 있습니다. 수정한 후 다시 시도해 주세요.';
+      default:
+        return '您输入的内容可能有些不合适，请修改后再试。';
+    }
+  }
+
+  // 关闭按钮文字
+  String getCloseText() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '關閉';
+      case 'en':
+        return 'Close';
+      case 'ja':
+        return '閉じる';
+      case 'ko':
+        return '닫기';
+      default:
+        return '关闭';
+    }
+  }
+
+  // "知道了"按钮文字
+  String getGotItText() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '知道了';
+      case 'en':
+        return 'OK';
+      case 'es':
+        return 'Aceptar';
+      case 'fr':
+        return 'OK';
+      case 'de':
+        return 'OK';
+      case 'pt':
+        return 'OK';
+      case 'ja':
+        return '了解';
+      case 'ko':
+        return '확인';
+      default:
+        return '知道了';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = AppTheme.isDark(context);
+
+    final title = _loading
+        ? getWaitingTitle()
+        : (_errorMessage != null
+              ? getErrorTitle()
+              : (_approved ? getApprovedTitle() : getRejectedTitle()));
+
+    // 等待中或已通过时无按钮（通过后自动进入下一步）
+    final actions = _loading || _approved
+        ? const <Widget>[]
+        : <Widget>[
+            CupertinoDialogAction(
+              child: Text(
+                _errorMessage != null ? getCloseText() : getGotItText(),
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.accentBlueDark
+                      : AppTheme.accentBlueLight,
+                ),
+              ),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ];
+
+    return CupertinoAlertDialog(
+      title: Text(
+        title,
+        style: TextStyle(
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          color: isDark ? AppTheme.primaryTextDark : AppTheme.primaryTextLight,
+        ),
+      ),
+      content: _buildContent(isDark),
+      actions: actions,
+    );
+  }
+
+  /// 根据审核状态构建弹窗内容
+  Widget _buildContent(bool isDark) {
+    // 等待审核结果中
+    if (_loading) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CupertinoActivityIndicator(),
+              const SizedBox(width: 10),
+              Flexible(
+                child: Text(
+                  getWaitingMessage(),
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: isDark
+                        ? AppTheme.secondaryTextDark
+                        : AppTheme.secondaryTextLight,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    // 审核失败
+    if (_errorMessage != null) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SizedBox(height: 8),
+          SelectableText(
+            _errorMessage!,
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.4,
+              color: isDark
+                  ? AppTheme.secondaryTextDark
+                  : AppTheme.secondaryTextLight,
+            ),
+          ),
+        ],
+      );
+    }
+
+    // 审核通过（Action: NONE）
+    if (_approved) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 4),
+          const Icon(
+            CupertinoIcons.checkmark_alt_circle_fill,
+            color: Color(0xFF34C759),
+            size: 44,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            getApprovedMessage(),
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 14,
+              height: 1.4,
+              color: isDark
+                  ? AppTheme.secondaryTextDark
+                  : AppTheme.secondaryTextLight,
+            ),
+          ),
+        ],
+      );
+    }
+
+    // 审核未通过（Action 非 NONE）：以当前语言弹出警告
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(height: 4),
+        const Icon(
+          CupertinoIcons.exclamationmark_triangle_fill,
+          color: Color(0xFFFF9F0A),
+          size: 44,
+        ),
+        const SizedBox(height: 10),
+        Text(
+          getRejectedMessage(),
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 14,
+            height: 1.4,
+            color: isDark
+                ? AppTheme.secondaryTextDark
+                : AppTheme.secondaryTextLight,
+          ),
+        ),
+      ],
     );
   }
 }

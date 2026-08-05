@@ -1,9 +1,13 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:ai_saga/logic/account_service.dart';
 import 'package:ai_saga/logic/home_content.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/sound_service.dart';
+import 'package:ai_saga/logic/security_service.dart';
+import 'package:ai_saga/widgets/light_auth_page.dart';
+import 'package:ai_saga/widgets/initialization_page.dart';
 
 /// 全局主题亮度通知器
 final ValueNotifier<Brightness> themeBrightnessNotifier =
@@ -13,6 +17,9 @@ final ValueNotifier<Brightness> themeBrightnessNotifier =
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 设备完整性防护：启动时检测硬件/系统完整性，
+  // 若发现设备已被 root / 越狱，立即静默退出进程，不显示任何提示。
+  await SecurityService.ensureNonRootedDevice();
   // 加载环境变量配置（.env 已加入 .gitignore，不随仓库上传；
   // 缺少时保持空配置，不影响应用启动）
   try {
@@ -71,6 +78,75 @@ class MyApp extends StatelessWidget {
   }
 }
 
+/// 轻授权门卫：未授权时先进入轻授权页，完成后进入主界面。
+class LightAuthGate extends StatelessWidget {
+  const LightAuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return LightAuthPage(
+      onComplete: () {
+        // 授权完成后直接进入主界面，并清空导航栈（移除语言选择页等），
+        // 避免主界面返回时回到设置流程。
+        Navigator.of(context).pushAndRemoveUntil(
+          PageRouteBuilder(
+            pageBuilder: (context, animation, secondaryAnimation) =>
+                const MyHomePage(),
+            transitionsBuilder:
+                (context, animation, secondaryAnimation, child) {
+                  return FadeTransition(
+                    opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
+                      CurvedAnimation(
+                        parent: animation,
+                        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+                      ),
+                    ),
+                    child: child,
+                  );
+                },
+            transitionDuration: const Duration(milliseconds: 1200),
+          ),
+          (route) => false,
+        );
+      },
+    );
+  }
+}
+
+/// 语言优先门卫：新用户先选择语言，完成后再进入轻授权页（开始你的故事）。
+/// 使用 push 而非 pushReplacement，保留语言选择页在导航栈中，
+/// 以便用户在轻授权页通过左上角返回按钮回到语言选择页。
+class LanguageFirstGate extends StatelessWidget {
+  const LanguageFirstGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return InitializationPage(
+      onComplete: () {
+        Navigator.of(context).push(
+          PageRouteBuilder(
+            pageBuilder: (context, animation, secondaryAnimation) =>
+                const LightAuthGate(),
+            transitionsBuilder:
+                (context, animation, secondaryAnimation, child) {
+                  return FadeTransition(
+                    opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
+                      CurvedAnimation(
+                        parent: animation,
+                        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+                      ),
+                    ),
+                    child: child,
+                  );
+                },
+            transitionDuration: const Duration(milliseconds: 1200),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -103,30 +179,40 @@ class _SplashScreenState extends State<SplashScreen>
     });
 
     // 淡出动画结束后执行页面切换（与淡出重叠），同时播放恐怖音效
-    Future.delayed(const Duration(milliseconds: 2600), () {
+    Future.delayed(const Duration(milliseconds: 2600), () async {
       SoundService.playHorror();
-      if (mounted) {
-        Navigator.of(context).pushReplacement(
-          // Apple 风格的交叉溶解过渡（cross dissolve）
-          PageRouteBuilder(
-            pageBuilder: (context, animation, secondaryAnimation) =>
-                const MyHomePage(),
-            transitionsBuilder:
-                (context, animation, secondaryAnimation, child) {
-                  return FadeTransition(
-                    opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
-                      CurvedAnimation(
-                        parent: animation,
-                        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-                      ),
-                    ),
-                    child: child,
-                  );
-                },
-            transitionDuration: const Duration(milliseconds: 1200),
-          ),
-        );
+      if (!mounted) return;
+      // 新用户最先选择语言：尚未选择语言且未授权时，先进入语言选择页，
+      // 完成后进入轻授权页（开始你的故事）；已选择语言或已授权则直接进入对应页面。
+      final authorized = await AccountService.isAuthorized();
+      final hasLanguage = StorageService.getLanguage().isNotEmpty;
+      if (!mounted) return;
+      final Widget nextPage;
+      if (authorized) {
+        nextPage = const MyHomePage();
+      } else if (hasLanguage) {
+        nextPage = const LightAuthGate();
+      } else {
+        nextPage = const LanguageFirstGate();
       }
+      Navigator.of(context).pushReplacement(
+        // Apple 风格的交叉溶解过渡（cross dissolve）
+        PageRouteBuilder(
+          pageBuilder: (context, animation, secondaryAnimation) => nextPage,
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            return FadeTransition(
+              opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
+                CurvedAnimation(
+                  parent: animation,
+                  curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+                ),
+              ),
+              child: child,
+            );
+          },
+          transitionDuration: const Duration(milliseconds: 1200),
+        ),
+      );
     });
   }
 

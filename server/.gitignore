@@ -1,0 +1,41 @@
+# ============================================================
+# AI-SAGA Server — .gitignore
+# Protects operational secrets and user data from being committed.
+# DESIGN.md and main.py are intentionally NOT ignored (public showcase).
+# ============================================================
+
+# ---- Secrets / credentials / signing material ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.p8
+*.cer
+*.mobileprovision
+*.jks
+*.keystore
+secrets.*
+credentials.*
+id_rsa
+id_ed25519
+token_secret*
+
+# ---- Runtime data / databases (contain user & device data) ----
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# ---- Misc ----
+.DS_Store

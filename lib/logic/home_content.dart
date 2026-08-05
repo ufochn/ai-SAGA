@@ -9,6 +9,7 @@ import 'package:ai_saga/widgets/player_setup_page.dart';
 import 'package:ai_saga/widgets/character_setup_page.dart';
 
 import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/widgets/setup_confirmation_page.dart';
 
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
@@ -45,7 +46,8 @@ class _HomeContentState extends State<HomeContent> {
   /// 主角性别: 0=男, 1=女, null=未设定（用于传递给搭档页面决定默认性别）
   int? _playerGenderIndex;
 
-  /// 0=语言选择, 1=地点设定, 2=年代设定, 3=主角设定, 4=搭档设定, 5=完成
+  /// 0=语言选择, 1=地点设定, 2=年代设定, 3=主角设定, 4=搭档设定,
+  /// 5=设置确认页（倒计时）, 6=正式主页面
   int _setupStep = 0;
 
   @override
@@ -63,10 +65,13 @@ class _HomeContentState extends State<HomeContent> {
     _inputContent = StorageService.getInputContent();
 
     if (!StorageService.isInitialized()) {
-      _setupStep = 0;
+      // 语言已在轻授权前选择（新用户经 LanguageFirstGate）或已有历史数据：
+      // 跳过语言页，从地点设定开始；若语言尚未选择，则仍从语言页开始。
+      _setupStep = StorageService.getLanguage().isEmpty ? 0 : 1;
       showMenuNotifier.value = false;
     } else {
-      _setupStep = 5;
+      // 已初始化（老用户）：直接进正式主页面，不经过确认页
+      _setupStep = 6;
       showMenuNotifier.value = true;
     }
 
@@ -205,8 +210,9 @@ class _HomeContentState extends State<HomeContent> {
                     playerGenderIndex: _playerGenderIndex,
                     onComplete: () {
                       setState(() {
+                        // 审核通过 → 进入设置确认页（step 5）
                         _setupStep = 5;
-                        showMenuNotifier.value = true;
+                        showMenuNotifier.value = false;
                       });
                     },
                     onBack: () {
@@ -218,6 +224,14 @@ class _HomeContentState extends State<HomeContent> {
                     },
                   ),
                 ],
+              ),
+            )
+          : _setupStep == 5
+          ? KeyedSubtree(
+              key: const ValueKey('setup_confirmation'),
+              child: SetupConfirmationPage(
+                onEdit: _onEditSetting,
+                onConfirmed: _onSetupConfirmed,
               ),
             )
           : KeyedSubtree(
@@ -240,5 +254,30 @@ class _HomeContentState extends State<HomeContent> {
               ),
             ),
     );
+  }
+
+  /// 设置确认页"编辑"快捷按钮：跳回对应设置页。
+  void _onEditSetting(int index) {
+    setState(() {
+      _setupStep = index;
+      showMenuNotifier.value = false;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_pageController.hasClients) {
+        _pageController.animateToPage(
+          index,
+          duration: const Duration(milliseconds: 400),
+          curve: Curves.easeInOut,
+        );
+      }
+    });
+  }
+
+  /// 设置确认页倒计时结束：进入正式主页面。
+  void _onSetupConfirmed() {
+    setState(() {
+      _setupStep = 6;
+      showMenuNotifier.value = true;
+    });
   }
 }

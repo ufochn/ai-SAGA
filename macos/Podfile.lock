@@ -1,0 +1,28 @@
+PODS:
+  - FlutterMacOS (1.0.0)
+  - sign_in_with_apple (0.0.1):
+    - FlutterMacOS
+  - soundpool_macos (1.0.0):
+    - FlutterMacOS
+
+DEPENDENCIES:
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - sign_in_with_apple (from `Flutter/ephemeral/.symlinks/plugins/sign_in_with_apple/macos`)
+  - soundpool_macos (from `Flutter/ephemeral/.symlinks/plugins/soundpool_macos/macos`)
+
+EXTERNAL SOURCES:
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  sign_in_with_apple:
+    :path: Flutter/ephemeral/.symlinks/plugins/sign_in_with_apple/macos
+  soundpool_macos:
+    :path: Flutter/ephemeral/.symlinks/plugins/soundpool_macos/macos
+
+SPEC CHECKSUMS:
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  sign_in_with_apple: a9e97e744e8edc36aefc2723111f652102a7a727
+  soundpool_macos: 3bc0b8b238407516ad9b8afc2647670ff58124f9
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.14.3

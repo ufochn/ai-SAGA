@@ -1,5 +1,6 @@
 import 'dart:math';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 持久化存储服务
@@ -255,5 +256,28 @@ class StorageService {
     await _prefs.setString(_keyEra, '');
     await _prefs.setString(_keyLanguage, '');
     await _prefs.setBool(_keyIsInitialized, false);
+  }
+
+  // ---- 安全存储（iOS Keychain / Android Keystore）----
+
+  static const FlutterSecureStorage _secureStorage = FlutterSecureStorage(
+    // Android 默认使用 Keystore 加密存储，无需 encryptedSharedPreferences
+    // （Jetpack Security 已废弃，该参数在新版本会被忽略）
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+  );
+
+  /// 保存敏感信息到系统安全存储（登录会话、令牌等）。
+  static Future<void> saveSecure(String key, String value) async {
+    await _secureStorage.write(key: key, value: value);
+  }
+
+  /// 从系统安全存储读取敏感信息；不存在返回 null。
+  static Future<String?> getSecure(String key) async {
+    return _secureStorage.read(key: key);
+  }
+
+  /// 从系统安全存储删除敏感信息。
+  static Future<void> deleteSecure(String key) async {
+    await _secureStorage.delete(key: key);
   }
 }

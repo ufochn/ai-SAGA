@@ -2,6 +2,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
+import 'package:ai_saga/widgets/audit_dialog.dart';
 
 /// 搭档设定页面 - 性别 + 姓名 + 特质（iOS风格表单）
 class CharacterSetupPage extends StatefulWidget {
@@ -30,6 +31,9 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
 
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _partnerNameEdited = false;
+
+  /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
+  bool _submitting = false;
 
   @override
   void initState() {
@@ -158,12 +162,37 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   }
 
   void _onSubmit() {
+    // 防止连点重复弹出审核弹窗、重复请求服务器
+    if (_submitting) return;
+    final partnerName = _partnerNameController.text.trim();
+    final partnerTraits = _partnerTraitsController.text.trim();
+    if (partnerName.isEmpty || partnerTraits.isEmpty) return;
+    _submitting = true;
     SoundService.playHorror2();
-    StorageService.savePartnerName(_partnerNameController.text);
-    StorageService.savePartnerGender(_partnerGenderIndex == 0 ? '男' : '女');
-    StorageService.savePartnerTraits(_partnerTraitsController.text);
-    StorageService.setInitialized();
-    widget.onComplete();
+
+    // 向服务器传输的内容 = 用户选择的姓名 + 换行 + 用户对搭档性格的设定文字
+    final auditText = '$partnerName\n$partnerTraits';
+
+    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
+    // 审核通过（Action: NONE）时保存搭档设定并进入下一步，未通过时弹窗警告
+    showCupertinoDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AuditDialog(
+        text: auditText,
+        onApproved: () {
+          StorageService.savePartnerName(partnerName);
+          StorageService.savePartnerGender(
+              _partnerGenderIndex == 0 ? '男' : '女');
+          StorageService.savePartnerTraits(partnerTraits);
+          StorageService.setInitialized();
+          widget.onComplete();
+        },
+      ),
+    ).then((_) {
+      // 弹窗关闭后（拒绝/出错）允许再次提交
+      _submitting = false;
+    });
   }
 
   /// 根据语言返回本地化的标题
@@ -370,48 +399,48 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '性格、外貌、喜好等，請隨意輸入。不輸入則系統隨機生成。';
+        return '性格、外貌、喜好等，請輸入您對搭檔的設定。';
       case 'en':
-        return 'Personality, appearance, hobbies, etc. Leave empty for random generation.';
+        return 'Personality, appearance, hobbies, etc. Describe your partner.';
       case 'es':
-        return 'Personalidad, apariencia, pasatiempos, etc. Déjalo vacío para generación aleatoria.';
+        return 'Personalidad, apariencia, pasatiempos, etc. Describe a tu pareja.';
       case 'fr':
-        return 'Personnalité, apparence, loisirs, etc. Laissez vide pour une génération aléatoire.';
+        return 'Personnalité, apparence, loisirs, etc. Décrivez votre partenaire.';
       case 'de':
-        return 'Persönlichkeit, Aussehen, Hobbys usw. Leer lassen für zufällige Generierung.';
+        return 'Persönlichkeit, Aussehen, Hobbys usw. Beschreiben Sie Ihren Partner.';
       case 'pt':
-        return 'Personalidade, aparência, hobbies, etc. Deixe em branco para geração aleatória.';
+        return 'Personalidade, aparência, hobbies, etc. Descreva seu parceiro.';
       case 'ja':
-        return '性格、外見、趣味など自由に入力してください。空欄の場合はランダム生成されます。';
+        return '性格、外見、趣味など、パートナーの設定を入力してください。';
       case 'ko':
-        return '성격, 외모, 취미 등을 자유롭게 입력하세요. 입력하지 않으면 무작위 생성됩니다.';
+        return '성격, 외모, 취미 등 파트너의 설정을 입력하세요.';
       default:
-        return '性格、外貌、喜好等，请随意输入。不输入则系统随机生成。';
+        return '性格、外貌、喜好等，请输入您对搭档的设定。';
     }
   }
 
-  /// 根据语言返回"选填"
-  String _getOptionalText() {
+  /// 根据语言返回特质输入框占位文字
+  String _getTraitsPlaceholder() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '選填';
+        return '請輸入性格、外貌、喜好等';
       case 'en':
-        return 'Optional';
+        return 'Enter personality, appearance, hobbies, etc.';
       case 'es':
-        return 'Opcional';
+        return 'Ingrese personalidad, apariencia, pasatiempos, etc.';
       case 'fr':
-        return 'Facultatif';
+        return 'Saisissez la personnalité, l\'apparence, les loisirs, etc.';
       case 'de':
-        return 'Optional';
+        return 'Persönlichkeit, Aussehen, Hobbys usw. eingeben';
       case 'pt':
-        return 'Opcional';
+        return 'Digite personalidade, aparência, hobbies, etc.';
       case 'ja':
-        return '任意';
+        return '性格、外見、趣味などを入力';
       case 'ko':
-        return '선택사항';
+        return '성격, 외모, 취미 등을 입력하세요';
       default:
-        return '选填';
+        return '请输入性格、外貌、喜好等';
     }
   }
 
@@ -443,6 +472,10 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
+    // 姓名与特质均非空时才能提交
+    final canSubmit =
+        _partnerNameController.text.trim().isNotEmpty &&
+        _partnerTraitsController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
       backgroundColor: isDark
           ? AppTheme.pageBackgroundDark
@@ -573,6 +606,9 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                               : AppTheme.primaryTextLight,
                           fontSize: 17,
                         ),
+                        onChanged: (value) {
+                          setState(() {});
+                        },
                       ),
                     ),
                     Padding(
@@ -644,7 +680,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                           const SizedBox(height: 12),
                           CupertinoTextField(
                             controller: _partnerTraitsController,
-                            placeholder: _getOptionalText(),
+                            placeholder: _getTraitsPlaceholder(),
                             placeholderStyle: TextStyle(
                               color: isDark
                                   ? AppTheme.tertiaryTextDark
@@ -670,6 +706,9 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                                   : AppTheme.primaryTextLight,
                               fontSize: 17,
                             ),
+                            onChanged: (value) {
+                              setState(() {});
+                            },
                           ),
                         ],
                       ),
@@ -682,18 +721,25 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
-                  onPressed: _onSubmit,
+                  onPressed: canSubmit ? _onSubmit : null,
                   borderRadius: BorderRadius.circular(12),
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   color: isDark
                       ? AppTheme.buttonFillDark
                       : AppTheme.buttonFillLight,
+                  disabledColor: isDark
+                      ? const Color(0xFF2C2C2E)
+                      : const Color(0xFFF2F2F7),
                   child: Text(
                     _getSubmitText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
-                      color: AppTheme.buttonText,
+                      color: canSubmit
+                          ? AppTheme.buttonText
+                          : (isDark
+                                ? AppTheme.buttonDisabledTextDark
+                                : AppTheme.buttonDisabledTextLight),
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),

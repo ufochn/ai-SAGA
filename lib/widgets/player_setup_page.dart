@@ -2,6 +2,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
+import 'package:ai_saga/widgets/audit_dialog.dart';
 
 /// 主角设定页面 - 性别 + 姓名（iOS风格表单）
 class PlayerSetupPage extends StatefulWidget {
@@ -22,6 +23,9 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
 
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _playerNameEdited = false;
+
+  /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
+  bool _submitting = false;
 
   @override
   void initState() {
@@ -126,10 +130,31 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   }
 
   void _onSubmit() {
+    // 防止连点重复弹出审核弹窗、重复请求服务器
+    if (_submitting) return;
+    final playerName = _playerNameController.text.trim();
+    if (playerName.isEmpty) return;
+    _submitting = true;
     SoundService.playHorror2();
-    StorageService.savePlayerName(_playerNameController.text);
-    StorageService.savePlayerGender(_playerGenderIndex == 0 ? '男' : '女');
-    widget.onComplete();
+
+    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
+    // 审核通过（Action: NONE）时保存主角设定并进入下一步，未通过时弹窗警告
+    showCupertinoDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AuditDialog(
+        text: playerName,
+        onApproved: () {
+          StorageService.savePlayerName(playerName);
+          StorageService.savePlayerGender(
+              _playerGenderIndex == 0 ? '男' : '女');
+          widget.onComplete();
+        },
+      ),
+    ).then((_) {
+      // 弹窗关闭后（拒绝/出错）允许再次提交
+      _submitting = false;
+    });
   }
 
   /// 根据语言返回本地化的欢迎标题
@@ -489,6 +514,9 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                               : AppTheme.primaryTextLight,
                           fontSize: 17,
                         ),
+                        onChanged: (value) {
+                          setState(() {});
+                        },
                       ),
                     ),
                     Padding(
@@ -527,18 +555,27 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
-                  onPressed: _onSubmit,
+                  onPressed: _playerNameController.text.trim().isNotEmpty
+                      ? _onSubmit
+                      : null,
                   borderRadius: BorderRadius.circular(12),
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   color: isDark
                       ? AppTheme.buttonFillDark
                       : AppTheme.buttonFillLight,
+                  disabledColor: isDark
+                      ? const Color(0xFF2C2C2E)
+                      : const Color(0xFFF2F2F7),
                   child: Text(
                     _getNextText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
-                      color: AppTheme.buttonText,
+                      color: _playerNameController.text.trim().isNotEmpty
+                          ? AppTheme.buttonText
+                          : (isDark
+                                ? AppTheme.buttonDisabledTextDark
+                                : AppTheme.buttonDisabledTextLight),
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),

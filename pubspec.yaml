@@ -32,11 +32,23 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_dotenv: ^6.0.1
+  # 轻授权登录：Android 用 Google，iOS 用 Sign in with Apple
+  google_sign_in: ^6.2.1
+  sign_in_with_apple: ^6.1.1
+  # 服务端验 ID Token 所需的 JWT 解码（客户端仅解析 user_id 展示用）
+  crypto: ^3.0.3
+  # 本地 vendored 版本：官方包未声明 Android namespace，与新版 AGP 不兼容，
+  # 已在 third_party/flutter_jailbreak_detection/android/build.gradle 中补上
+  # namespace 'appmire.be.flutterjailbreakdetection'。
+  flutter_jailbreak_detection:
+    path: third_party/flutter_jailbreak_detection
   flutter_secure_storage: ^10.3.1
   http: ^1.2.2
-  js: ^0.7.2
   shared_preferences: ^2.2.2
-  web: ^1.1.1
+  # 本地 vendored 版本：官方 soundpool 已 discontinued，其 Android 插件仍引用
+  # 已移除的 v1 Registrar API，已在 third_party/soundpool 中移除该旧代码。
+  soundpool:
+    path: third_party/soundpool
 
 dev_dependencies:
   flutter_test:

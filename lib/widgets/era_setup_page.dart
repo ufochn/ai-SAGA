@@ -2,6 +2,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
+import 'package:ai_saga/widgets/audit_dialog.dart';
 
 /// 游戏年代设定页面 - 在地点之后、角色设定之前
 class EraSetupPage extends StatefulWidget {
@@ -19,6 +20,9 @@ class _EraSetupPageState extends State<EraSetupPage> {
   final FocusNode _eraFocusNode = FocusNode();
   String _selectedEra = '';
   List<String> _eraOptions = [];
+
+  /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
+  bool _submitting = false;
 
   /// 每种语言对应的默认年代（当代）
   static const _defaultEraByLanguage = {
@@ -192,11 +196,29 @@ class _EraSetupPageState extends State<EraSetupPage> {
   }
 
   void _onSubmit() {
+    // 防止连点重复弹出审核弹窗、重复请求服务器
+    if (_submitting) return;
     final era = _eraController.text.trim();
     if (era.isEmpty) return;
+    _submitting = true;
     SoundService.playConfirm();
-    StorageService.saveEra(era);
-    widget.onComplete();
+
+    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
+    // 审核通过（Action: NONE）时保存年代并进入下一步，未通过时弹窗警告
+    showCupertinoDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AuditDialog(
+        text: era,
+        onApproved: () {
+          StorageService.saveEra(era);
+          widget.onComplete();
+        },
+      ),
+    ).then((_) {
+      // 弹窗关闭后（拒绝/出错）允许再次提交
+      _submitting = false;
+    });
   }
 
   /// 弹出 Cupertino 风格的时代选择器

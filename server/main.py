@@ -6,7 +6,7 @@ AI-SAGA 审核网关 v2（账号 + 硬件公钥 + 试用/付费权益 + 云同�
 - 身份：Apple / Google ID Token，服务器用官方 JWKS 校验，取稳定 sub 作为 user_id。
 - 设备：每设备持有安全硬件公钥（私钥永不出硬件）。public_key UNIQUE 防止
   "同一硬件注册多个 ID"（同硬件 = 一身份 = 一份配额）。
-- 试用：免费用户每 7 天（冷却期）获得 3 次试用，按 user_id 与 device_id
+- 试用：免费用户每 24 小时（冷却期）获得 28 次试用，按 user_id 与 device_id
   双维度记账，防"同账号换机"与"同机换账号"刷试用。
 - 付费：entitlements 表预留"有效期 + 购买次数"双模型；付费校验服务器端完成，
   平台推送（App Store Server Notifications / Google RTDN）吊销退款，预留接口。
@@ -52,9 +52,9 @@ PAID_DAILY_QUOTA = int(os.environ.get("PAID_DAILY_QUOTA", "100"))
 # 付费用户每分钟限流
 PAID_RATE_PER_MINUTE = int(os.environ.get("PAID_RATE_PER_MINUTE", "10"))
 # 试用次数（每冷却期）
-TRIAL_QUOTA = int(os.environ.get("TRIAL_QUOTA", "3"))
+TRIAL_QUOTA = int(os.environ.get("TRIAL_QUOTA", "28"))
 # 试用冷却期（秒）
-TRIAL_COOLDOWN_SECONDS = int(os.environ.get("TRIAL_COOLDOWN_SECONDS", str(7 * 86400)))
+TRIAL_COOLDOWN_SECONDS = int(os.environ.get("TRIAL_COOLDOWN_SECONDS", str(1 * 86400)))
 # 每 IP 每小时注册次数（注册入口限流）
 REGISTER_LIMIT_PER_IP_PER_HOUR = int(os.environ.get("REGISTER_LIMIT_PER_IP_PER_HOUR", "20"))
 
@@ -798,7 +798,7 @@ async def audit_and_chat(data: InputData, request: Request):
         # 付费用户：按每日配额 + 限流
         _count_usage(user_id, int(time.time()), 0, PAID_DAILY_QUOTA, PAID_RATE_PER_MINUTE)
     else:
-        # 免费用户：试用逻辑（3 次 + 7 天冷却）
+        # 免费用户：试用逻辑（28 次 + 24 小时冷却）
         trial = _grant_trial_if_due(user_id, device_id)
         if trial["remain"] <= 0:
             raise HTTPException(

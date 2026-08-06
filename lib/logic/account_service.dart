@@ -53,11 +53,35 @@ class AccountService {
     }
   }
 
+  /// 是否为开发模式（.env 的 DEV_MODE=true）。
+  ///
+  /// 开发模式下：账号由设备 ID 确定性派生、不弹真实 OAuth；
+  /// 服务器注册被 401 拒绝时也不再回弹授权页，而是直接展示错误，避免死循环。
+  static bool get isDevMode => _devMode;
+
   /// Google 登录 client id（来自 .env，Android 用 web client id）。
   static String get _googleWebClientId => dotenv.env['GOOGLE_CLIENT_ID'] ?? '';
 
+  /// 开发模式下的确定性测试账号（由设备唯一 ID 派生，不依赖安全存储）。
+  ///
+  /// 本地 DEV_MODE 联调时，账号不需要写入 Keychain：macOS 无开发者签名时
+  /// flutter_secure_storage 的写入会"看似成功实则未写入"，导致账号读回为
+  /// null、反复弹出轻授权页。这里直接按设备 ID 派生，保证始终可用。
+  static AccountInfo _devAccount() {
+    final devUserId = StorageService.getUserUniqueId();
+    return AccountInfo(
+      provider: 'dev',
+      userId: devUserId,
+      idToken: devUserId, // 服务器 DEV_MODE 下以此字段作为 user_id
+    );
+  }
+
   /// 读取已保存的账号（不发起网络请求）。
   static Future<AccountInfo?> getCachedAccount() async {
+    // 开发模式：直接返回确定性测试账号，不再依赖 Keychain 持久化。
+    if (_devMode) {
+      return _devAccount();
+    }
     final provider = await StorageService.getSecure(_providerKey);
     final userId = await StorageService.getSecure(_userIdKey);
     final idToken = await StorageService.getSecure(_idTokenKey);
@@ -77,13 +101,8 @@ class AccountService {
     // 开发模式：不接真实 Apple/Google OAuth，用设备唯一 ID 作为测试账号，
     // 便于本地联调整条链路（注册→硬件签名→令牌→试用→同步）。
     if (_devMode) {
-      final devUserId = StorageService.getUserUniqueId();
-      final info = AccountInfo(
-        provider: 'dev',
-        userId: devUserId,
-        idToken: devUserId, // 服务器 DEV_MODE 下以此字段作为 user_id
-      );
-      await _cacheAccount(info);
+      final info = _devAccount();
+      await _cacheAccount(info); // 尽力缓存；Keychain 写失败也不影响后续读取
       return info;
     }
 

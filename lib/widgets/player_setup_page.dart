@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/widgets/audit_dialog.dart';
@@ -9,7 +10,15 @@ class PlayerSetupPage extends StatefulWidget {
   final VoidCallback onComplete;
   final VoidCallback? onBack;
 
-  const PlayerSetupPage({super.key, required this.onComplete, this.onBack});
+  /// 当前已选语言（用于检测语言是否变化，从而将主角页重置为从未设置过）
+  final String? languageKey;
+
+  const PlayerSetupPage({
+    super.key,
+    required this.onComplete,
+    this.onBack,
+    this.languageKey,
+  });
 
   @override
   State<PlayerSetupPage> createState() => _PlayerSetupPageState();
@@ -24,17 +33,37 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _playerNameEdited = false;
 
+  /// 最近一次加载姓名所使用的语言（用于检测语言变更）
+  String? _loadedLanguage;
+
   /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
   bool _submitting = false;
+
+  /// 姓名输入字数上限
+  static const int _maxNameLength = 30;
+
+  /// 当前姓名是否超过字数上限
+  bool get _isNameOverLimit =>
+      _playerNameController.text.length > _maxNameLength;
 
   @override
   void initState() {
     super.initState();
 
-    // 初始化默认姓名
-    _playerNameController.text = _getDefaultName(
-      genderIndex: _playerGenderIndex,
-    );
+    // 若此前已确认过主角（进入下一页后返回本页），恢复性别与姓名，否则用默认
+    final savedGender = SetupDraft.instance.playerGender;
+    if (savedGender == '女') {
+      _playerGenderIndex = 1;
+    } else if (savedGender == '男') {
+      _playerGenderIndex = 0;
+    }
+    final savedName = SetupDraft.instance.playerName.trim();
+    _playerNameController.text = savedName.isNotEmpty
+        ? savedName
+        : _getDefaultName(genderIndex: _playerGenderIndex);
+
+    // 记录当前已加载语言（用于检测语言变更）
+    _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
 
     // 玩家姓名监听：光标全选
     _playerNameFocusNode.addListener(() {
@@ -52,6 +81,28 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
         }
       }
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant PlayerSetupPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final newLanguage = widget.languageKey ?? StorageService.getLanguage();
+    if (newLanguage != _loadedLanguage) {
+      // 语言发生变化：主角页完全按从未设置过处理
+      // （延迟到当前帧结束后重置，避免在 build 过程中调用 setState）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _playerNameEdited = false;
+        _submitting = false;
+        _playerGenderIndex = 0;
+        SetupDraft.instance.playerName = '';
+        SetupDraft.instance.playerGender = '';
+        _playerNameController.text = _getDefaultName(
+          genderIndex: _playerGenderIndex,
+        );
+        _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
+      });
+    }
   }
 
   @override
@@ -145,9 +196,10 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
       builder: (dialogContext) => AuditDialog(
         text: playerName,
         onApproved: () {
-          StorageService.savePlayerName(playerName);
-          StorageService.savePlayerGender(
-              _playerGenderIndex == 0 ? '男' : '女');
+          SetupDraft.instance.playerName = playerName;
+          SetupDraft.instance.playerGender = _playerGenderIndex == 0
+              ? '男'
+              : '女';
           widget.onComplete();
         },
       ),
@@ -381,9 +433,36 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     }
   }
 
+  /// 根据语言返回本地化的"超过30字上限"提示
+  String _getOverLimitText() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '超過30字上限';
+      case 'en':
+        return 'Max 30 characters';
+      case 'es':
+        return 'Máximo 30 caracteres';
+      case 'fr':
+        return '30 caractères max';
+      case 'de':
+        return 'Max. 30 Zeichen';
+      case 'pt':
+        return 'Máximo 30 caracteres';
+      case 'ja':
+        return '30文字まで';
+      case 'ko':
+        return '최대 30자';
+      default:
+        return '超过30字上限';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
+    final canSubmit =
+        !_isNameOverLimit && _playerNameController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
       backgroundColor: isDark
           ? AppTheme.pageBackgroundDark
@@ -509,9 +588,13 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                         ),
                         decoration: null,
                         style: TextStyle(
-                          color: isDark
-                              ? AppTheme.primaryTextDark
-                              : AppTheme.primaryTextLight,
+                          color: _isNameOverLimit
+                              ? (isDark
+                                    ? AppTheme.destructiveRedDark
+                                    : AppTheme.destructiveRedLight)
+                              : (isDark
+                                    ? AppTheme.primaryTextDark
+                                    : AppTheme.primaryTextLight),
                           fontSize: 17,
                         ),
                         onChanged: (value) {
@@ -555,9 +638,7 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
-                  onPressed: _playerNameController.text.trim().isNotEmpty
-                      ? _onSubmit
-                      : null,
+                  onPressed: canSubmit ? _onSubmit : null,
                   borderRadius: BorderRadius.circular(12),
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   color: isDark
@@ -567,11 +648,11 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _getNextText(),
+                    _isNameOverLimit ? _getOverLimitText() : _getNextText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
-                      color: _playerNameController.text.trim().isNotEmpty
+                      color: canSubmit
                           ? AppTheme.buttonText
                           : (isDark
                                 ? AppTheme.buttonDisabledTextDark

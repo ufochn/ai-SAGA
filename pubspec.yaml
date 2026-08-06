@@ -49,6 +49,7 @@ dependencies:
   # 已移除的 v1 Registrar API，已在 third_party/soundpool 中移除该旧代码。
   soundpool:
     path: third_party/soundpool
+  webcrypto: ^0.6.0
 
 dev_dependencies:
   flutter_test:

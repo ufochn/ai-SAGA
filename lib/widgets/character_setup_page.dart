@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/widgets/audit_dialog.dart';
@@ -10,11 +11,15 @@ class CharacterSetupPage extends StatefulWidget {
   final VoidCallback? onBack;
   final int? playerGenderIndex; // 主角性别: 0=男, 1=女, null=未知
 
+  /// 当前已选语言（用于检测语言是否变化，从而将搭档页重置为从未设置过）
+  final String? languageKey;
+
   const CharacterSetupPage({
     super.key,
     required this.onComplete,
     this.onBack,
     this.playerGenderIndex,
+    this.languageKey,
   });
 
   @override
@@ -32,8 +37,25 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _partnerNameEdited = false;
 
+  /// 最近一次加载默认姓名所使用的语言（用于检测语言变更）
+  String? _loadedLanguage;
+
   /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
   bool _submitting = false;
+
+  /// 搭档姓名输入字数上限
+  static const int _maxNameLength = 30;
+
+  /// 当前搭档姓名是否超过字数上限
+  bool get _isNameOverLimit =>
+      _partnerNameController.text.length > _maxNameLength;
+
+  /// 搭档性格设定输入字数上限
+  static const int _maxTraitsLength = 100;
+
+  /// 当前搭档性格设定是否超过字数上限
+  bool get _isTraitsOverLimit =>
+      _partnerTraitsController.text.length > _maxTraitsLength;
 
   @override
   void initState() {
@@ -44,10 +66,21 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
       _partnerGenderIndex = widget.playerGenderIndex == 0 ? 1 : 0;
     }
 
-    // 初始化默认姓名
-    _partnerNameController.text = _getDefaultName(
-      genderIndex: _partnerGenderIndex,
-    );
+    // 若此前已确认过搭档（进入下一页后返回本页），恢复性别、姓名与特质，否则用默认
+    final savedGender = SetupDraft.instance.partnerGender;
+    if (savedGender == '男') {
+      _partnerGenderIndex = 0;
+    } else if (savedGender == '女') {
+      _partnerGenderIndex = 1;
+    }
+    final savedName = SetupDraft.instance.partnerName.trim();
+    _partnerNameController.text = savedName.isNotEmpty
+        ? savedName
+        : _getDefaultName(genderIndex: _partnerGenderIndex);
+    _partnerTraitsController.text = SetupDraft.instance.partnerTraits.trim();
+
+    // 记录当前已加载语言（用于检测语言变更）
+    _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
 
     // 搭档姓名监听
     _partnerNameFocusNode.addListener(() {
@@ -78,6 +111,24 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   @override
   void didUpdateWidget(covariant CharacterSetupPage oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final newLanguage = widget.languageKey ?? StorageService.getLanguage();
+    if (newLanguage != _loadedLanguage) {
+      // 语言发生变化：搭档页完全按从未设置过处理
+      // （延迟到当前帧结束后重置，避免在 build 过程中调用 setState）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _partnerNameEdited = false;
+        _submitting = false;
+        _partnerGenderIndex = widget.playerGenderIndex == 0 ? 1 : 0;
+        SetupDraft.instance.partnerName = '';
+        SetupDraft.instance.partnerGender = '';
+        SetupDraft.instance.partnerTraits = '';
+        _partnerNameController.text =
+            _getDefaultName(genderIndex: _partnerGenderIndex);
+        _partnerTraitsController.text = '';
+        _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
+      });
+    }
     if (widget.playerGenderIndex != null &&
         widget.playerGenderIndex != oldWidget.playerGenderIndex) {
       setState(() {
@@ -181,11 +232,11 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
       builder: (dialogContext) => AuditDialog(
         text: auditText,
         onApproved: () {
-          StorageService.savePartnerName(partnerName);
-          StorageService.savePartnerGender(
-              _partnerGenderIndex == 0 ? '男' : '女');
-          StorageService.savePartnerTraits(partnerTraits);
-          StorageService.setInitialized();
+          SetupDraft.instance.partnerName = partnerName;
+          SetupDraft.instance.partnerGender = _partnerGenderIndex == 0
+              ? '男'
+              : '女';
+          SetupDraft.instance.partnerTraits = partnerTraits;
           widget.onComplete();
         },
       ),
@@ -469,11 +520,37 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     }
   }
 
+  /// 根据语言返回本地化的"超过30字上限"提示
+  String _getOverLimitText() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '超過30字上限';
+      case 'en':
+        return 'Max 30 characters';
+      case 'es':
+        return 'Máximo 30 caracteres';
+      case 'fr':
+        return '30 caractères max';
+      case 'de':
+        return 'Max. 30 Zeichen';
+      case 'pt':
+        return 'Máximo 30 caracteres';
+      case 'ja':
+        return '30文字まで';
+      case 'ko':
+        return '최대 30자';
+      default:
+        return '超过30字上限';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
-    // 姓名与特质均非空时才能提交
+    // 姓名与特质均非空、且姓名未超过字数上限时才能提交
     final canSubmit =
+        !_isNameOverLimit &&
         _partnerNameController.text.trim().isNotEmpty &&
         _partnerTraitsController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
@@ -601,9 +678,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                         ),
                         decoration: null,
                         style: TextStyle(
-                          color: isDark
-                              ? AppTheme.primaryTextDark
-                              : AppTheme.primaryTextLight,
+                          color: _isNameOverLimit
+                              ? (isDark
+                                    ? AppTheme.destructiveRedDark
+                                    : AppTheme.destructiveRedLight)
+                              : (isDark
+                                    ? AppTheme.primaryTextDark
+                                    : AppTheme.primaryTextLight),
                           fontSize: 17,
                         ),
                         onChanged: (value) {
@@ -701,9 +782,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                               ),
                             ),
                             style: TextStyle(
-                              color: isDark
-                                  ? AppTheme.primaryTextDark
-                                  : AppTheme.primaryTextLight,
+                              color: _isTraitsOverLimit
+                                  ? (isDark
+                                        ? AppTheme.destructiveRedDark
+                                        : AppTheme.destructiveRedLight)
+                                  : (isDark
+                                        ? AppTheme.primaryTextDark
+                                        : AppTheme.primaryTextLight),
                               fontSize: 17,
                             ),
                             onChanged: (value) {
@@ -731,7 +816,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _getSubmitText(),
+                    _isNameOverLimit ? _getOverLimitText() : _getSubmitText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,

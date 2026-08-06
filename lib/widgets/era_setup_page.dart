@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/widgets/audit_dialog.dart';
@@ -9,7 +10,15 @@ class EraSetupPage extends StatefulWidget {
   final VoidCallback onComplete;
   final VoidCallback? onBack;
 
-  const EraSetupPage({super.key, required this.onComplete, this.onBack});
+  /// 当前已选语言（用于检测语言是否变化，从而将年代页重置为从未设置过）
+  final String? languageKey;
+
+  const EraSetupPage({
+    super.key,
+    required this.onComplete,
+    this.onBack,
+    this.languageKey,
+  });
 
   @override
   State<EraSetupPage> createState() => _EraSetupPageState();
@@ -21,8 +30,20 @@ class _EraSetupPageState extends State<EraSetupPage> {
   String _selectedEra = '';
   List<String> _eraOptions = [];
 
+  /// 用户是否已通过选择齿轮选过年代（用于决定第二次打开齿轮时的对准项）
+  bool _hasPickedEra = false;
+
+  /// 最近一次加载年代列表所使用的语言（用于检测语言变更）
+  String? _loadedLanguage;
+
   /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
   bool _submitting = false;
+
+  /// 输入字数上限
+  static const int _maxTextLength = 30;
+
+  /// 当前输入是否超过字数上限
+  bool get _isOverLimit => _eraController.text.length > _maxTextLength;
 
   /// 每种语言对应的默认年代（当代）
   static const _defaultEraByLanguage = {
@@ -46,6 +67,23 @@ class _EraSetupPageState extends State<EraSetupPage> {
   }
 
   @override
+  void didUpdateWidget(covariant EraSetupPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final newLanguage = widget.languageKey ?? StorageService.getLanguage();
+    if (newLanguage != _loadedLanguage) {
+      // 语言发生变化：年代页完全按从未设置过处理
+      // （延迟到当前帧结束后重置，避免在 build 过程中调用 setState）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _hasPickedEra = false;
+        _submitting = false;
+        SetupDraft.instance.era = '';
+        _loadEraOptions();
+      });
+    }
+  }
+
+  @override
   void dispose() {
     _eraFocusNode.removeListener(_onFocusChange);
     _eraFocusNode.dispose();
@@ -65,16 +103,25 @@ class _EraSetupPageState extends State<EraSetupPage> {
     }
   }
 
-  /// 根据已选语言加载年代选项，默认选中当代
+  /// 根据已选语言加载年代选项，默认选中当代；
+  /// 若用户此前已确认过年代（进入下一页后返回本页），则恢复该年代而非默认
   void _loadEraOptions() {
+    _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
     final language = StorageService.getLanguage();
     final eras = _getEraOptionsForLanguage(language);
     final defaultEra = _defaultEraByLanguage[language] ?? eras.first;
+    // 用户已确认过的年代（点击"确认年代"后保存到草稿）
+    final savedEra = SetupDraft.instance.era.trim();
     setState(() {
       _eraOptions = eras;
       if (eras.isNotEmpty) {
-        _selectedEra = eras.contains(defaultEra) ? defaultEra : eras.first;
-        _eraController.text = _selectedEra;
+        if (savedEra.isNotEmpty) {
+          _selectedEra = savedEra;
+          _eraController.text = savedEra;
+        } else {
+          _selectedEra = eras.contains(defaultEra) ? defaultEra : eras.first;
+          _eraController.text = _selectedEra;
+        }
       }
     });
   }
@@ -192,6 +239,7 @@ class _EraSetupPageState extends State<EraSetupPage> {
     setState(() {
       _selectedEra = era;
       _eraController.text = era;
+      _hasPickedEra = true;
     });
   }
 
@@ -211,7 +259,7 @@ class _EraSetupPageState extends State<EraSetupPage> {
       builder: (dialogContext) => AuditDialog(
         text: era,
         onApproved: () {
-          StorageService.saveEra(era);
+          SetupDraft.instance.era = era;
           widget.onComplete();
         },
       ),
@@ -222,15 +270,31 @@ class _EraSetupPageState extends State<EraSetupPage> {
   }
 
   /// 弹出 Cupertino 风格的时代选择器
+  ///
+  /// 输入框保留用户之前的年代。首次打开齿轮时默认对准该语言默认的
+  /// 年代（当代）；若用户已通过齿轮选过年代，则保持用户所选择的年代。
   void _showEraPicker() {
     final fixedList = List<String>.from(_eraOptions);
-    final initialIndex = fixedList.indexOf(_selectedEra);
+    var initialIndex;
+    if (_hasPickedEra) {
+      // 用户已通过齿轮选过年代，保持该选择
+      initialIndex = fixedList.indexOf(_selectedEra);
+      if (initialIndex < 0) initialIndex = 0;
+    } else {
+      // 首次打开：对准该语言默认的年代
+      final language = StorageService.getLanguage();
+      final defaultEra =
+          _defaultEraByLanguage[language] ??
+          (fixedList.isEmpty ? '' : fixedList.first);
+      initialIndex = defaultEra.isEmpty ? 0 : fixedList.indexOf(defaultEra);
+      if (initialIndex < 0) initialIndex = 0;
+    }
     showCupertinoModalPopup(
       context: context,
       builder: (BuildContext context) {
         return _EraPickerWheel(
           eras: fixedList,
-          initialIndex: initialIndex >= 0 ? initialIndex : 0,
+          initialIndex: initialIndex,
           onSelectedItemChanged: (int index) {
             _onEraSelected(fixedList[index]);
           },
@@ -390,9 +454,35 @@ class _EraSetupPageState extends State<EraSetupPage> {
     }
   }
 
+  /// 根据语言返回本地化的"超过30字上限"提示
+  String _getOverLimitText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '超過30字上限';
+      case 'en':
+        return 'Max 30 characters';
+      case 'es':
+        return 'Máximo 30 caracteres';
+      case 'fr':
+        return '30 caractères max';
+      case 'de':
+        return 'Max. 30 Zeichen';
+      case 'pt':
+        return 'Máximo 30 caracteres';
+      case 'ja':
+        return '30文字まで';
+      case 'ko':
+        return '최대 30자';
+      default:
+        return '超过30字上限';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
+    final canSubmit = !_isOverLimit && _eraController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
       backgroundColor: isDark
           ? AppTheme.pageBackgroundDark
@@ -468,9 +558,13 @@ class _EraSetupPageState extends State<EraSetupPage> {
                   ),
                   decoration: null,
                   style: TextStyle(
-                    color: isDark
-                        ? AppTheme.primaryTextDark
-                        : AppTheme.primaryTextLight,
+                    color: _isOverLimit
+                        ? (isDark
+                              ? AppTheme.destructiveRedDark
+                              : AppTheme.destructiveRedLight)
+                        : (isDark
+                              ? AppTheme.primaryTextDark
+                              : AppTheme.primaryTextLight),
                     fontSize: 17,
                   ),
                   onChanged: (value) {
@@ -527,9 +621,7 @@ class _EraSetupPageState extends State<EraSetupPage> {
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
-                  onPressed: _eraController.text.trim().isNotEmpty
-                      ? _onSubmit
-                      : null,
+                  onPressed: canSubmit ? _onSubmit : null,
                   borderRadius: BorderRadius.circular(12),
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   color: isDark
@@ -539,11 +631,11 @@ class _EraSetupPageState extends State<EraSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _getConfirmText(),
+                    _isOverLimit ? _getOverLimitText() : _getConfirmText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
-                      color: _eraController.text.trim().isNotEmpty
+                      color: canSubmit
                           ? AppTheme.buttonText
                           : (isDark
                                 ? AppTheme.buttonDisabledTextDark
@@ -563,7 +655,7 @@ class _EraSetupPageState extends State<EraSetupPage> {
 }
 
 /// Cupertino 风格的时代选择滚轮弹窗
-class _EraPickerWheel extends StatelessWidget {
+class _EraPickerWheel extends StatefulWidget {
   final List<String> eras;
   final int initialIndex;
   final ValueChanged<int> onSelectedItemChanged;
@@ -573,6 +665,20 @@ class _EraPickerWheel extends StatelessWidget {
     required this.initialIndex,
     required this.onSelectedItemChanged,
   });
+
+  @override
+  State<_EraPickerWheel> createState() => _EraPickerWheelState();
+}
+
+class _EraPickerWheelState extends State<_EraPickerWheel> {
+  /// 当前滚轮停留的索引（默认即初始索引；仅在点 Done 时提交）
+  late int _currentIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentIndex = widget.initialIndex;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -626,7 +732,11 @@ class _EraPickerWheel extends StatelessWidget {
                         : CupertinoColors.activeBlue,
                   ),
                 ),
-                onPressed: () => Navigator.of(context).pop(),
+                onPressed: () {
+                  // 即便用户没有拨动滚轮，也提交当前显示的时代（默认项）
+                  widget.onSelectedItemChanged(_currentIndex);
+                  Navigator.of(context).pop();
+                },
               ),
             ],
           ),
@@ -634,11 +744,16 @@ class _EraPickerWheel extends StatelessWidget {
           Expanded(
             child: CupertinoPicker(
               scrollController: FixedExtentScrollController(
-                initialItem: initialIndex,
+                initialItem: widget.initialIndex,
               ),
               itemExtent: 36,
-              onSelectedItemChanged: onSelectedItemChanged,
-              children: eras.map((era) {
+              onSelectedItemChanged: (index) {
+                setState(() {
+                  _currentIndex = index;
+                });
+                widget.onSelectedItemChanged(index);
+              },
+              children: widget.eras.map((era) {
                 return Center(
                   child: Text(
                     era,

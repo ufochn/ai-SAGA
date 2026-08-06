@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/widgets/audit_dialog.dart';
@@ -9,7 +10,15 @@ class LocationSetupPage extends StatefulWidget {
   final VoidCallback onComplete;
   final VoidCallback? onBack;
 
-  const LocationSetupPage({super.key, required this.onComplete, this.onBack});
+  /// 当前已选语言（用于检测语言是否变化，从而将地名页重置为从未设置过）
+  final String? languageKey;
+
+  const LocationSetupPage({
+    super.key,
+    required this.onComplete,
+    this.onBack,
+    this.languageKey,
+  });
 
   @override
   State<LocationSetupPage> createState() => _LocationSetupPageState();
@@ -21,14 +30,43 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
   String _selectedCity = '';
   List<String> _cityOptions = [];
 
+  /// 用户是否已通过选择齿轮选过城市（用于决定第二次打开齿轮时的对准项）
+  bool _hasPickedCity = false;
+
+  /// 最近一次加载城市列表所使用的语言（用于检测语言变更）
+  String? _loadedLanguage;
+
   /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
   bool _submitting = false;
+
+  /// 输入字数上限
+  static const int _maxTextLength = 30;
+
+  /// 当前输入是否超过字数上限
+  bool get _isOverLimit => _locationController.text.length > _maxTextLength;
 
   @override
   void initState() {
     super.initState();
     _locationFocusNode.addListener(_onFocusChange);
     _loadCityOptions();
+  }
+
+  @override
+  void didUpdateWidget(covariant LocationSetupPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final newLanguage = widget.languageKey ?? StorageService.getLanguage();
+    if (newLanguage != _loadedLanguage) {
+      // 语言发生变化：地名页完全按从未设置过处理
+      // （延迟到当前帧结束后重置，避免在 build 过程中调用 setState）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _hasPickedCity = false;
+        _submitting = false;
+        SetupDraft.instance.location = '';
+        _loadCityOptions();
+      });
+    }
   }
 
   @override
@@ -65,18 +103,27 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
     'ko': '서울',
   };
 
-  /// 根据已选语言加载城市列表，默认选中该语言最有名的城市
+  /// 根据已选语言加载城市列表，默认选中该语言最有名的城市；
+  /// 若用户此前已确认过地点（进入下一页后返回本页），则恢复该地点而非默认城市
   void _loadCityOptions() {
+    _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
     final language = StorageService.getLanguage();
     final cities = _getCitiesForLanguage(language);
     final defaultCity = _defaultCityByLanguage[language] ?? cities.first;
+    // 用户已确认过的地点（点击"确认地点"后保存到草稿）
+    final savedLocation = SetupDraft.instance.location.trim();
     setState(() {
       _cityOptions = cities;
       if (cities.isNotEmpty) {
-        _selectedCity = cities.contains(defaultCity)
-            ? defaultCity
-            : cities.first;
-        _locationController.text = _selectedCity;
+        if (savedLocation.isNotEmpty) {
+          _selectedCity = savedLocation;
+          _locationController.text = savedLocation;
+        } else {
+          _selectedCity = cities.contains(defaultCity)
+              ? defaultCity
+              : cities.first;
+          _locationController.text = _selectedCity;
+        }
       }
     });
   }
@@ -258,6 +305,7 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
     setState(() {
       _selectedCity = city;
       _locationController.text = city;
+      _hasPickedCity = true;
     });
   }
 
@@ -277,7 +325,7 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
       builder: (dialogContext) => AuditDialog(
         text: location,
         onApproved: () {
-          StorageService.saveLocation(location);
+          SetupDraft.instance.location = location;
           widget.onComplete();
         },
       ),
@@ -288,15 +336,31 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
   }
 
   /// 弹出 Cupertino 风格的城市选择器
+  ///
+  /// 输入框保留用户之前的地名。首次打开齿轮时默认对准该语言最著名的
+  /// 默认城市；若用户已通过齿轮选过城市，则保持用户所选择的城市。
   void _showCityPicker() {
     final fixedList = List<String>.from(_cityOptions);
-    final initialIndex = fixedList.indexOf(_selectedCity);
+    var initialIndex;
+    if (_hasPickedCity) {
+      // 用户已通过齿轮选过城市，保持该选择
+      initialIndex = fixedList.indexOf(_selectedCity);
+      if (initialIndex < 0) initialIndex = 0;
+    } else {
+      // 首次打开：对准该语言最著名的默认城市
+      final language = StorageService.getLanguage();
+      final defaultCity =
+          _defaultCityByLanguage[language] ??
+          (fixedList.isEmpty ? '' : fixedList.first);
+      initialIndex = defaultCity.isEmpty ? 0 : fixedList.indexOf(defaultCity);
+      if (initialIndex < 0) initialIndex = 0;
+    }
     showCupertinoModalPopup(
       context: context,
       builder: (BuildContext context) {
         return _CityPickerWheel(
           cities: fixedList,
-          initialIndex: initialIndex >= 0 ? initialIndex : 0,
+          initialIndex: initialIndex,
           onSelectedItemChanged: (int index) {
             _onCitySelected(fixedList[index]);
           },
@@ -405,9 +469,36 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
     }
   }
 
+  /// 根据语言返回本地化的"超过30字上限"提示
+  String _getOverLimitText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '超過30字上限';
+      case 'en':
+        return 'Max 30 characters';
+      case 'es':
+        return 'Máximo 30 caracteres';
+      case 'fr':
+        return '30 caractères max';
+      case 'de':
+        return 'Max. 30 Zeichen';
+      case 'pt':
+        return 'Máximo 30 caracteres';
+      case 'ja':
+        return '30文字まで';
+      case 'ko':
+        return '최대 30자';
+      default:
+        return '超过30字上限';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
+    final canSubmit =
+        !_isOverLimit && _locationController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
       backgroundColor: isDark
           ? AppTheme.pageBackgroundDark
@@ -483,9 +574,13 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
                   ),
                   decoration: null,
                   style: TextStyle(
-                    color: isDark
-                        ? AppTheme.primaryTextDark
-                        : AppTheme.primaryTextLight,
+                    color: _isOverLimit
+                        ? (isDark
+                              ? AppTheme.destructiveRedDark
+                              : AppTheme.destructiveRedLight)
+                        : (isDark
+                              ? AppTheme.primaryTextDark
+                              : AppTheme.primaryTextLight),
                     fontSize: 17,
                   ),
                   onChanged: (value) {
@@ -573,9 +668,7 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
               SizedBox(
                 height: 48,
                 child: CupertinoButton.filled(
-                  onPressed: _locationController.text.trim().isNotEmpty
-                      ? _onSubmit
-                      : null,
+                  onPressed: canSubmit ? _onSubmit : null,
                   borderRadius: BorderRadius.circular(12),
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   color: isDark
@@ -585,11 +678,11 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _getConfirmText(),
+                    _isOverLimit ? _getOverLimitText() : _getConfirmText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
-                      color: _locationController.text.trim().isNotEmpty
+                      color: canSubmit
                           ? AppTheme.buttonText
                           : (isDark
                                 ? AppTheme.buttonDisabledTextDark
@@ -609,7 +702,7 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
 }
 
 /// Cupertino 风格的城市选择滚轮弹窗
-class _CityPickerWheel extends StatelessWidget {
+class _CityPickerWheel extends StatefulWidget {
   final List<String> cities;
   final int initialIndex;
   final ValueChanged<int> onSelectedItemChanged;
@@ -619,6 +712,20 @@ class _CityPickerWheel extends StatelessWidget {
     required this.initialIndex,
     required this.onSelectedItemChanged,
   });
+
+  @override
+  State<_CityPickerWheel> createState() => _CityPickerWheelState();
+}
+
+class _CityPickerWheelState extends State<_CityPickerWheel> {
+  /// 当前滚轮停留的索引（默认即初始索引；仅在点 Done 时提交）
+  late int _currentIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentIndex = widget.initialIndex;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -672,7 +779,11 @@ class _CityPickerWheel extends StatelessWidget {
                         : CupertinoColors.activeBlue,
                   ),
                 ),
-                onPressed: () => Navigator.of(context).pop(),
+                onPressed: () {
+                  // 即便用户没有拨动滚轮，也提交当前显示的地名（默认项）
+                  widget.onSelectedItemChanged(_currentIndex);
+                  Navigator.of(context).pop();
+                },
               ),
             ],
           ),
@@ -680,11 +791,16 @@ class _CityPickerWheel extends StatelessWidget {
           Expanded(
             child: CupertinoPicker(
               scrollController: FixedExtentScrollController(
-                initialItem: initialIndex,
+                initialItem: widget.initialIndex,
               ),
               itemExtent: 36,
-              onSelectedItemChanged: onSelectedItemChanged,
-              children: cities.map((city) {
+              onSelectedItemChanged: (index) {
+                setState(() {
+                  _currentIndex = index;
+                });
+                widget.onSelectedItemChanged(index);
+              },
+              children: widget.cities.map((city) {
                 return Center(
                   child: Text(
                     city,

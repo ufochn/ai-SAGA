@@ -105,8 +105,10 @@ class AuthService {
         .timeout(const Duration(seconds: 20));
 
     if (response.statusCode != 200) {
-      // 服务器可能因 id_token 过期要求重新授权
-      if (response.statusCode == 401) {
+      // 服务器可能因 id_token 过期要求重新授权。
+      // 开发模式（DEV_MODE=true）：不清理账号、不回弹授权页，直接展示服务端
+      // 错误，避免"授权-重试-401"死循环（服务器需配合 DEV_MODE=1 才能接受注册）。
+      if (response.statusCode == 401 && !AccountService.isDevMode) {
         await AccountService.clear();
         throw const AuthNotAuthorizedException();
       }

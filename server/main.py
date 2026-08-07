@@ -30,7 +30,16 @@ import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+# 加载同目录 .env（可选）：未安装 python-dotenv 时静默跳过，不影响启动
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # ================= 配置区域（均可通过环境变量覆盖） =================
 # 开发模式：DEV_MODE=1 时启用 provider=dev（跳过 Apple/Google OAuth 校验，
@@ -38,6 +47,9 @@ from pydantic import BaseModel
 DEV_MODE = os.environ.get("DEV_MODE", "0") == "1"
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY", "")
 DIFY_API_URL = os.environ.get("DIFY_API_URL", "https://api.dify.ai/v1/workflows/run")
+# 小说生成工作流（与审核工作流并行，必须显式配置独立 API Key，不允许兜底复用审核 Key）
+STORY_DIFY_API_KEY = os.environ.get("STORY_DIFY_API_KEY", "")
+STORY_DIFY_API_URL = os.environ.get("STORY_DIFY_API_URL", DIFY_API_URL)
 # 输出 token 上限（Dify max_tokens，需在 Dify 画布 LLM 节点绑定 max_tokens 输入变量）
 DIFY_MAX_TOKENS = int(os.environ.get("DIFY_MAX_TOKENS", "4000"))
 # 输入 token 估算上限（入口硬拦，估算在花钱之前）
@@ -57,6 +69,13 @@ TRIAL_QUOTA = int(os.environ.get("TRIAL_QUOTA", "28"))
 TRIAL_COOLDOWN_SECONDS = int(os.environ.get("TRIAL_COOLDOWN_SECONDS", str(1 * 86400)))
 # 每 IP 每小时注册次数（注册入口限流）
 REGISTER_LIMIT_PER_IP_PER_HOUR = int(os.environ.get("REGISTER_LIMIT_PER_IP_PER_HOUR", "20"))
+# 小说生成工作流全局每日上限（24 小时滚动窗口，防止滥用/被刷）
+STORY_DAILY_LIMIT = int(os.environ.get("STORY_DAILY_LIMIT", "500"))
+STORY_WINDOW_SECONDS = 24 * 3600
+# 小说生成首段字数：攒满该字数先审核，通过才开始显示
+STORY_FIRST_CHUNK = int(os.environ.get("STORY_FIRST_CHUNK", "450"))
+# 第二次审核起点：从该位置到结尾（默认 400，与首段形成 50 字重叠，防边界漏网）
+STORY_SECOND_AUDIT_START = int(os.environ.get("STORY_SECOND_AUDIT_START", "400"))
 
 # 客户端配置（校验 ID Token 的 audience / issuer）
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -159,6 +178,12 @@ CREATE TABLE IF NOT EXISTS rate (
     ts      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate_user_ts ON rate(user_id, ts);
+
+-- 小说生成工作流全局调用记录（24 小时滚动窗口限流）
+CREATE TABLE IF NOT EXISTS story_usage (
+    ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_story_usage_ts ON story_usage(ts);
 """
 
 
@@ -206,6 +231,13 @@ if not DIFY_API_KEY:
     raise RuntimeError(
         "环境变量 DIFY_API_KEY 未配置，无法启动。"
         "请在容器启动时通过 --env-file 注入 DIFY_API_KEY。"
+    )
+
+if not STORY_DIFY_API_KEY:
+    raise RuntimeError(
+        "环境变量 STORY_DIFY_API_KEY 未配置，无法启动。"
+        "每次调用 Dify 必须显式指定工作流：请为小说生成工作流单独配置 STORY_DIFY_API_KEY"
+        "（不可复用审核 Key，避免请求打到错误的 Dify 流程）。"
     )
 
 app = FastAPI(title="AI-SAGA 审核网关 v2")
@@ -294,6 +326,22 @@ class InputData(BaseModel):
     token: str = ""
     user_id: str = ""
     text: str
+
+
+class StoryInputData(BaseModel):
+    """小说生成请求：与 Dify 工作流「开始」节点变量一一对应。"""
+    token: str = ""
+    user_id: str = ""
+    location: str = ""
+    era: str = ""
+    player_name: str = ""
+    player_gender: str = ""
+    partner_name: str = ""
+    partner_gender: str = ""
+    partner_traits: str = ""
+    language: str = ""
+    user_input: str = ""
+    user_input_counter: int = 0
 
 
 class PurchaseData(BaseModel):
@@ -846,6 +894,237 @@ async def audit_and_chat(data: InputData, request: Request):
         raise HTTPException(status_code=503, detail=f"与 Dify 服务器通信网络异常: {str(exc)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"网关内部解析异常: {str(e)}")
+
+
+def _check_story_quota(now: int) -> None:
+    """小说生成工作流全局 24 小时滚动配额：超限直接 429 报警，禁止继续调用。"""
+    conn = _db()
+    try:
+        # 清理窗口外旧记录
+        conn.execute("DELETE FROM story_usage WHERE ts < ?", (now - STORY_WINDOW_SECONDS,))
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM story_usage WHERE ts > ?",
+            (now - STORY_WINDOW_SECONDS,),
+        ).fetchone()
+        if row["c"] >= STORY_DAILY_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail=f"小说生成今日调用已达上限 {STORY_DAILY_LIMIT} 次，已触发报警并禁止继续调用，请 24 小时后再试",
+            )
+        # 记录本次调用
+        conn.execute("INSERT INTO story_usage (ts) VALUES (?)", (now,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sse(obj: dict) -> str:
+    """把字典编码为一条 SSE 事件（data: {...}\n\n）。"""
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+async def _moderate_story(text: str) -> bool:
+    """调用审核工作流，返回 True=通过(Action: NONE)，False=不通过或审核异常（fail-closed）。"""
+    if not text or not text.strip():
+        return True
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "inputs": {"text_to_screen": text, "max_tokens": DIFY_MAX_TOKENS},
+        "response_mode": "blocking",
+        "user": "story-moderation",
+    }
+    try:
+        resp = await async_http_client.post(
+            DIFY_API_URL, json=payload, headers=headers, timeout=60.0
+        )
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        out = data.get("data", {}).get("outputs", {}).get("text", "") or ""
+        # 审核工作流输出形如 "Action: NONE\nProcessed Output: ..."，含 action: none 即通过
+        return bool(re.search(r"action\s*[:=]\s*none", out, re.IGNORECASE))
+    except Exception:
+        return False
+
+
+# ================= 路由：小说生成（流式：先审首段 → 打字 → 剩余全审 → reveal） =================
+@app.post("/api/generate-story")
+async def generate_story(data: StoryInputData, request: Request):
+    token = _extract_token(data, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+
+    # 小说生成工作流全局每日配额（默认 500 次 / 24 小时滚动）
+    _check_story_quota(int(time.time()))
+
+    # 输入成本控制（花钱之前硬拦）：把全部设定字段合并后估算 token
+    combined = " ".join(
+        [
+            data.location,
+            data.era,
+            data.player_name,
+            data.player_gender,
+            data.partner_name,
+            data.partner_gender,
+            data.partner_traits,
+            data.language,
+            data.user_input,
+        ]
+    )
+    _check_input_budget(combined)
+
+    ent = _get_entitlement(user_id)
+    paid = _is_paid_active(ent)
+
+    if paid:
+        # 付费用户：按每日配额 + 限流
+        _count_usage(user_id, int(time.time()), 0, PAID_DAILY_QUOTA, PAID_RATE_PER_MINUTE)
+    else:
+        # 免费用户：试用逻辑（28 次 + 24 小时冷却）
+        trial = _grant_trial_if_due(user_id, device_id)
+        if trial["remain"] <= 0:
+            raise HTTPException(
+                status_code=403,
+                detail="试用次数已用完，请购买后继续使用",
+            )
+        _consume_trial(user_id, device_id)
+
+    # Dify 开始节点 required 变量必须非空，空值用占位符兜底
+    def _fill(v: str) -> str:
+        return v.strip() if v and v.strip() else "未设定"
+
+    headers = {
+        "Authorization": f"Bearer {STORY_DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    dify_payload = {
+        "inputs": {
+            "location": _fill(data.location),
+            "era": _fill(data.era),
+            "player_name": _fill(data.player_name),
+            "player_gender": _fill(data.player_gender),
+            "partner_name": _fill(data.partner_name),
+            "partner_gender": _fill(data.partner_gender),
+            "partner_traits": _fill(data.partner_traits),
+            "language": _fill(data.language),
+            "user_input": data.user_input or "",
+            # 开始节点 user_input_counter 为 text-input 类型，Dify 要求以字符串提交
+            "user_input_counter": str(int(data.user_input_counter or 0)),
+            "max_tokens": DIFY_MAX_TOKENS,
+        },
+        "response_mode": "streaming",
+        "user": user_id,
+    }
+
+    async def _stream():
+        try:
+            async with async_http_client.stream(
+                "POST", STORY_DIFY_API_URL, json=dify_payload, headers=headers
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    yield _sse({"event": "error", "message": f"Dify 接口失败 {resp.status_code}: {body[:500]}"})
+                    return
+
+                first_buf = ""      # 前 STORY_FIRST_CHUNK 字（先审后发）
+                rest_buf = ""       # 剩余缓冲（先审后 reveal）
+                full_text = ""      # 累计全部文本
+                sent_first = False
+                outputs = {}
+
+                async for line in resp.aiter_lines():
+                    if not line.strip().startswith("data:"):
+                        continue
+                    raw = line.strip()[5:].strip()
+                    if not raw:
+                        continue
+                    try:
+                        evt = json.loads(raw)
+                    except Exception:
+                        continue
+                    etype = evt.get("event")
+                    edata = evt.get("data") or {}
+
+                    if etype == "text_chunk":
+                        txt = edata.get("text", "") or ""
+                        full_text += txt
+                        if not sent_first:
+                            first_buf += txt
+                            if len(first_buf) >= STORY_FIRST_CHUNK:
+                                if not await _moderate_story(first_buf):
+                                    yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                                    return
+                                yield _sse({"event": "chunk", "text": first_buf})
+                                sent_first = True
+                        else:
+                            rest_buf += txt
+
+                    elif etype == "workflow_finished":
+                        outputs = edata.get("outputs") or {}
+                        if not sent_first:
+                            # 全文不足首段字数：整体审一次再发
+                            final_all = outputs.get("text", "") or full_text
+                            if not await _moderate_story(final_all):
+                                yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                                return
+                            yield _sse({"event": "chunk", "text": final_all})
+                        else:
+                            out_text = outputs.get("text", "")
+                            if out_text and out_text.startswith(first_buf):
+                                rest = out_text[len(first_buf):]   # 展示：首段(450)之后，避免重复
+                            else:
+                                rest = rest_buf
+                            if rest:
+                                # 第二次审核：从 STORY_SECOND_AUDIT_START(400) 到结尾（含与首段的 50 字重叠）
+                                if out_text and len(out_text) > STORY_SECOND_AUDIT_START:
+                                    audit_text = out_text[STORY_SECOND_AUDIT_START:]
+                                else:
+                                    audit_text = rest
+                                if not await _moderate_story(audit_text):
+                                    yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                                    return
+                                yield _sse({"event": "reveal", "text": rest, "outputs": outputs})
+                            else:
+                                yield _sse({"event": "reveal", "text": "", "outputs": outputs})
+                        yield _sse({"event": "done", "outputs": outputs})
+                        return
+
+                    elif etype in ("error", "workflow_failed"):
+                        yield _sse({"event": "error", "message": edata.get("message") or "Dify 工作流执行失败"})
+                        return
+
+                # 流意外结束（未收到 workflow_finished）：兜底，但剩余内容仍须先审核再 reveal
+                if not sent_first and full_text:
+                    if await _moderate_story(full_text):
+                        yield _sse({"event": "chunk", "text": full_text})
+                        yield _sse({"event": "done", "outputs": outputs})
+                    else:
+                        yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                elif rest_buf:
+                    if await _moderate_story(rest_buf):
+                        yield _sse({"event": "reveal", "text": rest_buf, "outputs": outputs})
+                        yield _sse({"event": "done", "outputs": outputs})
+                    else:
+                        yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                else:
+                    yield _sse({"event": "error", "message": "生成流意外中断"})
+        except httpx.RequestError as exc:
+            yield _sse({"event": "error", "message": f"与 Dify 通信异常: {str(exc)}"})
+        except Exception as e:
+            yield _sse({"event": "error", "message": f"网关异常: {str(e)}"})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 关掉 nginx 缓冲，保证实时转发
+        },
+    )
 
 
 # ================= 付费验证（S6，预留） =================

@@ -1,6 +1,5 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/widgets/character_text.dart';
-import 'package:ai_saga/widgets/position_button.dart';
 import 'package:ai_saga/widgets/text_input_panel.dart';
 import 'package:ai_saga/widgets/initialization_page.dart';
 import 'package:ai_saga/widgets/location_setup_page.dart';
@@ -10,6 +9,7 @@ import 'package:ai_saga/widgets/character_setup_page.dart';
 
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/logic/story_service.dart';
 import 'package:ai_saga/widgets/setup_confirmation_page.dart';
 
 /// 用于控制菜单按钮显示/隐藏的通知器
@@ -60,6 +60,22 @@ class _HomeContentState extends State<HomeContent>
 
   /// 是否正在显示黑屏过渡（全黑 → 渐渐点亮）
   bool _blackoutActive = false;
+
+  /// 是否正在调用服务器/Dify 生成小说（黑屏上显示加载提示）
+  bool _generating = false;
+
+  /// 流式小说正文（随 chunk/reveal 累计）
+  String _storyText = '';
+
+  /// 当前段落在 [_storyText] 中的起始下标：打字机按段落内进度重新从最慢加速，
+  /// 保证每次续写输入都从头以慢速开始输出。
+  int _segmentStart = 0;
+
+  /// 违规中止原因（非空时隐藏正文并显示该提示）
+  String? _storyAbortReason;
+
+  /// 生成轮次计数（续写时作为 user_input_counter）
+  int _storyRound = 0;
 
   @override
   void initState() {
@@ -118,25 +134,75 @@ class _HomeContentState extends State<HomeContent>
   String get _fullText =>
       _mainText + _button1Content + _button2Content + _inputContent;
 
-  void _onButton1Pressed() {
-    setState(() {
-      _button1Content += '按钮1';
-    });
-    StorageService.saveButton1Content(_button1Content);
-  }
+  void _onInput1Confirm(String text) => _continueStory(text);
 
-  void _onButton2Pressed() {
-    setState(() {
-      _button2Content += '按钮2';
-    });
-    StorageService.saveButton2Content(_button2Content);
-  }
+  void _onInput2Confirm(String text) => _continueStory(text);
 
-  void _onInputConfirm(String text) {
+  void _onInputConfirm(String text) => _continueStory(text);
+
+  /// 任一输入框确认后：把输入作为 user_input，连同用户设定请求续写生成，
+  /// 新内容在屏幕上接力显示（追加到 _storyText，由打字机继续揭示）。
+  Future<void> _continueStory(String userInput) async {
+    if (!mounted || userInput.trim().isEmpty) return;
+    // 新一段内容与旧内容相隔一行（只在首个 chunk 前加一次）
+    bool sepAdded = false;
     setState(() {
-      _inputContent += text;
+      _generating = true;
+      _segmentStart = _storyText.length; // 新段落起点（续写内容从此开始）
+      _storyAbortReason = null;
     });
-    StorageService.saveInputContent(_inputContent);
+    await StoryService.generateStoryStream(
+      location: SetupDraft.instance.location,
+      era: SetupDraft.instance.era,
+      playerName: SetupDraft.instance.playerName,
+      playerGender: SetupDraft.instance.playerGender,
+      partnerName: SetupDraft.instance.partnerName,
+      partnerGender: SetupDraft.instance.partnerGender,
+      partnerTraits: SetupDraft.instance.partnerTraits,
+      language: StorageService.getLanguage(),
+      userInput: userInput,
+      userInputCounter: _storyRound,
+      onChunk: (text) {
+        if (!mounted) return;
+        setState(() {
+          if (!sepAdded && _storyText.isNotEmpty) {
+            _storyText += '\n\n'; // 与上一段相隔一行
+            sepAdded = true;
+            _segmentStart = _storyText.length; // 新段落正文起点（分隔符之后）
+          }
+          _storyText += text;
+          _mainText = _storyText;
+          _generating = false;
+        });
+      },
+      onReveal: (text, outputs) {
+        if (!mounted) return;
+        // 剩余部分不再一次性显示，而是由打字机以不断加速的方式接续打出
+        setState(() {
+          _storyText += text;
+          _mainText = _storyText;
+          _generating = false;
+        });
+      },
+      onAbort: (reason) {
+        if (!mounted) return;
+        setState(() {
+          _storyAbortReason = reason;
+          _generating = false;
+        });
+      },
+      onError: (message) {
+        if (!mounted) return;
+        setState(() {
+          _generating = false;
+        });
+        _showGenerateError(message);
+      },
+      onDone: (outputs) async {
+        _storyRound++;
+        await StorageService.saveMainText(_storyText);
+      },
+    );
   }
 
   @override
@@ -275,17 +341,31 @@ class _HomeContentState extends State<HomeContent>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        CharacterText(text: _fullText),
+                        if (_storyText.isNotEmpty)
+                          TypewriterText(
+                            text: _storyText,
+                            speedUpEvery: 20,
+                            segmentStart: _segmentStart,
+                            abortReason: _storyAbortReason,
+                          )
+                        else
+                          CharacterText(text: _fullText),
+                        if (_generating && _storyText.isNotEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 4),
+                            child: Row(
+                              children: [
+                                CupertinoActivityIndicator(radius: 10),
+                                SizedBox(width: 8),
+                                Text('正在续写…'),
+                              ],
+                            ),
+                          ),
                         const SizedBox(height: 12),
-                        PositionButton(
-                          label: '按钮',
-                          onPressed: _onButton1Pressed,
-                        ),
+                        TextInputPanel(onConfirm: _onInput1Confirm),
                         const SizedBox(height: 12),
-                        PositionButton(
-                          label: '按钮',
-                          onPressed: _onButton2Pressed,
-                        ),
+                        TextInputPanel(onConfirm: _onInput2Confirm),
                         const SizedBox(height: 12),
                         TextInputPanel(onConfirm: _onInputConfirm),
                         const SizedBox(height: 24),
@@ -294,7 +374,7 @@ class _HomeContentState extends State<HomeContent>
                   ),
                 ),
         ),
-        // 设置完成后的黑屏过渡：全黑 → 渐渐点亮
+        // 设置完成后的黑屏过渡：全黑 → 渐渐点亮；生成中显示加载提示
         if (_blackoutActive)
           Positioned.fill(
             child: FadeTransition(
@@ -302,7 +382,27 @@ class _HomeContentState extends State<HomeContent>
                 begin: 1.0,
                 end: 0.0,
               ).animate(_blackoutController),
-              child: const ColoredBox(color: CupertinoColors.black),
+              child: ColoredBox(
+                color: CupertinoColors.black,
+                child: _generating
+                    ? const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            CupertinoActivityIndicator(
+                              color: CupertinoColors.white,
+                              radius: 14,
+                            ),
+                            SizedBox(height: 12),
+                            Text(
+                              '正在生成你的世界…',
+                              style: TextStyle(color: CupertinoColors.white),
+                            ),
+                          ],
+                        ),
+                      )
+                    : null,
+              ),
             ),
           ),
       ],
@@ -326,21 +426,117 @@ class _HomeContentState extends State<HomeContent>
     });
   }
 
-  /// 设置确认页倒计时结束：将草稿统一写入持久化存储，再进入正式主页面；
-  /// 先全黑停留 1 秒，再渐渐点亮屏幕进入主页面。
+  /// 设置确认页倒计时结束：将草稿统一写入持久化存储，把用户设定发送到服务器，
+  /// 由网关转发 Dify 生成小说正文；成功后进入正式主页面显示生成文本。
+  /// 全黑过渡期间若仍在生成，则显示加载提示。
   Future<void> _onSetupConfirmed() async {
     await SetupDraft.instance.commit();
     if (!mounted) return;
+
+    setState(() {
+      _generating = true;
+      _storyText = '';
+      _segmentStart = 0; // 首次生成从第 1 个字重新最慢加速
+      _storyAbortReason = null;
+      _blackoutActive = true;
+      _blackoutController.value = 0; // 覆盖层完全不透明（全黑）
+    });
+
+    // 流式：服务器先审首段，通过后 chunk 开始打字；剩余全审后 reveal 一次性显示
+    await StoryService.generateStoryStream(
+      location: SetupDraft.instance.location,
+      era: SetupDraft.instance.era,
+      playerName: SetupDraft.instance.playerName,
+      playerGender: SetupDraft.instance.playerGender,
+      partnerName: SetupDraft.instance.partnerName,
+      partnerGender: SetupDraft.instance.partnerGender,
+      partnerTraits: SetupDraft.instance.partnerTraits,
+      language: StorageService.getLanguage(),
+      onChunk: (text) {
+        if (!mounted) return;
+        setState(() {
+          _storyText += text;
+          _mainText = _storyText;
+          _generating = false;
+          _setupStep = 6;
+          showMenuNotifier.value = true;
+          _blackoutActive = false;
+          _blackoutController.value = 1;
+        });
+      },
+      onReveal: (text, outputs) {
+        if (!mounted) return;
+        // 剩余部分不再一次性显示，由打字机以不断加速的方式接续打出
+        setState(() {
+          _storyText += text;
+          _mainText = _storyText;
+          _generating = false;
+          _blackoutActive = false;
+          _blackoutController.value = 1;
+        });
+      },
+      onAbort: (reason) {
+        if (!mounted) return;
+        setState(() {
+          _storyAbortReason = reason;
+          _generating = false;
+          _setupStep = 6;
+          showMenuNotifier.value = true;
+          _blackoutActive = false;
+          _blackoutController.value = 1;
+        });
+      },
+      onError: (message) {
+        if (!mounted) return;
+        setState(() {
+          _generating = false;
+          _blackoutActive = false;
+        });
+        _showGenerateError(message);
+      },
+      onDone: (outputs) async {
+        _storyRound++;
+        await StorageService.saveMainText(_storyText);
+      },
+    );
+  }
+
+  /// 生成失败弹窗：重试重新走一次生成，跳过则用默认文本直接进入主页面。
+  Future<void> _showGenerateError(String detail) async {
+    final retry = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('生成失败'),
+        content: Text('无法生成小说内容：$detail\n\n是否重试？'),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('跳过'),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('重试'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (retry == true) {
+      await _onSetupConfirmed();
+      return;
+    }
+    // 跳过：用当前默认文本直接进入正式主页面
     setState(() {
       _setupStep = 6;
       showMenuNotifier.value = true;
       _blackoutActive = true;
-      _blackoutController.value = 0; // 覆盖层完全不透明（全黑）
+      _blackoutController.value = 0;
     });
-    // 全黑停留 1 秒
     await Future<void>.delayed(const Duration(seconds: 1));
     if (!mounted) return;
-    // 渐渐点亮：黑色覆盖层淡出，露出主页面
     await _blackoutController.forward();
     if (!mounted) return;
     setState(() {

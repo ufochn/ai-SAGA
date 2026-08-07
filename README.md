@@ -208,15 +208,36 @@ This is the core UX. The user asked: *“先审 400 字 → 打字 → 剩余全
 | Reveal | If approved → send `reveal` with `rest = out_text[450:]` (the portion not yet shown) + `outputs`. If rejected → `abort`. |
 | Fallback | If the stream ends without `workflow_finished`, the buffered text is audited **before** any reveal — never show unaudited content. |
 
-**Progressive typewriter (Flutter)** — [`TypewriterText`](AI-SAGA/lib/widgets/character_text.dart:48) with dynamic speed ([`_currentCharsPerTick()`](AI-SAGA/lib/widgets/character_text.dart:134)):
+**Final typewriter scheme (Flutter)** — [`TypewriterText`](AI-SAGA/lib/widgets/character_text.dart:48) with dynamic speed ([`_currentCharsPerTick()`](AI-SAGA/lib/widgets/character_text.dart:134)):
 
-| Typing progress | Speed (150 ms/tick) |
-|---|---|
-| From the very **first** character of each segment | **Slowest speed** (1 char/tick ≈ 6.7 chars/s) |
-| Every **20** chars within the segment | **+1 char/tick** (the minimum allowed acceleration step) — continuous acceleration |
-| New segment (user continuation input) | **Restarts from the slowest speed** (speed is per-segment, via `segmentStart`) |
+> This is the exact scheme we settled on after iterating on the cadence. It deliberately starts **from the very first character at the slowest possible speed** and steps up by the **minimum allowed acceleration increment** every 20 characters.
 
-So the user sees the first audited segment type out slowly, then the remainder accelerate progressively. **The remainder is no longer revealed all at once** — we removed the `revealAll` jump; the whole story now types out with a steadily increasing speed, which is exactly the “不断加速” feel requested.
+**Parameters:**
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `tickInterval` | **150 ms** | one timer tick per 150 ms |
+| `charsPerTick` | **1** (start) | slowest possible speed — 1 char per tick ≈ **6.7 chars/s** |
+| `speedUpEvery` | **20** | every 20 chars typed within the current segment, speed increases |
+| acceleration step | **+1 char/tick** | the minimum allowed increment (no finer granularity exists with integer char/tick) |
+| `segmentStart` | per segment | speed is computed from **in-segment progress** (`visibleLen − segmentStart`), so every new segment restarts from the slowest speed |
+
+**Speed curve (per segment, 150 ms/tick):**
+
+| Progress within segment | char/tick | ≈ chars/s |
+|---|---|---|
+| chars 1–20 | 1 (slowest) | ≈ 6.7 |
+| chars 21–40 | 2 | ≈ 13.3 |
+| chars 41–60 | 3 | ≈ 20 |
+| chars 61–80 | 4 | ≈ 26.7 |
+| chars 81–100 | 5 | ≈ 33.3 |
+| … every +20 chars | +1 | steadily increasing |
+
+**Behavior:**
+- **First generation**: types from char 1 at the slowest speed (≈6.7 chars/s), then accelerates one notch every 20 chars.
+- **Every continuation input** (one of the three input boxes): the new segment **restarts from the slowest speed** and accelerates again from its own start — it never inherits the already-fast speed of the previous segment.
+- **No reveal-all**: the remainder is **not** dumped at once (`revealAll` is no longer used); the whole story types out with a continuously increasing speed, which is exactly the “不断加速” (keep accelerating) feel requested.
+- A blank line (`\n\n`) separates each new segment, so the reader sees each continuation go through its own slow → fast arc.
 
 **Key Q&A that shaped this**:
 - *“打字要结合 Dify 和服务器修改，还要兼容审核。两端都要做什么？”* → **Dify**: enable streaming response mode; **FastAPI**: SSE bridge + two-phase audit; **Flutter**: SSE client + typewriter widget.
@@ -226,6 +247,8 @@ So the user sees the first audited segment type out slowly, then the remainder a
 - *“400 字打字机效果能顶几秒？四百字读者阅读时间？”* → We estimated the typing/reading cadence to choose a comfortable first-batch length; 450 chars keeps the opening dramatic without dragging.
 - *“生成一段文字就审核一段、通过再传输，技术上难度？”* → Segment-by-segment moderation is possible but doubles audit calls and complexity; the chosen two-phase design gets most of the safety with only two audits per story.
 - *“有一种一百字强制审核一次的方法，怎么实现的？”* → Forced per-100-char audits were discussed as a stricter variant; the 450 + overlap design was adopted instead to balance safety, latency, and cost.
+- *“加快打字速度的最小字数单位极限是几个字？”* → The code allows a hard floor of **1 char** (the `speedUpEvery` divisor can be 1), but the *meaningful* minimum at 30 ms/tick is ≈10–20 chars — below that the +1 char/tick increments compound so fast the text finishes in a few ticks, with no visible ramp. We chose **20 chars**, then slowed the base tick to **150 ms** so the slowest start is ~6.7 chars/s.
+- *“初始打字速度能更慢吗？”* → Yes. Because 1 char/tick is already the integer floor, the only way to slow the start further is to **lengthen the tick interval** (30 ms → 150 ms), which is exactly what we did while keeping the +1 char per 20 chars acceleration.
 
 ### 19. Apple App Store compliance & UGC moderation Q&A
 

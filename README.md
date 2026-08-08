@@ -5,6 +5,8 @@
 > This document records the project’s current state, every major improvement made so far, and the reasoning behind each design decision — based on our collaboration history. A dedicated section at the end documents the **AI fiction generation pipeline** (Dify streaming + two-phase moderation + typewriter) and the full Q&A that led to it.
 >
 > **⚠️ 2026-08-08 update**: the fiction pipeline, story storage, quotas, input limits, and sync strategy were significantly revised. Read the **[Architecture Update (2026-08-08)](#architecture-update-2026-08-08)** section at the bottom first — several earlier sections below are **superseded** and kept only for history (see the *superseded* note there).
+>
+> **⚠️ 2026-08-08 (content moderation)**: guardrail auditing was consolidated onto the final setup confirmation page and the audit result parsing was hardened from a fragile `action: none` substring regex to **strict structured JSON verdicts** (server-authoritative, fail-closed). Read the **[Content Moderation & Guardrail Hardening (2026-08-08)](#content-moderation--guardrail-hardening-2026-08-08)** section at the bottom.
 
 ---
 
@@ -590,3 +592,90 @@ App-side handling: `hardware_account_limit` → English “Too Many Account Swit
 ## 9. Verification
 
 After the changes: `python3 -m py_compile server/main.py` → OK, and `flutter analyze` → no issues. Run both after touching the server or the Dart sources.
+
+---
+
+# Content Moderation & Guardrail Hardening (2026-08-08)
+
+> Session covering: moving every guardrail audit onto the **final setup confirmation page**, replacing the fragile `action: none` **substring regex** with **strict, server-authoritative JSON verdict parsing** (fail-closed), localized **network-error handling** when no verdict can be obtained, and the **Dify (AWS Bedrock Guardrails)** integration notes (including the `Array` output shape). Written in English for other developers. **Desensitized** — no secrets, credentials, emails, or real identifiers appear anywhere.
+
+## 1. Moderation consolidated onto a single confirmation point
+
+**Before.** Each of the four setup pages — location ([`location_setup_page.dart`](AI-SAGA/lib/widgets/location_setup_page.dart:305)), era ([`era_setup_page.dart`](AI-SAGA/lib/widgets/era_setup_page.dart:243)), player ([`player_setup_page.dart`](AI-SAGA/lib/widgets/player_setup_page.dart:180)) and partner ([`character_setup_page.dart`](AI-SAGA/lib/widgets/character_setup_page.dart:212)) — opened an `AuditDialog` on its own Confirm button, sending **only that page’s field** to the server. That meant up to four separate guardrail calls per onboarding and no holistic check of the combined settings.
+
+**Now (implemented).** The four pages’ buttons only validate, play a sound, write their value to `SetupDraft`, and advance. **Only the final setup confirmation page** triggers the guardrail: its Confirm button runs [`_onConfirmPressed`](AI-SAGA/lib/widgets/setup_confirmation_page.dart:479), which builds one audit text from **all** user settings (location, era, player gender/name, partner gender/name/traits) via [`_buildAuditText`](AI-SAGA/lib/widgets/setup_confirmation_page.dart:490), opens the `AuditDialog`, and only on approval starts the 5-second countdown that enters the main page.
+
+- **Pass** → countdown → main page.
+- **Fail** → the dialog shows the localized rejection message: “Your settings may contain sensitive information. Please review and set them again. Sorry.” (translated across all 10 supported languages in [`audit_dialog.dart`](AI-SAGA/lib/widgets/audit_dialog.dart:289)); the user stays on the confirmation page and can tap “Edit” on any card to revise.
+
+This is a deliberate UX + compliance change: one audit for the whole profile, a single clear rejection point, and no wasted guardrail calls on intermediate steps.
+
+## 2. Strict JSON verdicts replace the `action: none` substring regex
+
+**The fragility being fixed.** Both the server ([`_moderate_story`](AI-SAGA/server/main.py:1118)) and Flutter ([`_isApproved`](AI-SAGA/lib/widgets/audit_dialog.dart:136), since removed) used `re.search(r'action\s*[:=]\s*none', rawText)` over the entire audit response. Any occurrence of `action: none` **anywhere** — including inside a `reason`, `assessments`, or `actionReasons` field — counted as “approved”. This is a false-pass risk and a fragile contract on free text.
+
+**Now (implemented).** The server is the single authority and parses the guardrail result as **structured JSON**, reading only the **top-level `action` field**:
+
+| Function ([`server/main.py`](AI-SAGA/server/main.py:1008)) | Role |
+|---|---|
+| [`_extract_first_object`](AI-SAGA/server/main.py:1008) | From the decoded JSON, get one object (dict): accept a dict directly, the first dict element of an array, an array of JSON-encoded strings (double-serialization), or a top-level JSON string. Returns `None` otherwise (fail-closed). |
+| [`_parse_audit_output`](AI-SAGA/server/main.py:1042) | Strip markdown code fences if present, `json.loads`, then delegate to `_extract_first_object`. |
+| [`_parse_audit_json`](AI-SAGA/server/main.py:1066) | Read the **exact** top-level key `action` (case-insensitive key lookup, value trimmed + lowercased). Does **not** recurse into nested fields. Missing / non-string → `None`. |
+| [`_audit_passed`](AI-SAGA/server/main.py:1085) | `_parse_audit_json(out) == "none"` — the only pass condition. |
+| [`_build_audit_verdict`](AI-SAGA/server/main.py:1090) | Produces the clean verdict returned to the client: `{action, category, confidence, reason}`; unparseable → `action="block"`. |
+
+- **Dify audit output variable renamed** from `text` to **`guardrail_return_json`** in both consumers ([`/api/audit-and-chat`](AI-SAGA/server/main.py:942) and [`_moderate_story`](AI-SAGA/server/main.py:1144)). The story-generation workflow’s `outputs.text` (the generated story) is unaffected.
+- **`/api/audit-and-chat` now returns a structured verdict** (`{"action":"none"|"block",...}`) instead of forwarding the raw Dify text.
+- **Flutter** [`_parseAction`](AI-SAGA/lib/widgets/audit_dialog.dart:167) reads the verdict’s top-level `action` field strictly (`none` → approved, anything else → rejected). The old regex and all legacy “compatibility with the old plain-string + `action: none` substring” code were **removed** (verified: zero matches across the repo).
+
+**Why this is strictly safer.** Because only the real top-level `action` field counts, text like `"the model says action: none here"` buried inside `assessments`/`actionReasons`/`reason` can no longer cause a false pass — and a genuine `NONE` top-level value is no longer blocked by unrelated `action: block` text elsewhere. Verified with adversarial tests (see §5).
+
+## 3. Network / no-verdict handling
+
+Per requirement: if the app **cannot obtain a valid verdict for any reason** (network exception, timeout, server unreachable, or a 2xx response whose body is not a usable verdict), it must **not** guess pass/fail — instead it shows a localized network message.
+
+- Added [`getNetworkErrorMessage`](AI-SAGA/lib/widgets/audit_dialog.dart:271): “It seems your network connection is having issues. Please check your connection and try again.” (translated across all 10 languages).
+- In [`_callAuditServer`](AI-SAGA/lib/widgets/audit_dialog.dart:40): transport errors/timeouts and an invalid verdict body all set this message; a valid `action` value is the **only** thing that drives pass/fail.
+- **Non-2xx business errors** (e.g. 403 trial exhausted, 429 rate-limited) still surface the server’s own error message — those are “a response was received”, distinct from “no response at all”. This can be changed to the network message too if desired.
+
+## 4. Dify canvas requirement (one-time manual step)
+
+The server now reads `outputs.guardrail_return_json` and expects it to be JSON containing a top-level `action` field. Configure the **audit workflow**:
+
+1. **Final LLM node** prompt — output strict JSON only, for example:
+   ```text
+   Audit the following text and output a single JSON object with exactly these fields:
+   {"action":"NONE|BLOCK","category":"<category>","confidence":"<0..1>","reason":"<short reason>"}
+   Rules: action=NONE when the content has no significant issue (fictional religious/historical/cultural
+   backgrounds are allowed); action=BLOCK for denigration, hate, incitement, attacks on real people/groups,
+   private information, violence, or sexual content. category ∈ none|religion|politics|ethnicity|violence|sexual|pii|other.
+   Text: {text_to_screen}
+   ```
+2. **End node** must expose this JSON as the output variable **`guardrail_return_json`** (not `text`).
+3. If the guardrail node is backed by **AWS Bedrock Guardrails**, its response is `{action, actionReasons, assessments, outputs, processedOutputs, warnings}` and Dify often wraps it in an **Array** — the parser handles direct objects, arrays of objects, arrays of JSON-encoded strings, and double-serialized strings, so no extra wiring is needed.
+
+## 5. Verified behaviors
+
+Tested server-side parser against representative inputs (`pass` column = would approve):
+
+| Input shape | Result |
+|---|---|
+| Direct object `{"action":"NONE",...}` | ✅ pass |
+| Array of objects `[{"action":"NONE",...}]` (Bedrock/Dify Array) | ✅ pass |
+| Array of JSON-encoded strings `["{\"action\":\"NONE\",...}"]` | ✅ pass |
+| Double-serialized top-level string `"[{...}]"` | ✅ pass |
+| Array with `action:"GUARDRAIL_INTERVENED"` | ❌ block |
+| Empty array / array of non-objects / non-JSON | ❌ block (fail-closed) |
+| Top-level `BLOCK` + nested `"action: none"` text | ❌ **block** (old regex wrongly passed) |
+| Top-level `NONE` + nested `"action: block"` text | ✅ **pass** (old regex wrongly blocked) |
+
+`python3 -m py_compile server/main.py` → OK; `flutter analyze` → no issues.
+
+## 6. Design discussion recap (Q&A)
+
+- **Dual-side moderation**: guard both **input** (prompt/settings) and **output** (generated story). A “clean” prompt can still yield a flagged output, so both directions should go through the same guardrail (`role: input|output`).
+- **Layered pipeline**: deterministic NFKC/keyword filter (cheap, hard blocks only) → classifier/moderation model → **LLM judge returning structured JSON**. For humanities/religious content, keywords alone cause false positives on benign cultural references, so the judge does the nuanced “benign background vs. denigration” call.
+- **What category/confidence unlock**: per-category localized messaging, locating the offending setting card on the confirmation page, low-confidence → soft-block/human review instead of a hard binary, and (output side) category-aware regenerate/crop instead of aborting the whole story.
+- **Looser vs. tighter is a policy knob, not a property of structured parsing**: strict parsing + fail-closed can make the net *tighter* (low-confidence never auto-passes); relaxing benign cultural references reduces false positives but must be guarded against adversarial “historical/cultural framing” bypasses.
+- **Guardrail sensitivity ≠ parsing robustness**: maxing the guardrail’s sensitivity setting minimizes false negatives within that judge, but does not fix a fragile text-regex interpretation layer — hence the strict JSON parsing work here is complementary, not redundant.
+- **AWS Bedrock `action` values**: only `NONE` (pass) and `GUARDRAIL_INTERVENED` (blocked), which maps cleanly onto the `action == "none"` check.

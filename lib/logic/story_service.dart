@@ -30,20 +30,13 @@ class StoryService {
   /// [onError]：出错
   /// [onDone]：流程结束（可在此保存/收尾）
   static Future<void> generateStoryStream({
-    required String location,
-    required String era,
-    required String playerName,
-    required String playerGender,
-    required String partnerName,
-    required String partnerGender,
-    required String partnerTraits,
-    required String language,
     String userInput = '',
-    int userInputCounter = 0,
     required void Function(String text) onChunk,
     required void Function(String text, Map<String, dynamic> outputs) onReveal,
     required void Function(String reason) onAbort,
     required void Function(String message) onError,
+    void Function()? onDeviceConflict,
+    void Function()? onStalled,
     required void Function(Map<String, dynamic> outputs) onDone,
   }) async {
     final url = _storyApiUrl;
@@ -54,6 +47,8 @@ class StoryService {
     final token = await AuthService.ensureToken();
 
     final client = http.Client();
+    // 流式"卡死"标记：30 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
+    var stalled = false;
     try {
       final request = http.Request('POST', Uri.parse(url));
       request.headers.addAll({
@@ -62,16 +57,7 @@ class StoryService {
         'Authorization': 'Bearer $token',
       });
       request.body = jsonEncode({
-        'location': location,
-        'era': era,
-        'player_name': playerName,
-        'player_gender': playerGender,
-        'partner_name': partnerName,
-        'partner_gender': partnerGender,
-        'partner_traits': partnerTraits,
-        'language': language,
         'user_input': userInput,
-        'user_input_counter': userInputCounter,
       });
 
       final response = await client.send(request).timeout(const Duration(seconds: 180));
@@ -86,13 +72,31 @@ class StoryService {
         } catch (_) {
           // 忽略解析失败
         }
+        if (detail == 'device_conflict') {
+          // 多设备同时登入：由上层弹出警告并重启本 App
+          onDeviceConflict?.call();
+          return;
+        }
         onError(detail);
         return;
       }
 
+      var doneCalled = false;
       final lines = response.stream
           .transform(utf8.decoder)
-          .transform(const LineSplitter());
+          .transform(const LineSplitter())
+          .timeout(
+            const Duration(seconds: 30),
+            onTimeout: (sink) {
+              // 30 秒内没有任何数据到达（且未收到 done）：判定为网络异常/卡死，
+              // 通知上层弹出"请重启"警告，并结束本次流式读取，避免半截文本被误用。
+              if (!stalled) {
+                stalled = true;
+                onStalled?.call();
+              }
+              sink.close();
+            },
+          );
       await for (final line in lines) {
         final s = line.trim();
         if (!s.startsWith('data:')) continue;
@@ -122,6 +126,7 @@ class StoryService {
             onError(evt['message'] as String? ?? '生成失败');
             break;
           case 'done':
+            doneCalled = true;
             onDone(
               (evt['outputs'] as Map?)?.cast<String, dynamic>() ?? const {},
             );
@@ -130,7 +135,14 @@ class StoryService {
             break;
         }
       }
+      // 流式结束但未收到 done 事件：
+      // - 若已判定卡死（stalled），已由 onStalled 处理，不再重复处理；
+      // - 否则视为"未完整接收"，按错误处理（禁止基于残缺文本续写）
+      if (!doneCalled && !stalled) {
+        onError('生成未完整接收（未收到服务器结束信号），请检查网络后重试');
+      }
     } catch (e) {
+      if (stalled) return; // 卡死已由 onStalled 处理，不再重复报错
       if (e.toString().contains('TimeoutException')) {
         onError('生成超时，请稍后重试');
       } else {

@@ -20,7 +20,7 @@
                           │
                           ▼
               FastAPI Gateway (HTTP)
-        ├─ SQLite: users / devices / trials / entitlements / usage / sync_data
+        ├─ SQLite: users / devices / trials / entitlements / usage / sync_data / stories
         ├─ JWKS verification of Apple/Google ID Tokens → stable `sub` = user_id
         ├─ Challenge–signature registration (proof of hardware possession)
         │    + public_key UNIQUE (one hardware = one identity = one quota)
@@ -62,6 +62,7 @@
 | user_id | TEXT PK | Stable platform `sub` |
 | provider | TEXT | `google` / `apple` / `dev` |
 | email | TEXT | Platform email (may be empty) |
+| active_device_id | TEXT | Currently active hardware device (single-active-device enforcement); set at registration and on every app-launch handshake |
 | created_at | INTEGER | Registration timestamp |
 
 ### devices — hardware-bound devices
@@ -107,6 +108,13 @@
 | content | TEXT | Payload |
 | updated_at | INTEGER | Optimistic-concurrency version |
 
+### stories — novel story segments (array storage)
+| Field | Type | Notes |
+|---|---|---|
+| user_id | TEXT PK | Owning account |
+| segments | TEXT | JSON array of strings: each generation = one element (`["opening...", "continuation 1...", ...]`) |
+| updated_at | INTEGER | Optimistic-concurrency version |
+
 ### challenges — one-time registration challenges (replay protection)
 | Field | Type | Notes |
 |---|---|---|
@@ -143,6 +151,9 @@ POST /api/audit-and-chat  Authorization: Bearer <token>
 ```
 GET  /api/sync?since=<timestamp>   # incremental pull
 POST /api/sync  {key, content, updated_at}   # optimistic-concurrency write
+GET  /api/story                    # fetch this user's story segments (array)
+POST /api/story  {segments, updated_at}      # save story segments as an array (optimistic-concurrency)
+POST /api/device/activate          # app-launch handshake: register this device as the user's active hardware
 ```
 
 ### Purchase (reserved)
@@ -171,6 +182,8 @@ GET /api/health   # service status + registered users/devices
 - Sync is keyed by `user_id` so a player can continue on a new device under the same account.
 - Writes are version-stamped; a stale version is rejected (optimistic concurrency).
 - A reserved post-write hook will later trigger per-chapter incremental chunking + re-embedding for retrieval-augmented generation (RAG), with per-user isolation.
+- **Single active device:** on launch, after the root/jailbreak + hardware checks pass, the app calls `POST /api/device/activate` to set `users.active_device_id` to this device (last launch wins). Every authenticated data request is checked against it (`_enforce_active_device`); a mismatch returns HTTP 409 `device_conflict`, and the app shows a "multiple devices signed in" warning and restarts itself (`SecurityService.restartApp`).
+- **Launch sync gate (server one-way refresh):** every cold start the app first uploads its hardware public key + user id to `POST /api/device/activate` (server verifies and updates `devices.public_key`), then pulls the user's full story from `GET /api/story` and overwrites local storage — the database unilaterally refreshes the app's data, so the server is authoritative. The app's main features stay locked behind a syncing/retry screen until this completes. After each generation/continuation the app pushes the story via `POST /api/story`.
 
 ---
 
@@ -207,6 +220,7 @@ GET /api/health   # service status + registered users/devices
 
 - [x] Registration: challenge → hardware signature → registration → bearer token
 - [x] Cloud sync: incremental write/read
+- [x] Story cloud storage: story saved/loaded as an array of segments (`/api/story`)
 - [x] Same hardware re-binding under a different ID is rejected (409 anti-multi-ID)
 - [x] Input token estimation / output `max_tokens` cap
 - [x] Trial accounting: 3 uses + 7-day cooldown

@@ -3,7 +3,7 @@ import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
-import 'package:ai_saga/widgets/audit_dialog.dart';
+import 'package:ai_saga/logic/text_width.dart';
 
 /// 搭档设定页面 - 性别 + 姓名 + 特质（iOS风格表单）
 class CharacterSetupPage extends StatefulWidget {
@@ -40,22 +40,19 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   /// 最近一次加载默认姓名所使用的语言（用于检测语言变更）
   String? _loadedLanguage;
 
-  /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
-  bool _submitting = false;
+  /// 搭档姓名输入字数上限（按显示宽度统计）
+  static const int _maxNameLength = 20;
 
-  /// 搭档姓名输入字数上限
-  static const int _maxNameLength = 30;
-
-  /// 当前搭档姓名是否超过字数上限
+  /// 当前搭档姓名是否超过字数上限（宽字符=2、窄字符=1）
   bool get _isNameOverLimit =>
-      _partnerNameController.text.length > _maxNameLength;
+      weightedCharCount(_partnerNameController.text) > _maxNameLength;
 
-  /// 搭档性格设定输入字数上限
-  static const int _maxTraitsLength = 100;
+  /// 搭档性格设定输入字数上限（按显示宽度统计）
+  static const int _maxTraitsLength = 20;
 
-  /// 当前搭档性格设定是否超过字数上限
+  /// 当前搭档性格设定是否超过字数上限（宽字符=2、窄字符=1）
   bool get _isTraitsOverLimit =>
-      _partnerTraitsController.text.length > _maxTraitsLength;
+      weightedCharCount(_partnerTraitsController.text) > _maxTraitsLength;
 
   @override
   void initState() {
@@ -118,13 +115,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _partnerNameEdited = false;
-        _submitting = false;
         _partnerGenderIndex = widget.playerGenderIndex == 0 ? 1 : 0;
         SetupDraft.instance.partnerName = '';
         SetupDraft.instance.partnerGender = '';
         SetupDraft.instance.partnerTraits = '';
-        _partnerNameController.text =
-            _getDefaultName(genderIndex: _partnerGenderIndex);
+        _partnerNameController.text = _getDefaultName(
+          genderIndex: _partnerGenderIndex,
+        );
         _partnerTraitsController.text = '';
         _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
       });
@@ -213,37 +210,15 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   }
 
   void _onSubmit() {
-    // 防止连点重复弹出审核弹窗、重复请求服务器
-    if (_submitting) return;
     final partnerName = _partnerNameController.text.trim();
     final partnerTraits = _partnerTraitsController.text.trim();
     if (partnerName.isEmpty || partnerTraits.isEmpty) return;
-    _submitting = true;
     SoundService.playHorror2();
-
-    // 向服务器传输的内容 = 用户选择的姓名 + 换行 + 用户对搭档性格的设定文字
-    final auditText = '$partnerName\n$partnerTraits';
-
-    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
-    // 审核通过（Action: NONE）时保存搭档设定并进入下一步，未通过时弹窗警告
-    showCupertinoDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) => AuditDialog(
-        text: auditText,
-        onApproved: () {
-          SetupDraft.instance.partnerName = partnerName;
-          SetupDraft.instance.partnerGender = _partnerGenderIndex == 0
-              ? '男'
-              : '女';
-          SetupDraft.instance.partnerTraits = partnerTraits;
-          widget.onComplete();
-        },
-      ),
-    ).then((_) {
-      // 弹窗关闭后（拒绝/出错）允许再次提交
-      _submitting = false;
-    });
+    // 保存搭档设定并进入下一步（审核统一在最终确认页进行）
+    SetupDraft.instance.partnerName = partnerName;
+    SetupDraft.instance.partnerGender = _partnerGenderIndex == 0 ? '男' : '女';
+    SetupDraft.instance.partnerTraits = partnerTraits;
+    widget.onComplete();
   }
 
   /// 根据语言返回本地化的标题
@@ -520,37 +495,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     }
   }
 
-  /// 根据语言返回本地化的"超过30字上限"提示
-  String _getOverLimitText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '超過30字上限';
-      case 'en':
-        return 'Max 30 characters';
-      case 'es':
-        return 'Máximo 30 caracteres';
-      case 'fr':
-        return '30 caractères max';
-      case 'de':
-        return 'Max. 30 Zeichen';
-      case 'pt':
-        return 'Máximo 30 caracteres';
-      case 'ja':
-        return '30文字まで';
-      case 'ko':
-        return '최대 30자';
-      default:
-        return '超过30字上限';
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
-    // 姓名与特质均非空、且姓名未超过字数上限时才能提交
+    // 姓名与特质均非空、且两者均未超过字数上限时才能提交
     final canSubmit =
         !_isNameOverLimit &&
+        !_isTraitsOverLimit &&
         _partnerNameController.text.trim().isNotEmpty &&
         _partnerTraitsController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
@@ -816,7 +767,7 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _isNameOverLimit ? _getOverLimitText() : _getSubmitText(),
+                    _getSubmitText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,

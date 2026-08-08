@@ -4,7 +4,9 @@ import 'package:flutter/cupertino.dart';
 
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
+import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/widgets/audit_dialog.dart';
 
 /// 设置确认页。
 ///
@@ -388,9 +390,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return _counting
-            ? '現在開始進入全新的世界，敬請期待'
-            : '以下是您本次冒險的設定，可點擊「編輯」隨時修改';
+        return _counting ? '現在開始進入全新的世界，敬請期待' : '以下是您本次冒險的設定，可點擊「編輯」隨時修改';
       case 'en':
         return _counting
             ? 'A brand-new world awaits you. Get ready!'
@@ -420,9 +420,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
             ? '새로운 세계가 당신을 기다립니다. 기대하세요!'
             : '이것은 당신의 모험 설정입니다. 언제든지 "편집"을 눌러 변경할 수 있습니다.';
       default:
-        return _counting
-            ? '现在开始进入全新的世界，请期待'
-            : '以下是你本次冒险的设定，可点击"编辑"随时修改';
+        return _counting ? '现在开始进入全新的世界，请期待' : '以下是你本次冒险的设定，可点击"编辑"随时修改';
     }
   }
 
@@ -476,6 +474,31 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     }
   }
 
+  /// 点击"确定"：先对用户已设定的全部内容进行服务器审核，
+  /// 审核通过（服务端判定 action == "none"）后再进入倒计时，否则弹窗提示修改。
+  void _onConfirmPressed() {
+    SoundService.playConfirm();
+    showCupertinoDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) =>
+          AuditDialog(text: _buildAuditText(), onApproved: _startCountdown),
+    );
+  }
+
+  /// 汇总用户已设定的全部内容（地点、年代、主角、搭档）作为审核文本
+  String _buildAuditText() {
+    final sb = StringBuffer();
+    sb.writeln('Location: ${SetupDraft.instance.location}');
+    sb.writeln('Era: ${SetupDraft.instance.era}');
+    sb.writeln('Player Gender: ${SetupDraft.instance.playerGender}');
+    sb.writeln('Player Name: ${SetupDraft.instance.playerName}');
+    sb.writeln('Partner Gender: ${SetupDraft.instance.partnerGender}');
+    sb.writeln('Partner Name: ${SetupDraft.instance.partnerName}');
+    sb.write('Partner Traits: ${SetupDraft.instance.partnerTraits}');
+    return sb.toString();
+  }
+
   void _startCountdown() {
     setState(() {
       _counting = true;
@@ -512,7 +535,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
       (
         label: _getLocationLabel(),
         value: SetupDraft.instance.location,
-        index: 1
+        index: 1,
       ),
       (label: _getEraLabel(), value: SetupDraft.instance.era, index: 2),
     ];
@@ -527,9 +550,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
           onPressed: _onBackPressed,
           child: Icon(
             CupertinoIcons.back,
-            color: isDark
-                ? AppTheme.accentBlueDark
-                : AppTheme.accentBlueLight,
+            color: isDark ? AppTheme.accentBlueDark : AppTheme.accentBlueLight,
           ),
         ),
         backgroundColor: isDark
@@ -613,12 +634,14 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
                 child: CupertinoButton.filled(
-                  onPressed: _startCountdown,
+                  onPressed: _onConfirmPressed,
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   child: Text(
                     _getConfirmButtonText(),
                     style: const TextStyle(
-                        fontSize: 17, fontWeight: FontWeight.w600),
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
               ),

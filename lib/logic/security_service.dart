@@ -8,20 +8,20 @@ import 'security_terminate_stub.dart'
 
 /// 设备完整性防护。
 ///
-/// 只允许在未 root / 未越狱的移动设备上运行本应用：
-/// 启动时进行硬件/系统完整性检测，一旦发现设备已被 root 或越狱，
-/// 立即静默终止进程，不显示任何提示，以防止攻击者借用已提权设备
-/// 绕过审核、盗用后端 LLM 能力。
+/// 在未 root / 未越狱的移动设备上运行本应用：启动时进行硬件/系统完整性检测。
+/// 若发现设备疑似被 root 或越狱，不再静默退出，而是由主界面展示"设备安全
+/// 警告"页（英文提示 + Exit 按钮），防止攻击者借用已提权设备绕过审核、
+/// 盗用后端 LLM 能力。
 class SecurityService {
   SecurityService._();
 
-  /// 检查设备完整性；若设备已被 root / 越狱则直接退出进程（无任何提示）。
+  /// 检查设备完整性；返回设备是否疑似被 root / 越狱（不再静默退出）。
   ///
   /// 该检测必须在 [WidgetsFlutterBinding.ensureInitialized] 之后调用，
   /// 因为底层依赖原生平台通道。检测异常（例如在无 root 概念的桌面/Web
   /// 平台）时按“未越狱”处理，避免误杀正常用户；在目标平台
   /// Android / iOS 上该检测可靠有效。
-  static Future<void> ensureNonRootedDevice() async {
+  static Future<bool> isDeviceCompromised() async {
     bool compromised = false;
     try {
       compromised = await FlutterJailbreakDetection.jailbroken;
@@ -29,10 +29,11 @@ class SecurityService {
       // 检测不可用时按未越狱处理，保证正常用户不受影响。
       compromised = false;
     }
+    return compromised;
+  }
 
-    if (compromised) {
-      // 静默退出进程，不向用户展示任何提示。
-      terminateProcess();
-    }
+  /// 用户在"设备安全警告"页点击"Exit"后关闭 App。
+  static void exitApp() {
+    terminateProcess();
   }
 }

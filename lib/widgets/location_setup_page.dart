@@ -3,7 +3,7 @@ import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
-import 'package:ai_saga/widgets/audit_dialog.dart';
+import 'package:ai_saga/logic/text_width.dart';
 
 /// 游戏地点设定页面 - 在语言选择之后、角色设定之前
 class LocationSetupPage extends StatefulWidget {
@@ -36,14 +36,12 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
   /// 最近一次加载城市列表所使用的语言（用于检测语言变更）
   String? _loadedLanguage;
 
-  /// 防连点标记：审核弹窗打开期间禁止再次提交，避免重复请求触发服务器限流
-  bool _submitting = false;
+  /// 输入字数上限（按显示宽度统计）
+  static const int _maxTextLength = 20;
 
-  /// 输入字数上限
-  static const int _maxTextLength = 30;
-
-  /// 当前输入是否超过字数上限
-  bool get _isOverLimit => _locationController.text.length > _maxTextLength;
+  /// 当前输入是否超过字数上限（宽字符=2、窄字符=1）
+  bool get _isOverLimit =>
+      weightedCharCount(_locationController.text) > _maxTextLength;
 
   @override
   void initState() {
@@ -62,7 +60,6 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _hasPickedCity = false;
-        _submitting = false;
         SetupDraft.instance.location = '';
         _loadCityOptions();
       });
@@ -310,29 +307,12 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
   }
 
   void _onSubmit() {
-    // 防止连点重复弹出审核弹窗、重复请求服务器
-    if (_submitting) return;
     final location = _locationController.text.trim();
     if (location.isEmpty) return;
-    _submitting = true;
     SoundService.playConfirm();
-
-    // 弹出审核弹窗，调取服务器审核器（AWS Guard）进行审核；
-    // 审核通过（Action: NONE）时保存地点并进入下一步，未通过时弹窗警告
-    showCupertinoDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) => AuditDialog(
-        text: location,
-        onApproved: () {
-          SetupDraft.instance.location = location;
-          widget.onComplete();
-        },
-      ),
-    ).then((_) {
-      // 弹窗关闭后（拒绝/出错）允许再次提交
-      _submitting = false;
-    });
+    // 保存地点并进入下一步（审核统一在最终确认页进行）
+    SetupDraft.instance.location = location;
+    widget.onComplete();
   }
 
   /// 弹出 Cupertino 风格的城市选择器
@@ -466,31 +446,6 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
         return '장소 확인';
       default:
         return '确认地点';
-    }
-  }
-
-  /// 根据语言返回本地化的"超过30字上限"提示
-  String _getOverLimitText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-      case 'yue':
-        return '超過30字上限';
-      case 'en':
-        return 'Max 30 characters';
-      case 'es':
-        return 'Máximo 30 caracteres';
-      case 'fr':
-        return '30 caractères max';
-      case 'de':
-        return 'Max. 30 Zeichen';
-      case 'pt':
-        return 'Máximo 30 caracteres';
-      case 'ja':
-        return '30文字まで';
-      case 'ko':
-        return '최대 30자';
-      default:
-        return '超过30字上限';
     }
   }
 
@@ -678,7 +633,7 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
                       ? const Color(0xFF2C2C2E)
                       : const Color(0xFFF2F2F7),
                   child: Text(
-                    _isOverLimit ? _getOverLimitText() : _getConfirmText(),
+                    _getConfirmText(),
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,

@@ -7,12 +7,15 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/widgets/account_limit_warning.dart';
+import 'package:ai_saga/widgets/app_restart.dart';
 import 'package:ai_saga/widgets/light_auth_page.dart';
 
 /// 审核弹窗 - 调取服务器审核器（AWS Guard）进行审核。
 /// 等待期间显示"正在审核输入，请稍后"；收到结果后：
-/// - 若为 Action: NONE（通过）→ 自动调用 onApproved 进入下一步；
-/// - 若不为 Action: NONE（不通过）→ 以当前语言弹出警告，提示内容可能不合适需修改。
+/// - 若服务器返回有效判定且 action == none（通过）→ 自动调用 onApproved 进入下一步；
+/// - 若 action != none（不通过）→ 以当前语言弹出警告，提示设置可能包含敏感信息需修改；
+/// - 若拿不到服务器的有效判定（网络异常 / 超时 / 响应无效）→ 以当前语言提示检查网络后重试。
 class AuditDialog extends StatefulWidget {
   final String text;
   final VoidCallback onApproved;
@@ -72,26 +75,51 @@ class _AuditDialogState extends State<AuditDialog> {
 
       // 请求级失败（非 2xx）：限流/鉴权/服务端错误，展示错误而不是"内容违规"
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        final msg = _extractErrorMessage(response);
+        if (msg == 'device_conflict') {
+          // 多设备同时登入：弹出警告并重启本 App
+          _handleDeviceConflict();
+          return;
+        }
         setState(() {
           _loading = false;
-          _errorMessage = _extractErrorMessage(response);
+          _errorMessage = msg;
         });
         return;
       }
 
-      if (_isApproved(response.body)) {
-        // 审核通过：不显示任何提示，直接关闭弹窗并进入下一步
+      final action = _parseAction(response.body);
+      if (action == null) {
+        // 服务器没有返回有效的审核判定（非 JSON / 非对象 / 无 action 字段）：
+        // 一律按"未取得判定结果"处理，以当前语言提示检查网络后重试
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _errorMessage = getNetworkErrorMessage();
+        });
+        return;
+      }
+      if (action == 'none') {
+        // 审核通过（action == none）：不显示任何提示，直接关闭弹窗并进入下一步
         if (!mounted) return;
         Navigator.of(context).pop();
         widget.onApproved();
       } else {
-        // 审核未通过（非 action: NONE）：以当前语言弹出警告，提示用户修改
+        // 审核未通过（action != none）：以当前语言弹出警告，提示用户修改
         setState(() {
           _loading = false;
         });
       }
     } catch (e) {
       if (!mounted) return;
+      // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
+      if (e is HardwareAccountLimitException) {
+        setState(() {
+          _loading = false;
+        });
+        await showAccountLimitWarning(context);
+        return;
+      }
       // 未授权：引导用户完成轻授权后重试本次审核
       if (e is AuthNotAuthorizedException) {
         final needRetry = await _promptLightAuth();
@@ -106,9 +134,11 @@ class _AuditDialogState extends State<AuditDialog> {
         });
         return;
       }
+      // 网络异常 / 超时 / 服务端不可达等一切拿不到判定结果的错误：
+      // 以当前语言提示用户检查网络连接后重试
       setState(() {
         _loading = false;
-        _errorMessage = e.toString();
+        _errorMessage = getNetworkErrorMessage();
       });
     }
   }
@@ -129,13 +159,92 @@ class _AuditDialogState extends State<AuditDialog> {
   /// 占位回调（LightAuthPage 授权完成后由 push 返回值触发重试）。
   static void _dummyComplete() {}
 
-  /// 判断审核结果是否通过。
+  /// 从服务器返回的判定 JSON 中严格读取 action 字段。
   ///
-  /// 服务器返回的是一段字符串文本（如 "Action: NONE\nProcessed Output: ..."），
-  /// 只判断文本中是否包含 Action: NONE（忽略大小写与空格差异），不做 JSON 解析。
-  bool _isApproved(String body) {
-    return RegExp(r'action\s*[:=]\s*none', caseSensitive: false)
-        .hasMatch(body);
+  /// 只认真正的 action 字段，且值忽略大小写与首尾空白后等于 "none" 才算通过；
+  /// 若响应不是合法 JSON、不是对象、或找不到 action 字段，返回 null
+  /// （调用方按"未取得判定结果"处理，fail-closed）。
+  String? _parseAction(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is! Map) return null;
+      String? action;
+      decoded.forEach((key, value) {
+        if (key is String && key.trim().toLowerCase() == 'action') {
+          if (value is String) action = value;
+        }
+      });
+      return action?.trim().toLowerCase();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 服务器判定本机已不是活跃设备（检测到多设备同时登入）：
+  /// 弹出警告，用户同意后重启本 App。
+  Future<void> _handleDeviceConflict() async {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+    });
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        title: Text(getDeviceConflictTitle()),
+        content: Text(getDeviceConflictMessage()),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(getDeviceConflictConfirm()),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    // 用户同意：优雅重启本 App（重建整棵树 → 重新走同步门禁 → 重新登记活跃设备）
+    RestartWidget.restartApp(context);
+  }
+
+  /// "多设备同时登入"警告标题（本地化）
+  String getDeviceConflictTitle() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '偵測到多裝置同時登入';
+      case 'en':
+        return 'Multiple Devices Detected';
+      default:
+        return '检测到多设备同时登入';
+    }
+  }
+
+  /// "多设备同时登入"警告内容（本地化）
+  String getDeviceConflictMessage() {
+    switch (_language) {
+      case 'zh-TW':
+        return '您似乎有兩個以上的裝置在同時登入本 App。為保持小說同步，本 App 需要重新啟動。';
+      case 'yue':
+        return '你似乎有兩個以上嘅裝置同時登入呢個 App。為咗保持小說同步，呢個 App 需要重新啟動。';
+      case 'en':
+        return 'It looks like this App is signed in on more than one device at the same time. To keep your story in sync, this App needs to restart.';
+      default:
+        return '您似乎有两个以上的设备在同时登入本 App。为保持小说同步，本 App 需要重新启动。';
+    }
+  }
+
+  /// "多设备同时登入"警告确认按钮文字（本地化）
+  String getDeviceConflictConfirm() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '同意';
+      case 'en':
+        return 'OK';
+      default:
+        return '同意';
+    }
   }
 
   /// 从非 2xx 响应中提取可读的错误信息（兼容 {message}/{error}/{detail} 与纯文本）
@@ -156,6 +265,31 @@ class _AuditDialogState extends State<AuditDialog> {
     } catch (_) {}
     final text = response.body.trim();
     return text.isEmpty ? 'HTTP ${response.statusCode}' : text;
+  }
+
+  // 拿不到服务器判定结果时（网络异常 / 超时 / 服务端不可达 / 响应无效）的提示文字
+  String getNetworkErrorMessage() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '網路連線似乎出現問題，請檢查您的網路連線後再試。';
+      case 'en':
+        return 'It seems your network connection is having issues. Please check your connection and try again.';
+      case 'es':
+        return 'Parece que hay un problema con su conexión de red. Compruebe su conexión e inténtelo de nuevo.';
+      case 'fr':
+        return 'Votre connexion réseau semble avoir un problème. Veuillez vérifier votre connexion et réessayer.';
+      case 'de':
+        return 'Es scheint ein Problem mit Ihrer Netzwerkverbindung zu geben. Bitte überprüfen Sie Ihre Verbindung und versuchen Sie es erneut.';
+      case 'pt':
+        return 'Parece que há um problema com sua conexão de rede. Verifique sua conexão e tente novamente.';
+      case 'ja':
+        return 'ネットワーク接続に問題があるようです。接続を確認して、もう一度お試しください。';
+      case 'ko':
+        return '네트워크 연결에 문제가 있는 것 같습니다. 연결을 확인한 후 다시 시도해 주세요.';
+      default:
+        return '网络连接似乎出现问题，请检查您的网络连接后重试。';
+    }
   }
 
   String get _language => StorageService.getLanguage();
@@ -265,23 +399,23 @@ class _AuditDialogState extends State<AuditDialog> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '您的用戶名似乎需要修改';
+        return '審核未通過';
       case 'en':
-        return 'Your username seems to need changes';
+        return 'Audit Not Passed';
       case 'es':
-        return 'Su nombre de usuario parece necesitar cambios';
+        return 'Auditoría No Superada';
       case 'fr':
-        return 'Votre nom d\'utilisateur semble devoir être modifié';
+        return 'Audit Non Réussi';
       case 'de':
-        return 'Ihr Benutzername scheint geändert werden zu müssen';
+        return 'Prüfung Nicht Bestanden';
       case 'pt':
-        return 'Seu nome de usuário parece precisar de alterações';
+        return 'Auditoria Não Aprovada';
       case 'ja':
-        return 'ユーザー名の修正が必要なようです';
+        return '審査未通過';
       case 'ko':
-        return '사용자 이름을 수정해야 할 것 같습니다';
+        return '심사 통과 실패';
       default:
-        return '您的用户名似乎需要修改';
+        return '审核未通过';
     }
   }
 
@@ -290,23 +424,23 @@ class _AuditDialogState extends State<AuditDialog> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '請重新輸入';
+        return '您的設定可能包含某些敏感資訊，請檢查後重新設定。抱歉。';
       case 'en':
-        return 'Please enter it again.';
+        return 'Your settings may contain sensitive information. Please review and set them again. Sorry.';
       case 'es':
-        return 'Por favor, vuelva a introducirlo.';
+        return 'Sus configuraciones pueden contener información sensible. Por favor revíselas y vuelva a configurarlas. Lo sentimos.';
       case 'fr':
-        return 'Veuillez le saisir à nouveau.';
+        return 'Vos paramètres peuvent contenir des informations sensibles. Veuillez les vérifier et les reconfigurer. Désolé.';
       case 'de':
-        return 'Bitte erneut eingeben.';
+        return 'Ihre Einstellungen könnten sensible Informationen enthalten. Bitte überprüfen Sie sie und stellen Sie sie erneut ein. Es tut uns leid.';
       case 'pt':
-        return 'Por favor, digite novamente.';
+        return 'Suas configurações podem conter informações sensíveis. Por favor, verifique-as e redefina. Desculpe.';
       case 'ja':
-        return 'もう一度入力してください。';
+        return '設定に機密情報が含まれている可能性があります。確認して再設定してください。申し訳ございません。';
       case 'ko':
-        return '다시 입력해 주세요.';
+        return '설정에 민감한 정보가 포함되어 있을 수 있습니다. 확인 후 다시 설정해 주세요. 죄송합니다.';
       default:
-        return '请重新输入';
+        return '您的设置可能包含某些敏感信息，请检查后重新设置。抱歉。';
     }
   }
 

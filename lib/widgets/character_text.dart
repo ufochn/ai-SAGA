@@ -110,6 +110,8 @@ class _TypewriterTextState extends State<TypewriterText> {
     }
     // 文本变长：继续打字（若已到末尾则重启）
     if (_visibleLen < widget.text.length && _timer == null) {
+      // 文本再次增长时重置标记，使每次彻底显示完成都能再次触发 onTypingDone
+      _doneFired = false;
       _start();
     }
   }
@@ -121,8 +123,10 @@ class _TypewriterTextState extends State<TypewriterText> {
         return;
       }
       setState(() {
-        _visibleLen =
-            min(_visibleLen + _currentCharsPerTick(), widget.text.length);
+        _visibleLen = min(
+          _visibleLen + _currentCharsPerTick(),
+          widget.text.length,
+        );
       });
       if (_visibleLen >= widget.text.length) {
         timer.cancel();
@@ -184,7 +188,10 @@ class _TypewriterTextState extends State<TypewriterText> {
         ),
       );
     }
-    final shown = widget.text.substring(0, min(_visibleLen, widget.text.length));
+    final shown = widget.text.substring(
+      0,
+      min(_visibleLen, widget.text.length),
+    );
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
       child: Container(

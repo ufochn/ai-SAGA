@@ -1,13 +1,12 @@
 """
-AI-SAGA 审核网关 v2（账号 + 硬件公钥 + 试用/付费权益 + 云同步）
+AI-SAGA 审核网关 v2（账号 + 硬件公钥 + 付费权益 + 云同步）
 
 架构要点
 ========
 - 身份：Apple / Google ID Token，服务器用官方 JWKS 校验，取稳定 sub 作为 user_id。
 - 设备：每设备持有安全硬件公钥（私钥永不出硬件）。public_key UNIQUE 防止
   "同一硬件注册多个 ID"（同硬件 = 一身份 = 一份配额）。
-- 试用：免费用户每 24 小时（冷却期）获得 28 次试用，按 user_id 与 device_id
-  双维度记账，防"同账号换机"与"同机换账号"刷试用。
+- 配额：审核 Dify 流程全局 2000 次/天；生成 Dify 流程全局 1000 次/天（24h 滚动）。
 - 付费：entitlements 表预留"有效期 + 购买次数"双模型；付费校验服务器端完成，
   平台推送（App Store Server Notifications / Google RTDN）吊销退款，预留接口。
 - 成本控制：输入 ≤ MAX_INPUT_TOKENS（默认 5000），输出 ≤ DIFY_MAX_TOKENS（默认 4000）。
@@ -55,23 +54,27 @@ DIFY_MAX_TOKENS = int(os.environ.get("DIFY_MAX_TOKENS", "4000"))
 # 输入 token 估算上限（入口硬拦，估算在花钱之前）
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "5000"))
 # 输入字符数兜底上限（防止极端长文本撑爆估算）
-MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "40000"))
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
+# 整本小说正文数组累计字符上限（与单次输入上限解耦）。
+# 小说文本由用户付费生成，默认一亿字≈无实际限制；仅作兜底，防止异常超大
+# payload 打爆内存/磁盘或触发反向代理请求体限制。
+MAX_STORY_TOTAL_CHARS = int(os.environ.get("MAX_STORY_TOTAL_CHARS", "100000000"))
 
 DATA_DIR = os.environ.get("DATA_DIR", "/code/data")
 TOKEN_EXPIRY_DAYS = int(os.environ.get("TOKEN_EXPIRY_DAYS", "7"))
-# 付费用户每日配额
+# 付费用户每日配额（预留，付费功能启用后再接入）
 PAID_DAILY_QUOTA = int(os.environ.get("PAID_DAILY_QUOTA", "100"))
-# 付费用户每分钟限流
+# 付费用户每分钟限流（预留）
 PAID_RATE_PER_MINUTE = int(os.environ.get("PAID_RATE_PER_MINUTE", "10"))
-# 试用次数（每冷却期）
-TRIAL_QUOTA = int(os.environ.get("TRIAL_QUOTA", "28"))
-# 试用冷却期（秒）
-TRIAL_COOLDOWN_SECONDS = int(os.environ.get("TRIAL_COOLDOWN_SECONDS", str(1 * 86400)))
 # 每 IP 每小时注册次数（注册入口限流）
 REGISTER_LIMIT_PER_IP_PER_HOUR = int(os.environ.get("REGISTER_LIMIT_PER_IP_PER_HOUR", "20"))
+# 同硬件 24 小时内可切换/绑定的不同账号数上限（防换账号刷试用/配额）
+HARDWARE_ACCOUNTS_PER_DAY = int(os.environ.get("HARDWARE_ACCOUNTS_PER_DAY", "2"))
 # 小说生成工作流全局每日上限（24 小时滚动窗口，防止滥用/被刷）
-STORY_DAILY_LIMIT = int(os.environ.get("STORY_DAILY_LIMIT", "500"))
+STORY_DAILY_LIMIT = int(os.environ.get("STORY_DAILY_LIMIT", "1000"))
 STORY_WINDOW_SECONDS = 24 * 3600
+# 审核工作流全局每日上限（24 小时滚动窗口）：覆盖设定页审核与生成过程中的内容审核
+AUDIT_DAILY_LIMIT = int(os.environ.get("AUDIT_DAILY_LIMIT", "2000"))
 # 小说生成首段字数：攒满该字数先审核，通过才开始显示
 STORY_FIRST_CHUNK = int(os.environ.get("STORY_FIRST_CHUNK", "450"))
 # 第二次审核起点：从该位置到结尾（默认 400，与首段形成 50 字重叠，防边界漏网）
@@ -98,6 +101,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id    TEXT PRIMARY KEY,
     provider   TEXT NOT NULL,          -- 'google' | 'apple'
     email      TEXT,
+    active_device_id TEXT,             -- 当前活跃硬件设备（防多设备同时登入）
     created_at INTEGER NOT NULL
 );
 
@@ -111,16 +115,6 @@ CREATE TABLE IF NOT EXISTS devices (
     key_rotated_at INTEGER,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
-
-CREATE TABLE IF NOT EXISTS trials (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    TEXT NOT NULL,
-    device_id  TEXT NOT NULL,
-    granted_at INTEGER NOT NULL,
-    used_count INTEGER DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_trials_user  ON trials(user_id, granted_at);
-CREATE INDEX IF NOT EXISTS idx_trials_device ON trials(device_id, granted_at);
 
 -- 权益表：预留"有效期 + 购买次数"双模型
 CREATE TABLE IF NOT EXISTS entitlements (
@@ -157,6 +151,31 @@ CREATE TABLE IF NOT EXISTS sync_data (
     PRIMARY KEY (user_id, key)
 );
 
+-- 小说正文：每段一行（追加新段 = 一条 INSERT，不用重写整本；seq 即数组下标）
+CREATE TABLE IF NOT EXISTS story_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,          -- 段下标（0,1,2,...），即 App 数组下标
+    content    TEXT NOT NULL,             -- 这一段文本
+    created_at INTEGER NOT NULL,
+    UNIQUE(user_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_segments_user_seq ON story_segments(user_id, seq);
+
+-- 用户设定（App 首次设定时上传，服务器权威保存；生成时按 user_id 读取）
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id        TEXT PRIMARY KEY,
+    location       TEXT DEFAULT '',
+    era            TEXT DEFAULT '',
+    player_name    TEXT DEFAULT '',
+    player_gender  TEXT DEFAULT '',
+    partner_name   TEXT DEFAULT '',
+    partner_gender TEXT DEFAULT '',
+    partner_traits TEXT DEFAULT '',
+    language       TEXT DEFAULT '',
+    updated_at     INTEGER
+);
+
 -- 注册挑战（一次性、短时有效）
 CREATE TABLE IF NOT EXISTS challenges (
     challenge_id TEXT PRIMARY KEY,
@@ -172,6 +191,15 @@ CREATE TABLE IF NOT EXISTS challenges_guard (
 );
 CREATE INDEX IF NOT EXISTS idx_guard_ip_ts ON challenges_guard(ip, ts);
 
+-- 同硬件 24 小时内使用过的不同账号（防换账号刷试用/配额）
+CREATE TABLE IF NOT EXISTS hardware_accounts (
+    public_key   TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY (public_key, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hardware_accounts_pk_ts ON hardware_accounts(public_key, last_seen_at);
+
 -- 每分钟限流记录（按 user）
 CREATE TABLE IF NOT EXISTS rate (
     user_id TEXT NOT NULL,
@@ -184,6 +212,12 @@ CREATE TABLE IF NOT EXISTS story_usage (
     ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_story_usage_ts ON story_usage(ts);
+
+-- 审核工作流全局调用记录（24 小时滚动窗口限流）
+CREATE TABLE IF NOT EXISTS audit_usage (
+    ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_usage_ts ON audit_usage(ts);
 """
 
 
@@ -199,6 +233,19 @@ def init_db() -> None:
     conn = _db()
     try:
         conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    _migrate_schema()
+
+
+def _migrate_schema() -> None:
+    """对已有数据库做幂等迁移：为 users 补充 active_device_id 列。"""
+    conn = _db()
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "active_device_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN active_device_id TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -329,9 +376,15 @@ class InputData(BaseModel):
 
 
 class StoryInputData(BaseModel):
-    """小说生成请求：与 Dify 工作流「开始」节点变量一一对应。"""
+    """小说生成请求：App 只上传用户最新输入，其余设定/上一段由服务器从数据库读取。
+    （App 端有专门的 reset 功能，不走本生成接口。）"""
     token: str = ""
     user_id: str = ""
+    user_input: str = ""
+
+
+class SettingsData(BaseModel):
+    """用户设定（App 首次设定/修改设定时上传，服务器权威保存）。"""
     location: str = ""
     era: str = ""
     player_name: str = ""
@@ -340,8 +393,6 @@ class StoryInputData(BaseModel):
     partner_gender: str = ""
     partner_traits: str = ""
     language: str = ""
-    user_input: str = ""
-    user_input_counter: int = 0
 
 
 class PurchaseData(BaseModel):
@@ -354,6 +405,18 @@ class SyncPutData(BaseModel):
     key: str
     content: str = ""
     updated_at: int
+
+
+class StoryData(BaseModel):
+    """小说正文数组：每次生成的内容为数组的一个元素（与客户端 List<String> 对应）。"""
+    segments: list[str] = []
+    updated_at: int = 0
+
+
+class ActivateData(BaseModel):
+    """App 启动握手请求：上传本机硬件公钥与用户 id，服务器校验后更新硬件公钥。"""
+    user_id: str = ""
+    public_key: str = ""
 
 
 # ================= 辅助函数 =================
@@ -375,6 +438,32 @@ def _client_ip(request: Request) -> str:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+# 多设备冲突的错误标识：App 检测到该 detail 时弹出"多设备同时登入"警告并重启
+DEVICE_CONFLICT_DETAIL = "device_conflict"
+
+
+def _enforce_active_device(user_id: str, device_id: str) -> None:
+    """多设备防护：请求携带的设备必须与当前活跃设备一致，否则 409 冲突。
+
+    若请求的 device_id 与该用户当前活跃设备不一致，抛出
+    HTTPException(409, DEVICE_CONFLICT_DETAIL)，App 据此弹出
+    "多个设备同时登入"警告并重启本 App。
+    """
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT active_device_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        active = row["active_device_id"] if row else None
+        if active and active != device_id:
+            raise HTTPException(
+                status_code=409,
+                detail=DEVICE_CONFLICT_DETAIL,
+            )
+    finally:
+        conn.close()
 
 
 # 注册限流（进程内 + SQLite 持久化双保险）
@@ -400,6 +489,22 @@ def _throttle_register(ip: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# 同硬件 24 小时内使用账号记账（防换账号刷试用/配额）
+def _touch_hardware_account(conn, public_key: str, user_id: str, now: int) -> None:
+    conn.execute(
+        """INSERT INTO hardware_accounts (public_key, user_id, last_seen_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(public_key, user_id) DO UPDATE SET
+             last_seen_at=excluded.last_seen_at""",
+        (public_key, user_id, now),
+    )
+    # 顺带清理 48 小时前的过期记录，控制表体积
+    conn.execute(
+        "DELETE FROM hardware_accounts WHERE last_seen_at < ?",
+        (now - 2 * 86400,),
+    )
 
 
 # ================= 输入成本控制（S5） =================
@@ -592,34 +697,62 @@ async def register(data: RegisterData, request: Request):
         ):
             raise HTTPException(status_code=401, detail="硬件签名校验失败")
 
-        # 4) public_key UNIQUE 检查（同硬件多 ID 防护）
+        now = int(time.time())
+
+        # 4) public_key UNIQUE 检查（同硬件多账号防护，防换账号刷试用/配额）
         existing = conn.execute(
             """SELECT device_id, user_id FROM devices WHERE public_key=?""",
             (data.public_key,),
         ).fetchone()
-        if existing:
+        if existing and existing["user_id"] != real_user_id:
+            # 同硬件换账号：
+            #  - 该账号 24h 内已在这台硬件登入过 → 允许切回（不算新增不同账号）
+            #  - 否则统计 24h 内已使用过的不同账号数；达到上限则拒绝。
+            #    detail 使用机器可识别的错误码 hardware_account_limit，
+            #    供 App 弹出英文警告并直接退出。
+            used_before = conn.execute(
+                """SELECT 1 FROM hardware_accounts
+                   WHERE public_key=? AND user_id=? AND last_seen_at >= ?""",
+                (data.public_key, real_user_id, now - 24 * 3600),
+            ).fetchone()
+            if not used_before:
+                distinct_today = conn.execute(
+                    """SELECT COUNT(DISTINCT user_id) AS c FROM hardware_accounts
+                       WHERE public_key=? AND last_seen_at >= ?""",
+                    (data.public_key, now - 24 * 3600),
+                ).fetchone()["c"]
+                if distinct_today >= HARDWARE_ACCOUNTS_PER_DAY:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="hardware_account_limit",
+                    )
+            # 换账号放行：该硬件换绑到新账号，删除旧 device 绑定
             if existing["device_id"] != device_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="该设备已绑定其他身份，请复用原设备标识",
+                conn.execute(
+                    "DELETE FROM devices WHERE device_id=?",
+                    (existing["device_id"],),
                 )
-            # 同 device_id 重绑公钥：仅当 id_token 校验的 user_id 一致才允许（密钥轮换）
-            if existing["user_id"] != real_user_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="设备身份与账号不匹配",
+        elif existing:
+            # 同硬件 + 同账号：允许（应用重装/清数据后 device_id 变化时，
+            # 删除旧绑定，以新 device_id 重新绑定，保证同账号能正常恢复使用）
+            if existing["device_id"] != device_id:
+                conn.execute(
+                    "DELETE FROM devices WHERE device_id=?",
+                    (existing["device_id"],),
                 )
 
-        now = int(time.time())
+        # 记录/刷新该硬件 24h 内使用过的账号（同账号重装、换账号都记账）
+        _touch_hardware_account(conn, data.public_key, real_user_id, now)
 
-        # 5) upsert user
+        # 5) upsert user（注册即把该设备登记为当前活跃硬件）
         conn.execute(
-            """INSERT INTO users (user_id, provider, email, created_at)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO users (user_id, provider, email, active_device_id, created_at)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                  provider=excluded.provider,
+                 active_device_id=excluded.active_device_id,
                  email=CASE WHEN excluded.email<>'' THEN excluded.email ELSE users.email END""",
-            (real_user_id, data.provider, verified["email"], now),
+            (real_user_id, data.provider, verified["email"], device_id, now),
         )
 
         # 6) upsert device（同 device_id 换公钥 = 密钥轮换，允许）
@@ -696,7 +829,7 @@ def _verify_hardware_signature(public_key_b64: str, message: str, signature_b64:
         return False
 
 
-# ================= 试用与权益（S4 / S5） =================
+# ================= 权益（S4 / S5，付费预留） =================
 def _get_entitlement(user_id: str) -> Optional[dict]:
     conn = _db()
     try:
@@ -723,68 +856,6 @@ def _is_paid_active(ent: Optional[dict]) -> bool:
         if ent.get("used_quota", 0) >= ent["purchased_quota"]:
             return False
     return True
-
-
-def _grant_trial_if_due(user_id: str, device_id: str) -> dict:
-    """按 user_id 与 device_id 双维度检查冷却期，返回 (allow, remain)。
-
-    - 若任一维度上次试用距今 < 冷却期 且 次数未用完 → 直接返回当前 grant。
-    - 若两个维度冷却都过了 → 新发一次 grant（reset used_count=0）。
-    """
-    now = int(time.time())
-    conn = _db()
-    try:
-        u_row = conn.execute(
-            """SELECT * FROM trials WHERE user_id=?
-               ORDER BY granted_at DESC LIMIT 1""",
-            (user_id,),
-        ).fetchone()
-        d_row = conn.execute(
-            """SELECT * FROM trials WHERE device_id=?
-               ORDER BY granted_at DESC LIMIT 1""",
-            (device_id,),
-        ).fetchone()
-
-        def fresh_enough(row) -> bool:
-            return (now - row["granted_at"]) < TRIAL_COOLDOWN_SECONDS
-
-        # 已有 grant 且在冷却期内
-        if u_row and fresh_enough(u_row):
-            remain = TRIAL_QUOTA - u_row["used_count"]
-            return {"remain": max(remain, 0), "granted_at": u_row["granted_at"]}
-        if d_row and fresh_enough(d_row):
-            remain = TRIAL_QUOTA - d_row["used_count"]
-            return {"remain": max(remain, 0), "granted_at": d_row["granted_at"]}
-
-        # 冷却期已过（或首次）→ 新发试用
-        conn.execute(
-            """INSERT INTO trials (user_id, device_id, granted_at, used_count)
-               VALUES (?, ?, ?, 0)""",
-            (user_id, device_id, now),
-        )
-        conn.commit()
-        return {"remain": TRIAL_QUOTA, "granted_at": now}
-    finally:
-        conn.close()
-
-
-def _consume_trial(user_id: str, device_id: str) -> None:
-    """试用次数 -1（记录到最新一次 grant）。"""
-    conn = _db()
-    try:
-        row = conn.execute(
-            """SELECT id FROM trials WHERE user_id=? AND device_id=?
-               ORDER BY granted_at DESC LIMIT 1""",
-            (user_id, device_id),
-        ).fetchone()
-        if row:
-            conn.execute(
-                """UPDATE trials SET used_count = used_count + 1 WHERE id=?""",
-                (row["id"],),
-            )
-            conn.commit()
-    finally:
-        conn.close()
 
 
 def _count_usage(user_id: str, now: int, tokens: int, quota: int, rate: int) -> None:
@@ -834,26 +905,14 @@ async def audit_and_chat(data: InputData, request: Request):
     claims = validate_token(token)
     user_id = claims["user_id"]
     device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
 
     # 输入成本控制（花钱之前硬拦）
     user_text = data.text
     _check_input_budget(user_text)
 
-    ent = _get_entitlement(user_id)
-    paid = _is_paid_active(ent)
-
-    if paid:
-        # 付费用户：按每日配额 + 限流
-        _count_usage(user_id, int(time.time()), 0, PAID_DAILY_QUOTA, PAID_RATE_PER_MINUTE)
-    else:
-        # 免费用户：试用逻辑（28 次 + 24 小时冷却）
-        trial = _grant_trial_if_due(user_id, device_id)
-        if trial["remain"] <= 0:
-            raise HTTPException(
-                status_code=403,
-                detail="试用次数已用完，请购买后继续使用",
-            )
-        _consume_trial(user_id, device_id)
+    # 设定页审核无每用户限制，唯一硬限为全局审核 Dify 流程 AUDIT_DAILY_LIMIT（2000 次/天）
+    _check_audit_quota(int(time.time()))
 
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
@@ -881,15 +940,16 @@ async def audit_and_chat(data: InputData, request: Request):
             )
         dify_data = response.json()
         dify_outputs = dify_data.get("data", {}).get("outputs", {})
-        final_text = dify_outputs.get("text", "")
+        final_text = dify_outputs.get("guardrail_return_json", "")
         if not final_text:
             raise HTTPException(
                 status_code=500,
-                detail="Dify 未返回有效的 text 字段，请检查画板 End 节点配置是否叫 text",
+                detail="Dify 未返回有效的 guardrail_return_json 字段，请检查画板 End 节点配置是否叫 guardrail_return_json",
             )
         # 输出兜底截断（成本已在 max_tokens 锁死，这里是防异常返回超长文本）
         final_text = final_text[: MAX_INPUT_CHARS * 2]
-        return final_text
+        # 服务端统一解析并返回结构化判定，客户端只消费其中的 action 字段
+        return _build_audit_verdict(final_text)
     except httpx.RequestError as exc:
         raise HTTPException(status_code=503, detail=f"与 Dify 服务器通信网络异常: {str(exc)}")
     except Exception as e:
@@ -918,15 +978,153 @@ def _check_story_quota(now: int) -> None:
         conn.close()
 
 
+def _check_audit_quota(now: int) -> None:
+    """审核工作流全局 24 小时滚动配额：超限直接 429，禁止继续调用审核 Dify。"""
+    conn = _db()
+    try:
+        # 清理窗口外旧记录
+        conn.execute("DELETE FROM audit_usage WHERE ts < ?", (now - STORY_WINDOW_SECONDS,))
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM audit_usage WHERE ts > ?",
+            (now - STORY_WINDOW_SECONDS,),
+        ).fetchone()
+        if row["c"] >= AUDIT_DAILY_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail=f"审核服务今日调用已达上限 {AUDIT_DAILY_LIMIT} 次，已触发报警并禁止继续调用，请 24 小时后再试",
+            )
+        # 记录本次调用
+        conn.execute("INSERT INTO audit_usage (ts) VALUES (?)", (now,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _sse(obj: dict) -> str:
     """把字典编码为一条 SSE 事件（data: {...}\n\n）。"""
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _extract_first_object(data) -> Optional[dict]:
+    """从解析后的 JSON 数据里取出一个对象（dict）。
+
+    - dict → 直接返回；
+    - list → 返回第一个对象元素；若元素是 JSON 字符串（Dify 常把
+      数组元素显示为 String），则逐个解一层再取；
+    - str → 顶层被 JSON 字符串包了一层（双重序列化），解一层再取；
+    - 其它 / 取不到 → None（fail-closed）。
+    """
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+        for item in data:
+            if isinstance(item, str):
+                try:
+                    nested = json.loads(item)
+                except Exception:
+                    continue
+                found = _extract_first_object(nested)
+                if found is not None:
+                    return found
+        return None
+    if isinstance(data, str):
+        try:
+            nested = json.loads(data)
+        except Exception:
+            return None
+        return _extract_first_object(nested)
+    return None
+
+
+def _parse_audit_output(out: str) -> Optional[dict]:
+    """解析审核工作流输出为一个 JSON 对象；失败返回 None。
+
+    兼容多种形态：
+    - 直接是 JSON 对象：{"action": "NONE", ...}
+    - JSON 数组（Dify guardrail 节点输出为 Array）：
+      [{"action": "NONE", ...}] 或 ["{\\"action\\": \\"NONE\\", ...}"]
+      取第一个可用的对象元素；
+    - 顶层被 JSON 字符串包了一层（双重序列化）。
+    另兼容带 markdown 代码围栏（```json ... ```）的输出。
+    """
+    if not out or not out.strip():
+        return None
+    text = out.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```\s*$", "", text)
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    return _extract_first_object(data)
+
+
+def _parse_audit_json(out: str) -> Optional[str]:
+    """严格读取审核结果中的 action 字段（大小写不敏感、忽略首尾空白）。
+
+    只有真正的 action 字段才计数；解析失败 / 非对象 / 找不到 action /
+    值不是字符串 → 返回 None（调用方按不通过处理，fail-closed）。
+    """
+    data = _parse_audit_output(out)
+    if data is None:
+        return None
+    action = None
+    for k, v in data.items():
+        if isinstance(k, str) and k.strip().lower() == "action":
+            action = v
+            break
+    if not isinstance(action, str):
+        return None
+    return action.strip().lower()
+
+
+def _audit_passed(out: str) -> bool:
+    """审核通过判定：只认 JSON 中的 action 字段 == "none"，否则不通过（fail-closed）。"""
+    return _parse_audit_json(out) == "none"
+
+
+def _build_audit_verdict(out: str) -> dict:
+    """把审核工作流输出整理为结构化判定返回给客户端。
+
+    客户端只消费其中的 action 字段：action=="none" 放行，否则不通过。
+    解析失败 / 找不到 action → 一律返回 action="block"（fail-closed）。
+    """
+    data = _parse_audit_output(out)
+    action = _parse_audit_json(out)
+    if data is None or action is None:
+        return {
+            "action": "block",
+            "category": "unknown",
+            "confidence": 0.0,
+            "reason": "audit_result_unparseable",
+        }
+    category = str(data.get("category") or "none")
+    try:
+        confidence = float(data.get("confidence") or 1.0)
+    except Exception:
+        confidence = 1.0
+    return {
+        "action": "none" if action == "none" else "block",
+        "category": category,
+        "confidence": confidence,
+        "reason": str(data.get("reason") or ""),
+    }
+
+
 async def _moderate_story(text: str) -> bool:
-    """调用审核工作流，返回 True=通过(Action: NONE)，False=不通过或审核异常（fail-closed）。"""
+    """调用审核工作流，返回 True=通过，False=不通过或审核异常（fail-closed）。"""
     if not text or not text.strip():
         return True
+    # 审核工作流全局配额（所有用户合计 AUDIT_DAILY_LIMIT 次/天）：
+    # 超限时 fail-closed（不调用 Dify，视为不通过），保证审核链路始终受控。
+    try:
+        _check_audit_quota(int(time.time()))
+    except HTTPException:
+        return False
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
@@ -943,11 +1141,79 @@ async def _moderate_story(text: str) -> bool:
         if resp.status_code != 200:
             return False
         data = resp.json()
-        out = data.get("data", {}).get("outputs", {}).get("text", "") or ""
-        # 审核工作流输出形如 "Action: NONE\nProcessed Output: ..."，含 action: none 即通过
-        return bool(re.search(r"action\s*[:=]\s*none", out, re.IGNORECASE))
+        out = data.get("data", {}).get("outputs", {}).get("guardrail_return_json", "") or ""
+        # 审核工作流输出应为 JSON（含 action 字段），fail-closed
+        return _audit_passed(out)
     except Exception:
         return False
+
+
+def _get_story_tail(user_id: str) -> tuple:
+    """只读最后一段文本与总段数（续写上下文用，避免整本读取）。"""
+    conn = _db()
+    try:
+        row = conn.execute(
+            """SELECT content FROM story_segments
+               WHERE user_id=? ORDER BY seq DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        cnt = conn.execute(
+            """SELECT COUNT(*) AS c FROM story_segments WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()["c"]
+        previous = row["content"] if row else ""
+        return previous, cnt
+    finally:
+        conn.close()
+
+
+def _persist_story_segment(user_id: str, new_segment: str) -> None:
+    """追加本段为该用户小说数组的新元素（seq = 原最大下标 + 1），单行 INSERT。
+
+    服务器从 Dify 收到完整文本（且审核通过）就立即写入，
+    与 App 是否收全无关；App 断流/卡死重启后，冷启动同步即可拉回完整文本。
+    每段一行，追加不重写任何旧数据。
+    """
+    if not new_segment or not new_segment.strip():
+        return
+    now = int(time.time())
+    conn = _db()
+    try:
+        row = conn.execute(
+            """SELECT COALESCE(MAX(seq), -1) AS m FROM story_segments WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        next_seq = row["m"] + 1
+        conn.execute(
+            """INSERT INTO story_segments (user_id, seq, content, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, next_seq, new_segment, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_user_settings(user_id: str) -> dict:
+    """读取服务器保存的该用户设定（无设定时返回空字典）。"""
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM user_settings WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _reset_story(user_id: str) -> None:
+    """全新生成/重新生成：清空该用户的全部段落（从 seq=0 重新开始）。"""
+    conn = _db()
+    try:
+        conn.execute("DELETE FROM story_segments WHERE user_id=?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ================= 路由：小说生成（流式：先审首段 → 打字 → 剩余全审 → reveal） =================
@@ -957,41 +1223,34 @@ async def generate_story(data: StoryInputData, request: Request):
     claims = validate_token(token)
     user_id = claims["user_id"]
     device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
 
-    # 小说生成工作流全局每日配额（默认 500 次 / 24 小时滚动）
+    # 小说生成工作流全局每日配额（默认 1000 次 / 24 小时滚动）
     _check_story_quota(int(time.time()))
 
-    # 输入成本控制（花钱之前硬拦）：把全部设定字段合并后估算 token
+    # 设定从数据库读取；续写/全新以数据库是否已有段落为准（App 端有专门 reset 功能，
+    # 不在此生成接口判断）。
+    settings = _get_user_settings(user_id)
+    # 以数据库是否已有段落决定续写/全新；空库自然返回 ("", 0)
+    previous_story, user_input_counter = _get_story_tail(user_id)
+
+    # 输入成本控制（花钱之前硬拦）：设定 + 用户输入合并估算 token
     combined = " ".join(
         [
-            data.location,
-            data.era,
-            data.player_name,
-            data.player_gender,
-            data.partner_name,
-            data.partner_gender,
-            data.partner_traits,
-            data.language,
-            data.user_input,
+            settings.get("location") or "",
+            settings.get("era") or "",
+            settings.get("player_name") or "",
+            settings.get("player_gender") or "",
+            settings.get("partner_name") or "",
+            settings.get("partner_gender") or "",
+            settings.get("partner_traits") or "",
+            settings.get("language") or "",
+            data.user_input or "",
         ]
     )
     _check_input_budget(combined)
 
-    ent = _get_entitlement(user_id)
-    paid = _is_paid_active(ent)
-
-    if paid:
-        # 付费用户：按每日配额 + 限流
-        _count_usage(user_id, int(time.time()), 0, PAID_DAILY_QUOTA, PAID_RATE_PER_MINUTE)
-    else:
-        # 免费用户：试用逻辑（28 次 + 24 小时冷却）
-        trial = _grant_trial_if_due(user_id, device_id)
-        if trial["remain"] <= 0:
-            raise HTTPException(
-                status_code=403,
-                detail="试用次数已用完，请购买后继续使用",
-            )
-        _consume_trial(user_id, device_id)
+    # 小说生成的唯一硬限为全局 STORY_DAILY_LIMIT（默认 1000 次/天，见 _check_story_quota）。
 
     # Dify 开始节点 required 变量必须非空，空值用占位符兜底
     def _fill(v: str) -> str:
@@ -1003,17 +1262,20 @@ async def generate_story(data: StoryInputData, request: Request):
     }
     dify_payload = {
         "inputs": {
-            "location": _fill(data.location),
-            "era": _fill(data.era),
-            "player_name": _fill(data.player_name),
-            "player_gender": _fill(data.player_gender),
-            "partner_name": _fill(data.partner_name),
-            "partner_gender": _fill(data.partner_gender),
-            "partner_traits": _fill(data.partner_traits),
-            "language": _fill(data.language),
+            "location": _fill(settings.get("location") or ""),
+            "era": _fill(settings.get("era") or ""),
+            "player_name": _fill(settings.get("player_name") or ""),
+            "player_gender": _fill(settings.get("player_gender") or ""),
+            "partner_name": _fill(settings.get("partner_name") or ""),
+            "partner_gender": _fill(settings.get("partner_gender") or ""),
+            "partner_traits": _fill(settings.get("partner_traits") or ""),
+            "language": _fill(settings.get("language") or ""),
             "user_input": data.user_input or "",
+            # 服务器从权威数组取出的上一段内容（供 LLM 延续剧情；Dify 画布需绑定
+            # previous_story 输入变量，未绑定则此项不生效）
+            "previous_story": previous_story,
             # 开始节点 user_input_counter 为 text-input 类型，Dify 要求以字符串提交
-            "user_input_counter": str(int(data.user_input_counter or 0)),
+            "user_input_counter": str(int(user_input_counter)),
             "max_tokens": DIFY_MAX_TOKENS,
         },
         "response_mode": "streaming",
@@ -1071,13 +1333,15 @@ async def generate_story(data: StoryInputData, request: Request):
                             if not await _moderate_story(final_all):
                                 yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                                 return
+                            final_segment = final_all
                             yield _sse({"event": "chunk", "text": final_all})
                         else:
-                            out_text = outputs.get("text", "")
+                            out_text = outputs.get("text", "") or full_text
                             if out_text and out_text.startswith(first_buf):
                                 rest = out_text[len(first_buf):]   # 展示：首段(450)之后，避免重复
                             else:
                                 rest = rest_buf
+                            final_segment = out_text
                             if rest:
                                 # 第二次审核：从 STORY_SECOND_AUDIT_START(400) 到结尾（含与首段的 50 字重叠）
                                 if out_text and len(out_text) > STORY_SECOND_AUDIT_START:
@@ -1090,6 +1354,8 @@ async def generate_story(data: StoryInputData, request: Request):
                                 yield _sse({"event": "reveal", "text": rest, "outputs": outputs})
                             else:
                                 yield _sse({"event": "reveal", "text": "", "outputs": outputs})
+                        # 服务器已从 Dify 收到完整文本且审核通过：立即持久化，与 App 是否收全无关
+                        _persist_story_segment(user_id, final_segment)
                         yield _sse({"event": "done", "outputs": outputs})
                         return
 
@@ -1101,12 +1367,15 @@ async def generate_story(data: StoryInputData, request: Request):
                 if not sent_first and full_text:
                     if await _moderate_story(full_text):
                         yield _sse({"event": "chunk", "text": full_text})
+                        _persist_story_segment(user_id, full_text)
                         yield _sse({"event": "done", "outputs": outputs})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                 elif rest_buf:
                     if await _moderate_story(rest_buf):
                         yield _sse({"event": "reveal", "text": rest_buf, "outputs": outputs})
+                        # full_text = 首段 + 剩余，即完整文本
+                        _persist_story_segment(user_id, full_text)
                         yield _sse({"event": "done", "outputs": outputs})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
@@ -1140,6 +1409,8 @@ async def verify_purchase(data: PurchaseData, request: Request):
     token = _extract_token(data, request)
     claims = validate_token(token)
     user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
 
     if data.provider == "appstore":
         if not APPSTORE_SHARED_SECRET:
@@ -1191,6 +1462,8 @@ async def sync_get(request: Request, since: int = 0):
     token = _extract_token(None, request)
     claims = validate_token(token)
     user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
     conn = _db()
     try:
         rows = conn.execute(
@@ -1214,6 +1487,8 @@ async def sync_put(data: SyncPutData, request: Request):
     token = _extract_token(None, request)
     claims = validate_token(token)
     user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
 
     if not data.key or len(data.key) > 128:
         raise HTTPException(status_code=400, detail="key 非法")
@@ -1243,6 +1518,189 @@ async def sync_put(data: SyncPutData, request: Request):
 
     # TODO(RAG二期): 内容更新后，在此钩子触发该用户章节的增量切片 + 重新嵌入
     return {"status": "ok", "applied": True}
+
+
+# ================= 多设备防护：App 启动握手（上传公钥 → 校验 → 更新硬件公钥） =================
+@app.post("/api/device/activate")
+async def device_activate(data: ActivateData, request: Request):
+    """App 每次启动时调用：上传硬件公钥 + 用户 id，服务器校验后更新硬件公钥，
+    并把该设备登记为该用户的最新活跃硬件。
+
+    身份以签名令牌为准（user_id/device_id 由令牌解析，客户端 body 里的 user_id
+    仅作展示核对）；硬件公钥上传后经校验（非空、长度合法、设备确属该用户）写入
+    devices.public_key，完成"更新硬件公钥"。多设备同时登入时，最后启动的设备成为
+    活跃设备；旧设备下一次操作会被 409 device_conflict 拒绝。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+
+    # 校验上传的硬件公钥（Base64 SPKI，长度受限）
+    if not data.public_key or len(data.public_key) > 2048:
+        raise HTTPException(status_code=400, detail="public_key 非法")
+
+    now = int(time.time())
+    conn = _db()
+    try:
+        dev = conn.execute(
+            "SELECT device_id FROM devices WHERE device_id=? AND user_id=?",
+            (device_id, user_id),
+        ).fetchone()
+        if not dev:
+            raise HTTPException(status_code=404, detail="设备未注册")
+        # 校验通过：更新该设备的硬件公钥，并登记为当前活跃设备
+        conn.execute(
+            "UPDATE devices SET public_key=?, last_seen_at=? WHERE device_id=?",
+            (data.public_key, now, device_id),
+        )
+        conn.execute(
+            "UPDATE users SET active_device_id=? WHERE user_id=?",
+            (device_id, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "status": "ok",
+        "active_device_id": device_id,
+    }
+
+
+# ================= 小说正文云存储（每段一行，与客户端 List<String> 数组对应） =================
+@app.get("/api/story")
+async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
+    """获取该用户的小说正文数组（每段一行，seq 即数组下标）。
+
+    - 默认：返回全部段（按 seq 升序），并附 total。
+    - ?limit=N：只返回最后 N 段（App 冷启动只拉尾部）；不统计 total（省 COUNT）。
+    - ?before_seq=X&limit=N：返回 seq < X 的最近 N 段（App 向上懒加载更早段）；不统计 total。
+    返回 {segments, start_seq, [total], updated_at}；start_seq 为 segments[0] 的
+    绝对下标，保证 App 本地数组下标与服务器 seq 对齐。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
+    conn = _db()
+    try:
+        if limit > 0 and before_seq >= 0:
+            rows = conn.execute(
+                """SELECT seq, content FROM story_segments
+                   WHERE user_id=? AND seq < ? ORDER BY seq DESC LIMIT ?""",
+                (user_id, before_seq, limit),
+            ).fetchall()
+            rows = list(reversed(rows))
+        elif limit > 0:
+            rows = conn.execute(
+                """SELECT seq, content FROM story_segments
+                   WHERE user_id=? ORDER BY seq DESC LIMIT ?""",
+                (user_id, limit),
+            ).fetchall()
+            rows = list(reversed(rows))
+        else:
+            rows = conn.execute(
+                """SELECT seq, content FROM story_segments
+                   WHERE user_id=? ORDER BY seq ASC""",
+                (user_id,),
+            ).fetchall()
+        updated_at = conn.execute(
+            """SELECT COALESCE(MAX(created_at), 0) AS u FROM story_segments WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()["u"]
+        total = None
+        if limit <= 0:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM story_segments WHERE user_id=?", (user_id,)
+            ).fetchone()["c"]
+    finally:
+        conn.close()
+    segments = [r["content"] for r in rows if isinstance(r["content"], str)]
+    start_seq = rows[0]["seq"] if rows else 0
+    resp = {
+        "segments": segments,
+        "start_seq": start_seq,
+        "updated_at": updated_at,
+    }
+    if total is not None:
+        resp["total"] = total
+    return resp
+
+
+@app.post("/api/story")
+async def story_put(data: StoryData, request: Request):
+    """整组覆盖该用户的小说正文数组（删除旧段后按序写入；乐观并发：只接受更新的版本）。
+
+    注：当前 App 已不再调用本接口（新增段走 _persist_story_segment 单行 INSERT），
+    此端点保留以兼容外部整组写入。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
+
+    if not isinstance(data.segments, list) or not all(
+        isinstance(s, str) for s in data.segments
+    ):
+        raise HTTPException(status_code=400, detail="segments 必须是字符串数组")
+    total_chars = sum(len(s) for s in data.segments)
+    if total_chars > MAX_STORY_TOTAL_CHARS:
+        raise HTTPException(status_code=400, detail="内容过大")
+
+    now = int(time.time())
+    conn = _db()
+    try:
+        # 乐观并发：以该用户最新段的创建时间作为版本号，只接受更新的版本
+        row = conn.execute(
+            """SELECT COALESCE(MAX(created_at), 0) AS u FROM story_segments WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        if row["u"] >= data.updated_at:
+            conn.close()
+            return {"status": "ok", "applied": False}
+        conn.execute("DELETE FROM story_segments WHERE user_id=?", (user_id,))
+        conn.executemany(
+            """INSERT INTO story_segments (user_id, seq, content, created_at)
+               VALUES (?, ?, ?, ?)""",
+            [(user_id, i, s, now) for i, s in enumerate(data.segments)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok", "applied": True}
+
+
+@app.post("/api/settings")
+async def settings_put(data: SettingsData, request: Request):
+    """保存该用户的设定（App 首次设定/修改设定时调用，服务器权威保存）。"""
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
+    conn = _db()
+    try:
+        conn.execute(
+            """INSERT INTO user_settings
+                 (user_id, location, era, player_name, player_gender,
+                  partner_name, partner_gender, partner_traits, language, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 location=excluded.location, era=excluded.era,
+                 player_name=excluded.player_name, player_gender=excluded.player_gender,
+                 partner_name=excluded.partner_name, partner_gender=excluded.partner_gender,
+                 partner_traits=excluded.partner_traits, language=excluded.language,
+                 updated_at=excluded.updated_at""",
+            (user_id, data.location, data.era, data.player_name, data.player_gender,
+             data.partner_name, data.partner_gender, data.partner_traits, data.language,
+             int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok"}
 
 
 def _extract_token(data: Optional[InputData], request: Request) -> str:

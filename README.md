@@ -3,6 +3,8 @@
 **AI SAGA** (AI 傳奇 / AI サーガ / AI 사가) is a multilingual, iOS‑style interactive fiction game for Android, iOS, macOS and Web. It lets players build a character and partner, choose a location and era, and then generate an adventure detective–romance story, with every piece of player input **moderated by an AI audit gateway** before it is accepted.
 
 > This document records the project’s current state, every major improvement made so far, and the reasoning behind each design decision — based on our collaboration history. A dedicated section at the end documents the **AI fiction generation pipeline** (Dify streaming + two-phase moderation + typewriter) and the full Q&A that led to it.
+>
+> **⚠️ 2026-08-08 update**: the fiction pipeline, story storage, quotas, input limits, and sync strategy were significantly revised. Read the **[Architecture Update (2026-08-08)](#architecture-update-2026-08-08)** section at the bottom first — several earlier sections below are **superseded** and kept only for history (see the *superseded* note there).
 
 ---
 
@@ -446,3 +448,145 @@ iOS additionally enables the Sign in with Apple capability via [`Runner.entitlem
 - The two Dify keys are **parallel** — the audit workflow never substitutes for the fiction workflow (`fail-fast`, no fallback).
 - Vendored plugins live under [`third_party/`](AI-SAGA/third_party/) with minimal patches to keep them buildable against current toolchains.
 - Backend architecture, database schema, security principles, API design, and design rationale are documented in the public [`server/DESIGN.md`](server/DESIGN.md:1).
+
+---
+
+# Architecture Update (2026-08-08)
+
+> Session covering: story **storage model**, **server-authoritative generation**, **tail-only startup sync with index alignment**, **quota simplification**, **weighted input limits**, **DB-based continue/reset detection**, and a **completeness-gap analysis** for persistence. Written in English for other developers. **Desensitized** — no secrets, credentials, emails, or real user/device identifiers appear anywhere in this document.
+
+## 1. Story storage: from one JSON blob per user to one row per segment
+
+**Before.** The `stories` table stored the whole novel as one JSON array string (`segments`) in a single cell. Every continuation did a full read–modify–write of the entire cell, so write cost grew linearly with novel length; WAL churned; there was no indexed random access by segment index.
+
+**Now (implemented).** A normalized table stores **each generated segment as its own row**; `seq` is the integer array index and matches the app’s `List<String>` index exactly.
+
+```sql
+CREATE TABLE IF NOT EXISTS story_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,   -- 0,1,2,... = array index
+    content    TEXT NOT NULL,      -- one generated segment only
+    created_at INTEGER NOT NULL,
+    UNIQUE(user_id, seq)
+);
+CREATE INDEX idx_segments_user_seq ON story_segments(user_id, seq);
+```
+
+**Consequences**
+- Appending one segment = one `INSERT` with `seq = MAX(seq)+1` — **O(1), never rewrites old rows** ([`_persist_story_segment`](AI-SAGA/server/main.py:1169)).
+- Indexed lookup by `seq` is O(log n) and touches only the target row.
+- `previous_story` (context for the next generation) is read with `ORDER BY seq DESC LIMIT 1` + a `COUNT(*)` only when needed ([`_get_story_tail`](AI-SAGA/server/main.py:1150)).
+- The old `stories` table and its JSON logic were removed (project is pre-release, no data migration needed).
+
+**Scale notes (for planning):** a ~10 000-character Chinese novel ≈ 30 KB raw (UTF-8 3 bytes/char) and ≈ 32–40 KB stored. Local SSD read of that is ~0.1–1 ms; one `INSERT` is ~0.05–0.2 ms regardless of length. SQLite is comfortable to ~100 GB–1 TB; the real constraint is *per-user* blob size, which the per-row model removes. (This is the fix for the old “whole-array rewrite” concern.)
+
+## 2. Server-authoritative generation pipeline
+
+The app is deliberately a thin client: it uploads **only the user’s latest instruction**; the server derives everything else from its own database.
+
+```
+Flutter input box → generateStoryStream(user_input: "...")
+  ▼ POST /api/generate-story  (Authorization: Bearer <token>)
+server:
+  settings   = _get_user_settings(user_id)      # from user_settings table
+  previous_story, counter = _get_story_tail(user_id)  # from story_segments
+  dify_payload = { ...settings..., previous_story, user_input, counter, max_tokens }
+  → Dify fiction workflow (streaming)
+  → two-phase moderation → SSE chunk/reveal → done
+  → _persist_story_segment(user_id, final_text)  # single row INSERT, always saved
+```
+
+- **Settings are stored server-side**: new `user_settings` table + `POST /api/settings`; the app uploads once when the setup is confirmed ([`SettingsService.saveSettings`](AI-SAGA/lib/logic/settings_service.dart:35)), and the server reads them on every generation ([`_get_user_settings`](AI-SAGA/server/main.py:1200)).
+- **Previous-segment context comes from the server array**, passed to Dify as `previous_story` — the LLM now actually sees the prior story (previously the payload had no story context at all).
+- **Persistence is server-authoritative**: as soon as the server has the complete text (and it passes moderation) it writes the new row, **regardless of whether the app received the stream**. The old `POST /api/story` whole-array push from the app was removed.
+
+> **Dify integration note**: for `previous_story` to reach the LLM, the Dify **fiction** workflow’s Start node must bind a `previous_story` input variable and use it in the prompt. If the workflow uses a different variable name, update [`dify_payload`](AI-SAGA/server/main.py:1241) accordingly.
+
+## 3. Tail-only startup sync + index alignment (no full download)
+
+**Before.** Cold start downloaded the entire novel (`GET /api/story` → full array) into local storage, so list index == server index trivially.
+
+**Now.** Cold start downloads **only the last 3 segments**; earlier segments are lazily fetched when the user scrolls to the top. Because indices are load-bearing (choice markers, the time-tree placeholder), the app tracks a **base offset** so the local list index maps exactly to the server `seq`.
+
+- `GET /api/story` supports `?limit=N` (tail) and `?before_seq=X&limit=N` (older batch), and returns `start_seq` (index of `segments[0]`) plus `total` only for full pulls ([`story_get`](AI-SAGA/server/main.py:1584)). For tail/lazy pulls the `COUNT(*)` is skipped to save DB work.
+- App `SyncService` returns a `StorySnapshot{segments, startSeq, total}`; startup pulls `tailLimit = 3`; scrolling up fetches `previousBatchLimit = 10` at a time ([`fetchPreviousSegments`](AI-SAGA/lib/logic/sync_service.dart:70)).
+- `home_content` keeps `_storyStartIndex` such that `_storyTexts[i]` has absolute index `_storyStartIndex + i` ([`home_content.dart`](AI-SAGA/lib/logic/home_content.dart:95)). Lazy-load **prepends** a batch, shifts `_storyStartIndex`/`_visibleStartIndex`/`_sessionStreamStartIndex`, and compensates the scroll so the viewport does not jump ([`_loadPreviousSegment`](AI-SAGA/lib/logic/home_content.dart:210)).
+- Choice records store the **absolute** segment index (created/deduped/rendered as `_storyStartIndex + localIndex`), so indices stay aligned no matter how much is lazily loaded.
+
+**Performance impact.** Returning 3 segments instead of N cuts bandwidth and JSON serialization by ~90–97%; DB work for the tail query is now just a `LIMIT` read (no `COUNT`). Estimate for 100k cold starts/day, ~100 segments each: ~3.2 GB/day → ~100 MB/day transfer.
+
+## 4. Quota & cost simplification
+
+Per-user trial/paid quotas were removed in favour of **two global rolling 24 h budgets** (simplified logic; paid personal quotas to be reintroduced later with the payment feature):
+
+| Budget | Default | Where enforced |
+|---|---|---|
+| Audit Dify workflow | **2000 calls / day** (all users) | [`_check_audit_quota`](AI-SAGA/server/main.py:1028), counted in `/api/audit-and-chat` and `_moderate_story` |
+| Fiction generation workflow | **1000 calls / day** (all users) | [`_check_story_quota`](AI-SAGA/server/main.py:1002) |
+
+- Removed: `trials` table, `_grant_trial_if_due`, `_consume_trial`, `TRIAL_QUOTA`, `TRIAL_COOLDOWN_SECONDS`, `PAID_DAILY_QUOTA`/`PAID_RATE_PER_MINUTE` enforcement (constants kept, unused, for the future paid feature).
+- Input hard-gate: `MAX_INPUT_CHARS = 4000`, `MAX_INPUT_TOKENS = 5000` (settings + user instruction, checked before any spend).
+- Whole-novel cap: `MAX_STORY_TOTAL_CHARS = 100 000 000` (≈ unlimited; only enforced on the dormant whole-array push endpoint).
+
+> **Superseded sections**: README §6 (input caps), §7 (trial/paid model), §17 (`STORY_DAILY_LIMIT=500`), and the roadmap item “SQL story persistence” — the values/design changed today.
+
+## 5. Weighted character-count input limits
+
+Both the story input boxes and the four setup pages enforce limits by **display width**: wide characters (Han/Kana/Hangul/full-width) count **2**, narrow characters (Latin/digits/ASCII) count **1** — implemented in the shared helper [`text_width.dart`](AI-SAGA/lib/logic/text_width.dart:9).
+
+| Surface | Limit (weighted) | Behaviour |
+|---|---|---|
+| Story input boxes (3) | **200** | soft limit: text turns **red** and the confirm button is **grey/disabled** when over; input is not truncated ([`text_input_panel.dart`](AI-SAGA/lib/widgets/text_input_panel.dart:6)) |
+| Setup pages (location, era, player, partner) | **20** | same soft-limit treatment; button text is no longer swapped to an “over limit” message ([`location_setup_page.dart`](AI-SAGA/lib/widgets/location_setup_page.dart:38), etc.) |
+
+Example: 100 Chinese characters ≈ weighted 200 → exactly at the story-box limit; 200 Latin letters ≈ 200. The character-count helper is shared by the panel and all four setup pages.
+
+## 6. Continue-vs-fresh is decided by the database (not the app)
+
+The server no longer infers “new story” from an empty `user_input` (that was an app-trusted heuristic). Instead:
+
+- **Continuation** is decided purely by whether `story_segments` has rows: if it does, the server reads the last segment as context and appends; if the table is empty, it starts from `seq = 0` with no previous context ([`_get_story_tail`](AI-SAGA/server/main.py:1150)).
+- A dedicated **reset** (“start a new story”) is intentionally **not** part of the generation endpoint — it is an explicit app-side feature (recommended UX below), so a malformed/empty input can never wipe a stored story.
+
+**Recommended app-side reset UX** (not yet implemented): add a destructive **“New Story”** action to the existing menu sheet ([`_showMenuSheet`](AI-SAGA/lib/main.dart:466)) with a confirm dialog mirroring [`_showConfirmRestartDialog`](AI-SAGA/lib/main.dart:898). On confirm: call a new `DELETE /api/story` (server runs [`_reset_story`](AI-SAGA/server/main.py:1203), i.e. `DELETE FROM story_segments WHERE user_id=?`), clear local story + `main_text_start_index`, then rebuild `HomeContent`. Because the generation path is DB-driven, the next generation naturally restarts at `seq = 0`.
+
+## 7. Persistence completeness — known gap & mitigation plan (IMPORTANT)
+
+**Current guarantee.** A new segment is written to the DB **only once the server has the complete text**, and only if moderation passes. `_persist_story_segment` is called in exactly three mutually-exclusive places, all of which persist the *whole* segment:
+
+1. On Dify’s explicit `workflow_finished` event (normal path) — the definitive “all text delivered” signal ([`server/main.py:1363`](AI-SAGA/server/main.py:1363));
+2. Fallback when the stream ends cleanly but no `workflow_finished` arrived and the first chunk was never sent — persists the accumulated `full_text` ([`server/main.py:1375`](AI-SAGA/server/main.py:1375));
+3. Fallback when the stream ends cleanly, the first chunk was already sent and the rest arrived — persists `full_text` ([`server/main.py:1383`](AI-SAGA/server/main.py:1383)).
+
+The 450-char “first chunk” is only **transmitted** to the app (typewriter display) after its own audit — it is **never persisted separately**, and there is no “insert then delete if it fails” anywhere.
+
+**Known gap.** A genuine mid-stream network failure raises inside the `async for` and is caught by `except httpx.RequestError`/`except Exception`, so the fallback is **not** reached and no partial text is persisted. However, the fallback treats **“SSE stream closed cleanly without `workflow_finished`”** as *complete*. If a proxy or Dify closes the stream gracefully before all text is delivered, the server cannot distinguish “done” from “aborted early” and would persist a possibly-truncated segment.
+
+**Recommended fix (agreed direction, not yet implemented).** Make an explicit end marker the **only** completeness signal:
+- Only persist when the workflow emits an explicit finish marker (e.g., `workflow_finished`, or a dedicated `story_complete: true` field, or a custom event);
+- Treat a clean close **without** the marker as incomplete → discard + error, never persist;
+- Optionally include a checksum/`char_count` in the marker so the server can verify `len(full_text)` matches before writing (defense in depth).
+
+Trade-off: generations from a Dify workflow that never emits the marker would be judged incomplete — this is the intended “rather lose a generation than store truncated text” trade-off. Implement once the Dify-side marker format is finalised.
+
+## 8. Account & hardware security restrictions (reference)
+
+The login/registration surface enforces, in order:
+
+1. `device_id` whitelist regex (`^[A-Za-z0-9._:-]{1,128}$`).
+2. IP rate limit (20 register-challenges/hour/IP, persisted).
+3. One-time signed challenge (replay protection).
+4. Official JWKS verification of the Apple/Google ID token; the server takes `sub` as the real `user_id`.
+5. Hardware proof-of-possession: ECDSA P-256 signature over the challenge.
+6. `public_key UNIQUE` — one hardware ↔ one device binding.
+7. **Same-hardware account-switch cap**: max **2 distinct accounts per hardware per 24 h** (`HARDWARE_ACCOUNTS_PER_DAY`, default 2); switch-back to an account seen in the last 24 h is allowed; otherwise `409 hardware_account_limit`.
+8. Same-hardware same-account re-registration allowed (reinstall recovery).
+9. HMAC-signed token, 7-day expiry, binds `{user_id, device_id}`.
+10. Single active device per account (`409 device_conflict`) → app shows an English warning and gracefully restarts.
+
+App-side handling: `hardware_account_limit` → English “Too Many Account Switches” dialog with an **Exit App** button ([`account_limit_warning.dart`](AI-SAGA/lib/widgets/account_limit_warning.dart:10)); `device_conflict` → restart via `RestartWidget`; token expiry → one-tap re-authorization via `LightAuthPage` (sync gate, generation, and audit paths).
+
+## 9. Verification
+
+After the changes: `python3 -m py_compile server/main.py` → OK, and `flutter analyze` → no issues. Run both after touching the server or the Dart sources.

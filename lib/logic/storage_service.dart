@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -5,10 +6,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// 持久化存储服务
 class StorageService {
-  static const String _keyMainText = 'main_text';
-  static const String _keyButton1Content = 'button1_content';
-  static const String _keyButton2Content = 'button2_content';
-  static const String _keyInputContent = 'input_content';
+  static const String _keyMainTextList = 'main_text_list';
+  static const String _keyMainTextStartIndex = 'main_text_start_index';
   static const String _keyIsInitialized = 'is_initialized';
   static const String _keyPlayerName = 'player_name';
   static const String _keyPlayerGender = 'player_gender';
@@ -107,70 +106,36 @@ class StorageService {
     return _prefs.getString(_keyEra) ?? '';
   }
 
-  /// 保留旧的 getRegion 别名以兼容现有代码
-  static String getRegion() => getLanguage();
+  // ---- 小说正文数组（每次生成的内容单独一个元素） ----
 
-  // ---- 主文本内容（初始"正"字） ----
-
-  /// 保存主文本内容
-  static Future<void> saveMainText(String text) async {
-    await _prefs.setString(_keyMainText, text);
+  /// 保存小说正文数组（本地只保留已加载的尾部，服务器为权威数据源）
+  static Future<void> saveMainTextList(List<String> texts) async {
+    await _prefs.setString(_keyMainTextList, jsonEncode(texts));
   }
 
-  /// 读取主文本内容
-  static String getMainText() {
-    return _prefs.getString(_keyMainText) ?? '';
+  /// 读取小说正文数组（未保存或数据损坏时返回空列表）
+  static List<String> getMainTextList() {
+    final raw = _prefs.getString(_keyMainTextList);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return decoded.map((e) => e.toString()).toList();
+      }
+    } catch (_) {
+      // 数据损坏时忽略，返回空列表
+    }
+    return [];
   }
 
-  /// 检查是否已保存过初始文本
-  static bool hasMainText() {
-    return _prefs.containsKey(_keyMainText);
+  /// 保存本地小说数组第一个元素对应的服务器绝对下标（保证与服务器 seq 对齐）
+  static Future<void> saveMainTextStartIndex(int index) async {
+    await _prefs.setInt(_keyMainTextStartIndex, index);
   }
 
-  // ---- 按钮1追加内容 ----
-
-  /// 保存按钮1追加的内容
-  static Future<void> saveButton1Content(String text) async {
-    await _prefs.setString(_keyButton1Content, text);
-  }
-
-  /// 读取按钮1追加的内容
-  static String getButton1Content() {
-    return _prefs.getString(_keyButton1Content) ?? '';
-  }
-
-  // ---- 按钮2追加内容 ----
-
-  /// 保存按钮2追加的内容
-  static Future<void> saveButton2Content(String text) async {
-    await _prefs.setString(_keyButton2Content, text);
-  }
-
-  /// 读取按钮2追加的内容
-  static String getButton2Content() {
-    return _prefs.getString(_keyButton2Content) ?? '';
-  }
-
-  // ---- 输入框追加内容 ----
-
-  /// 保存输入框追加的内容
-  static Future<void> saveInputContent(String text) async {
-    await _prefs.setString(_keyInputContent, text);
-  }
-
-  /// 读取输入框追加的内容
-  static String getInputContent() {
-    return _prefs.getString(_keyInputContent) ?? '';
-  }
-
-  // ---- 全量获取（用于展示） ----
-
-  /// 获取完整展示文本（主文本 + 按钮1 + 按钮2 + 输入框）
-  static String getFullDisplayText() {
-    return getMainText() +
-        getButton1Content() +
-        getButton2Content() +
-        getInputContent();
+  /// 读取本地小说数组第一个元素的绝对下标（默认 0）
+  static int getMainTextStartIndex() {
+    return _prefs.getInt(_keyMainTextStartIndex) ?? 0;
   }
 
   // ---- 初始化数据（角色设定） ----
@@ -243,10 +208,7 @@ class StorageService {
   /// 清除所有持久化数据（将所有内容设为空字符串）
   /// 注意：不删除用户唯一标识
   static Future<void> clearAll() async {
-    await _prefs.setString(_keyMainText, '');
-    await _prefs.setString(_keyButton1Content, '');
-    await _prefs.setString(_keyButton2Content, '');
-    await _prefs.setString(_keyInputContent, '');
+    await _prefs.setString(_keyMainTextList, '');
     await _prefs.setString(_keyPlayerName, '');
     await _prefs.setString(_keyPlayerGender, '');
     await _prefs.setString(_keyPartnerName, '');

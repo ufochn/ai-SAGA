@@ -8,6 +8,8 @@ import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/security_service.dart';
 import 'package:ai_saga/widgets/light_auth_page.dart';
 import 'package:ai_saga/widgets/initialization_page.dart';
+import 'package:ai_saga/widgets/security_warning_page.dart';
+import 'package:ai_saga/widgets/app_restart.dart';
 
 /// 全局主题亮度通知器
 final ValueNotifier<Brightness> themeBrightnessNotifier =
@@ -17,9 +19,10 @@ final ValueNotifier<Brightness> themeBrightnessNotifier =
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // 设备完整性防护：启动时检测硬件/系统完整性，
-  // 若发现设备已被 root / 越狱，立即静默退出进程，不显示任何提示。
-  await SecurityService.ensureNonRootedDevice();
+  // 设备完整性检测：返回设备是否疑似被 root / 越狱；
+  // 若疑似越狱，主界面显示"设备安全警告"页（英文提示 + Exit 按钮），
+  // 由用户确认后关闭 App，而非静默退出。
+  final compromised = await SecurityService.isDeviceCompromised();
   // 加载环境变量配置（.env 已加入 .gitignore，不随仓库上传；
   // 缺少时保持空配置，不影响应用启动）
   try {
@@ -32,11 +35,12 @@ void main() async {
   themeBrightnessNotifier.value = StorageService.getIsDarkMode()
       ? Brightness.dark
       : Brightness.light;
-  runApp(const MyApp());
+  runApp(RestartWidget(child: MyApp(compromised: compromised)));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final bool compromised;
+  const MyApp({super.key, required this.compromised});
 
   @override
   Widget build(BuildContext context) {
@@ -71,7 +75,7 @@ class MyApp extends StatelessWidget {
                 ? AppTheme.pageBackgroundDark
                 : AppTheme.pageBackgroundLight,
           ),
-          home: const SplashScreen(),
+          home: compromised ? const DeviceSecurityWarningPage() : const SplashScreen(),
         );
       },
     );

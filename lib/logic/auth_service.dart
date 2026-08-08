@@ -112,6 +112,12 @@ class AuthService {
         await AccountService.clear();
         throw const AuthNotAuthorizedException();
       }
+      // 同硬件 24h 内切换账号过多（服务器 409 hardware_account_limit）：
+      // 抛出专用异常，由上层弹出英文警告并直接退出 App。
+      if (response.statusCode == 409 &&
+          response.body.contains('hardware_account_limit')) {
+        throw const HardwareAccountLimitException();
+      }
       throw Exception('设备注册失败：HTTP ${response.statusCode} ${response.body}');
     }
 
@@ -165,4 +171,10 @@ class AuthService {
 /// 表示用户尚未完成轻授权，需要引导到 [LightAuthPage]。
 class AuthNotAuthorizedException implements Exception {
   const AuthNotAuthorizedException();
+}
+
+/// 表示同硬件 24 小时内切换账号过多，服务器拒绝本次注册（409 hardware_account_limit）。
+/// 触发时 App 应弹出英文警告并直接退出，防止继续换账号刷试用/配额。
+class HardwareAccountLimitException implements Exception {
+  const HardwareAccountLimitException();
 }

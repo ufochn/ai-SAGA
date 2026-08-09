@@ -31,10 +31,22 @@ class StoryService {
   /// [onDone]：流程结束（可在此保存/收尾）
   static Future<void> generateStoryStream({
     String userInput = '',
+    String choice1 = '',
+    String choice2 = '',
+    String choice3 = '',
+    // 用户设定（第一轮生成时随请求上传，服务器与小说正文一起落库）
+    String location = '',
+    String era = '',
+    String playerName = '',
+    String playerGender = '',
+    String partnerName = '',
+    String partnerGender = '',
+    String partnerTraits = '',
+    String language = '',
     required void Function(String text) onChunk,
     required void Function(String text, Map<String, dynamic> outputs) onReveal,
     required void Function(String reason) onAbort,
-    required void Function(String message) onError,
+    required void Function(String message, {String? code}) onError,
     void Function()? onDeviceConflict,
     void Function()? onStalled,
     required void Function(Map<String, dynamic> outputs) onDone,
@@ -58,9 +70,22 @@ class StoryService {
       });
       request.body = jsonEncode({
         'user_input': userInput,
+        'choice_1': choice1,
+        'choice_2': choice2,
+        'choice_3': choice3,
+        'location': location,
+        'era': era,
+        'player_name': playerName,
+        'player_gender': playerGender,
+        'partner_name': partnerName,
+        'partner_gender': partnerGender,
+        'partner_traits': partnerTraits,
+        'language': language,
       });
 
-      final response = await client.send(request).timeout(const Duration(seconds: 180));
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 180));
       if (response.statusCode != 200) {
         final body = await response.stream.bytesToString();
         String detail = 'HTTP ${response.statusCode}';
@@ -123,7 +148,10 @@ class StoryService {
             onAbort(evt['reason'] as String? ?? '生成内容包含违规信息');
             break;
           case 'error':
-            onError(evt['message'] as String? ?? '生成失败');
+            onError(
+              evt['message'] as String? ?? '生成失败',
+              code: evt['code'] as String?,
+            );
             break;
           case 'done':
             doneCalled = true;

@@ -7,6 +7,10 @@
 > **⚠️ 2026-08-08 update**: the fiction pipeline, story storage, quotas, input limits, and sync strategy were significantly revised. Read the **[Architecture Update (2026-08-08)](#architecture-update-2026-08-08)** section at the bottom first — several earlier sections below are **superseded** and kept only for history (see the *superseded* note there).
 >
 > **⚠️ 2026-08-08 (content moderation)**: guardrail auditing was consolidated onto the final setup confirmation page and the audit result parsing was hardened from a fragile `action: none` substring regex to **strict structured JSON verdicts** (server-authoritative, fail-closed). Read the **[Content Moderation & Guardrail Hardening (2026-08-08)](#content-moderation--guardrail-hardening-2026-08-08)** section at the bottom.
+>
+> **⚠️ 2026-08-09 update**: fixed the guardrail `guardrail_return_json` parsing when Dify returns a JSON **array**, added **localized empty-output quota warnings** (no “LLM” wording) for both new and existing users, several story-page UI refinements, and a **flash-free earlier-content loading** UX built on a layout-phase scroll compensation. Read the **[Session Update (2026-08-09)](#session-update-2026-08-09)** section at the bottom.
+>
+> **⚠️ 2026-08-09 (settings-in-story)**: the dedicated `user_settings` table was **removed** — the seven user settings now travel with each story segment and are stored as per-row snapshot columns on `story_segments`; a new `language` column makes the stored value the authoritative base for all language handling, and the redundant per-request language upload on continuation was removed. The debug database was **rebuilt from scratch** (old data cleared). Read the **[Settings-in-Story Refactor & Language-as-Authority (2026-08-09)](#settings-in-story-refactor--language-as-authority-2026-08-09)** section at the bottom.
 
 ---
 
@@ -488,18 +492,18 @@ CREATE INDEX idx_segments_user_seq ON story_segments(user_id, seq);
 The app is deliberately a thin client: it uploads **only the user’s latest instruction**; the server derives everything else from its own database.
 
 ```
-Flutter input box → generateStoryStream(user_input: "...")
+Flutter setup confirmed → generateStoryStream(user_input: "", location, era, player...)
   ▼ POST /api/generate-story  (Authorization: Bearer <token>)
 server:
-  settings   = _get_user_settings(user_id)      # from user_settings table
-  previous_story, counter = _get_story_tail(user_id)  # from story_segments
+  settings   = _resolve_story_settings(user_id, data)  # 第一轮用请求上传，续写读最新一段快照
+  previous_story, counter = _get_story_tail(user_id)   # from story_segments
   dify_payload = { ...settings..., previous_story, user_input, counter, max_tokens }
   → Dify fiction workflow (streaming)
   → two-phase moderation → SSE chunk/reveal → done
-  → _persist_story_segment(user_id, final_text)  # single row INSERT, always saved
+  → _persist_story_segment(user_id, final_text, settings, choices)  # single row INSERT
 ```
 
-- **Settings are stored server-side**: new `user_settings` table + `POST /api/settings`; the app uploads once when the setup is confirmed ([`SettingsService.saveSettings`](AI-SAGA/lib/logic/settings_service.dart:35)), and the server reads them on every generation ([`_get_user_settings`](AI-SAGA/server/main.py:1200)).
+- **Settings + language travel with the story, no separate table**: there is **no `user_settings` table**. After the setup the app only keeps settings locally; on the **first** generation it uploads them in the `/api/generate-story` request, and the server writes them into that segment’s snapshot columns (`location/era/player_*/partner_*/language`) alongside the story body ([`_persist_story_segment`](AI-SAGA/server/main.py:1183)). Later rounds send no settings; the server reuses the latest segment’s snapshot (including `language`) ([`_resolve_story_settings`](AI-SAGA/server/main.py:1228)). The stored `language` is the authoritative base for all language-related generation.
 - **Previous-segment context comes from the server array**, passed to Dify as `previous_story` — the LLM now actually sees the prior story (previously the payload had no story context at all).
 - **Persistence is server-authoritative**: as soon as the server has the complete text (and it passes moderation) it writes the new row, **regardless of whether the app received the stream**. The old `POST /api/story` whole-array push from the app was removed.
 
@@ -679,3 +683,217 @@ Tested server-side parser against representative inputs (`pass` column = would a
 - **Looser vs. tighter is a policy knob, not a property of structured parsing**: strict parsing + fail-closed can make the net *tighter* (low-confidence never auto-passes); relaxing benign cultural references reduces false positives but must be guarded against adversarial “historical/cultural framing” bypasses.
 - **Guardrail sensitivity ≠ parsing robustness**: maxing the guardrail’s sensitivity setting minimizes false negatives within that judge, but does not fix a fragile text-regex interpretation layer — hence the strict JSON parsing work here is complementary, not redundant.
 - **AWS Bedrock `action` values**: only `NONE` (pass) and `GUARDRAIL_INTERVENED` (blocked), which maps cleanly onto the `action == "none"` check.
+
+---
+
+# Session Update (2026-08-09)
+
+> Session covering: fixing the audit gateway when Dify returns `guardrail_return_json` as a JSON **array**, adding a localized **empty-output quota warning** (without the word “LLM”) for both new and existing users, several **story-page UI refinements**, and the **flash-free earlier-content loading** UX with a layout-phase scroll compensation. Written in English for other developers. **Desensitized** — no secrets, credentials, emails, or real identifiers appear anywhere.
+
+## 1. Guardrail extraction hardened for Dify's array output
+
+**The failure.** The app surfaced *“网关内部解析异常: 500: Dify 未返回有效的 guardrail_return_json 字段”*. Two distinct causes were found and fixed in [`/api/audit-and-chat`](server/main.py:968) and [`_moderate_story`](server/main.py:1208):
+
+1. **Double-wrapped `HTTPException`**: an exception raised inside the `try` was caught by the broad `except Exception` and re-wrapped, turning a clean 400/429 into a confusing 500. Fixed with an explicit `except HTTPException: raise` plus a status-failed check.
+2. **Dify returns an array, not a string**: once the workflow was re-published, Dify delivered `guardrail_return_json` as a JSON **array** (e.g. Bedrock-style `[{...}]`), which the old string-only parser rejected. The new [`_extract_guardrail_output`](server/main.py:309) accepts a string, a dict, a list, an array of JSON-encoded strings, and double-serialized strings, then normalises the verdict back to a single JSON string via an inner `_coerce`. Both consumers now use it, so the app consistently receives `{"action":"none"|"block",...}`.
+
+## 2. Localized "empty output" quota warning
+
+When the server/Dify returns **blank story text** (e.g. the operator's LLM quota is exhausted), the streaming endpoint now emits an SSE error event `{"event":"error","code":"empty_output", ...}` in three places (before the first chunk was sent, after it was sent, and at stream-end fallback). See [`generate_story`](server/main.py:1372).
+
+- [`story_service.dart`](lib/logic/story_service.dart:32) changed `onError` to `void Function(String message, {String? code})` and forwards `code`.
+- [`home_content.dart`](lib/logic/home_content.dart) treats `code == 'empty_output'` (and a stream that ended without any content) as a **quota warning** and shows a localized dialog — for **both** brand-new and existing users, and never exposes the string “LLM”. Example (default/zh): *“服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试”*, translated across all 10 supported languages via `_getQuotaWarningText()`.
+
+## 3. Story-page UI refinements
+
+- **Continue button stays visible while generating** — it is only greyed-out/disabled (via a new `disabled` parameter on `TextInputPanel`) instead of disappearing.
+- **Generating prompt & button labels are localized** per the user's language.
+- **The “generating…” indicator moved below the buttons**.
+- **Removed the extra leading blank line** that used to precede each newly displayed continuation segment.
+
+## 4. Earlier-content lazy loading (the deep topic)
+
+### 4.1 Cursor model
+
+The app never keeps the whole novel in memory. Three integer cursors drive everything ([`home_content.dart`](lib/logic/home_content.dart)):
+
+| Cursor | Meaning |
+|---|---|
+| `_storyStartIndex` | server `seq` of the **first** local segment. `> 0` ⇒ earlier content still exists remotely. |
+| `_visibleStartIndex` | index of the **first rendered** segment. Restart loads only a tail; older in-memory segments are revealed one at a time as the user scrolls up. |
+| `_sessionStreamStartIndex` | index at which current-session **typewriter** segments begin (older history is rendered fully, not typed). |
+
+Choice markers store **absolute** indices (`_storyStartIndex + localIndex`) so alignment is preserved no matter how much is lazily prepended.
+
+### 4.2 Fetch policy
+
+Scrolling to the top triggers [`_loadPreviousSegment()`](lib/logic/home_content.dart:303): if `_visibleStartIndex > 0` it reveals one in-memory segment (branch 1); otherwise it fetches one remote batch of `previousBatchLimit = 10` segments (branch 2) via `fetchPreviousSegments(beforeSeq)`. A **cooldown** (`_lastServerLoad`, 800 ms) prevents a single fling from firing multiple batches, and each trigger fetches **exactly one** batch — this fixed a previous ~10–15 s stall caused by chained loading.
+
+### 4.3 Top pull-area UX
+
+Only when `_storyStartIndex > 0` does the scroll content begin with a blank band of `_earlierPullHeight` (~1/4 screen, clamped 80–280 px) with a centered `CupertinoActivityIndicator` while `_downloadingEarlier` is true. New users with no older content see **no** blank area. When new segments arrive they are inserted at the top of `_storyTexts` (below the band) and rendered immediately (`_visibleStartIndex = 0`), so the band is “filled from the bottom upward” and the reader can keep scrolling to older batches.
+
+### 4.4 Flash-free same-frame compensation (the centerpiece)
+
+**The bug being fixed.** The original code inserted the new segments via `setState` and then compensated in `addPostFrameCallback` with `jumpTo(oldOffset + added)`. Post-frame callbacks run **after paint**, so for one frame the viewport rendered the new content at the old (wrong) offset and the visible text shifted down by the full inserted height — a flash/jump the user could clearly see.
+
+**The fix — compensate during layout, in the same frame, before paint.** Two small classes were added to [`home_content.dart`](lib/logic/home_content.dart):
+
+- [`_CompensatingScrollController`](lib/logic/home_content.dart:29) extends `ScrollController`, adds a one-shot `armCompensation()` / `consumeCompensation()` / `disarmCompensation()` flag, and overrides `createScrollPosition` to return the custom position.
+- [`_CompensatingScrollPosition`](lib/logic/home_content.dart:69) extends `ScrollPositionWithSingleContext` and overrides `correctForNewDimensions(oldMetrics, newMetrics)` — a hook the framework calls inside `applyContentDimensions()` **during layout**, before anything is painted. When the armed flag is consumed and `newMetrics.maxScrollExtent > oldMetrics.maxScrollExtent`, it computes
+
+  ```dart
+  final delta = newPosition.maxScrollExtent - oldPosition.maxScrollExtent;
+  correctPixels(pixels + delta);
+  return false; // request one more layout pass in this same frame
+  ```
+
+  and otherwise defers to `super.correctForNewDimensions`.
+
+Because `delta` is the difference of the **real rendered** `maxScrollExtent` before/after the insert, it exactly equals the height of everything that was prepended (text, choice markers, the per-segment “restart here” cards) — no TextPainter estimation, and therefore robust to **any future element types**. Compensating relative to the **current** `pixels` also keeps the view static even if the user reversed direction (scrolled down) while the batch was downloading.
+
+The flow in [`_loadPreviousSegment`](lib/logic/home_content.dart:303): capture nothing up front → `_scrollController.armCompensation()` → `setState(insert…)` → the very same frame's layout applies the exact correction → post-frame `disarmCompensation()` (safety net if no layout occurred, preventing a stray later compensation) + hide the spinner.
+
+### 4.5 Why not measure with TextPainter?
+
+The naive “measure first” plan estimates the text height with `TextPainter`, but each history segment is followed by a large `StoryChoiceCard` (3 inputs + 3 buttons) — replicating that by hand is error-prone, and any error resurfaces as a flash. The layout-phase hook sidesteps measurement entirely because the framework hands us the true height.
+
+### 4.6 Scope & caveats
+
+- The compensation is **armed** only inside `_loadPreviousSegment` for top-insertions. Any future feature that inserts content above the current viewport must call `armCompensation()` before its `setState`, or it will fall back to the default (flashing) behavior. Reuse the same controller type.
+- The formula is exact only when the insert is at the **top** of the scroll content. Inserting into the middle would not keep both the above and below content static.
+- Typewriter growth (content growing **below** the viewport) is intentionally **not** compensated — the flag is not armed on that path, and the view correctly stays put.
+
+## 5. Verification
+
+`flutter analyze` → no issues (including the new `ScrollPosition` subclass — `correctPixels`/`correctForNewDimensions` are `@protected`, called only from within the subclass). **Important for testing**: because the scroll controller's *type* changed, verify with **Hot Restart (↻/R)**, not Hot Reload (⚡/r) — Hot Reload keeps the old plain `ScrollController` instance, which lacks `armCompensation()`.
+
+---
+
+# Time-Tree Choice Cards & Story-Storage Deep-Dive (2026-08-09)
+
+> Session covering: a deep-dive into the **SQLite story-segment storage model** and its read/write paths, and the **time-tree choice-card UI** — a persistent block of three input boxes + three buttons under every historical paragraph, with a button-below layout and two new localized button labels. Written in English for other developers. **Desensitized** — no secrets, credentials, emails, or real identifiers appear anywhere.
+
+## 1. Story storage model (deep-dive)
+
+### 1.1 Schema — one row per generated segment
+
+The novel is stored in SQLite as one row per generated segment ([`story_segments`](server/main.py:156)):
+
+| Column | Meaning |
+|---|---|
+| `user_id` | owning account (stable platform `sub`) |
+| `seq` | segment index (`0,1,2,…`), identical to the app's `List<String>` index; `UNIQUE(user_id, seq)` |
+| `content` | this segment's text |
+| `created_at` | write timestamp |
+| `choice_1` / `choice_2` / `choice_3` | the three choice inputs offered that round (per-row snapshot) |
+| `location`, `era`, `player_*`, `partner_*`, `language` | the user's settings snapshot at the moment this segment was generated |
+
+The database runs in **WAL mode** and carries the composite index `idx_segments_user_seq ON story_segments(user_id, seq)` ([`server/main.py:177`](server/main.py:177)).
+
+### 1.2 Write path (append-only)
+
+- [`/api/generate-story`](server/main.py:1286) streams from Dify over SSE, moderates the output in two phases, then appends a single row via [`_persist_story_segment`](server/main.py:1174) with `seq = MAX(seq)+1` — **O(1) and never rewrites old rows**. Persistence happens the moment the server holds the complete, approved text, independent of whether the app ever received the stream.
+- Continuation context comes from the DB, not the app: only the last segment is read (`ORDER BY seq DESC LIMIT 1` plus a `COUNT(*)`) in [`_get_story_tail`](server/main.py:1155); for later rounds the settings are re-read from the latest segment's snapshot columns in [`_resolve_story_settings`](server/main.py:1231).
+
+### 1.3 Read path (lazy, index-aligned)
+
+[`GET /api/story`](server/main.py:1642) supports a full pull, `?limit=N` (tail-only, no `COUNT`), and `?before_seq=X&limit=N` (older batch). It returns `start_seq` so the app can map each local list index onto the server `seq` exactly. On the app, `_storyStartIndex` keeps `_storyTexts[i]` aligned to the absolute index `_storyStartIndex + i` ([`home_content.dart`](lib/logic/home_content.dart)).
+
+## 2. Time-tree choice cards (UI)
+
+**Goal.** Under every already-generated historical paragraph, keep a persistent block of **three input boxes + three buttons** — the "time-tree" affordance. The three buttons are placeholders for a future branch/restart feature. This session is scoped strictly to **UI structure + localized copy**: no server-side `choice_1/2/3` fetching, and no real branching yet.
+
+### 2.1 New widget: `StoryChoiceCard`
+
+[`story_choice_card.dart`](lib/widgets/story_choice_card.dart:1) renders three `[input box + full-width button below]` rows. The input boxes are plain editable fields styled like `TextInputPanel`; the buttons are greyed out while the typewriter is still streaming (`enabled`) and play a click sound on tap, but their action is a no-op placeholder.
+
+### 2.2 `TextInputPanel.buttonBelow`
+
+[`text_input_panel.dart`](lib/widgets/text_input_panel.dart:38) gained a `buttonBelow` flag (default `false` preserves the original input-left / button-right row). When `true`, the confirm button moves **below** the input box and stretches to full width.
+
+### 2.3 `StoryChoiceMarker` simplified
+
+[`story_choice_marker.dart`](lib/widgets/story_choice_marker.dart:1) is now a text-only "Your choice: …" marker. Its previous "tap to continue the story from here" button was removed, because the time-tree buttons now live in the per-paragraph `StoryChoiceCard`.
+
+### 2.4 Wiring in `home_content.dart`
+
+- [`_buildStoryBody`](lib/logic/home_content.dart:555) inserts a `StoryChoiceCard` under every **historical** segment (not the newest one). The newest paragraph is instead followed by the page-bottom continuation inputs.
+- The three **latest** (bottom) input boxes now use `buttonBelow: true`; their confirm buttons read **"Continue the story following the guidance above"** and keep the existing continue logic.
+- Historical card buttons read **"Restart from here"** and call the placeholder [`_onRestartHerePressed`](lib/logic/home_content.dart) (TODO — future time-tree return/restart).
+- Two new localizers were added across all 10 languages: [`_getLatestContinueButtonText()`](lib/logic/home_content.dart) and [`_getRestartHereButtonText()`](lib/logic/home_content.dart). The now-unused `_getInputConfirmText` and `_getContinueHereButtonText` were removed.
+
+### 2.5 Final layout
+
+| Position | Contents |
+|---|---|
+| Newest paragraph | three continuation inputs, button below each → "Continue the story following the guidance above" |
+| Historical paragraph | `StoryChoiceCard`: three inputs + three "Restart from here" buttons (placeholder) |
+| In-text | "Your choice: …" marker only (no button) |
+
+## 3. Verification
+
+`flutter analyze` → no issues across the whole project.
+
+---
+
+# Settings-in-Story Refactor & Language-as-Authority (2026-08-09)
+
+> Session covering: eliminating the dedicated `user_settings` table so that every user setting travels with the story body into per-segment snapshot columns on `story_segments`; adding a `language` column that becomes the authoritative base for all language-related operations; and a debug-mode **fresh rebuild** of the production database (old data fully cleared). Written in English for other developers. **Desensitized** — no secrets, credentials, emails, or real identifiers appear anywhere.
+
+## 1. No more `user_settings` table — settings ride along with the story
+
+**Before.** The app uploaded the seven user settings (`location`, `era`, `player_gender/name`, `partner_gender/name/traits`) to a dedicated `user_settings` table right after setup confirmation (`POST /api/settings`); every generation then read them back from that table.
+
+**Now (implemented).**
+- The `user_settings` table, the `POST /api/settings` endpoint, the `SettingsData` model and `_get_user_settings` were **removed** from the server ([`server/main.py`](AI-SAGA/server/main.py:99) schema no longer contains it).
+- After setup the app only keeps settings **locally** (no immediate server upload).
+- On the **first** generation the app uploads the settings inside the `/api/generate-story` request ([`StoryInputData`](AI-SAGA/server/main.py:440)); the server writes them into that segment’s snapshot columns and uses them for the Dify payload.
+- On later (continuation) rounds the app sends no settings; the server re-reads them from the **latest segment’s snapshot** via [`_resolve_story_settings`](AI-SAGA/server/main.py:1317).
+
+```sql
+-- story_segments now carries the full per-round context
+CREATE TABLE IF NOT EXISTS story_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    content    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    choice_1   TEXT DEFAULT '',
+    choice_2   TEXT DEFAULT '',
+    choice_3   TEXT DEFAULT '',
+    location       TEXT DEFAULT '',
+    era            TEXT DEFAULT '',
+    player_gender  TEXT DEFAULT '',
+    player_name    TEXT DEFAULT '',
+    partner_gender TEXT DEFAULT '',
+    partner_name   TEXT DEFAULT '',
+    partner_traits TEXT DEFAULT '',
+    language       TEXT DEFAULT '',
+    UNIQUE(user_id, seq)
+);
+```
+
+## 2. `language` is now the authoritative base
+
+- A `language` column was added to `story_segments` and is persisted on every segment write via [`_persist_story_segment`](AI-SAGA/server/main.py:1260).
+- [`_resolve_story_settings`](AI-SAGA/server/main.py:1317) reads `language` from the request on the first generation and from the latest segment snapshot on continuations — the stored value is the single source of truth for language.
+- The redundant per-request `language` upload on continuation was **removed** from the app ([`home_content.dart`](AI-SAGA/lib/logic/home_content.dart:437)); only the first generation sends it (to seed the snapshot).
+
+## 3. Three choice inputs are snapshotted too
+
+The three on-page input boxes (`choice_1/2/3`) are tracked live via the new `onChanged` callback on [`TextInputPanel`](AI-SAGA/lib/widgets/text_input_panel.dart:12) and uploaded with the request ([`StoryService.generateStoryStream`](AI-SAGA/lib/logic/story_service.dart:38)), so every segment records the exact choices offered that round.
+
+## 4. Debug-mode fresh rebuild (old data cleared)
+
+Because the schema changed and `CREATE TABLE IF NOT EXISTS` never alters an existing database, the production database was **deleted and rebuilt from scratch** in debug mode:
+
+1. Removed `<server-data-dir>/ai_saga.db` (plus WAL/SHM) on the server (path placeholder — actual path is only in local `.env` / deploy helper, both git-ignored).
+2. Uploaded the new [`server/main.py`](AI-SAGA/server/main.py:1) (bind-mounted; uvicorn `--reload` auto-restarted the container).
+3. Verified: `user_settings` no longer exists, `story_segments` now has the `language` column, and `/api/health` returns `{"status":"ok","registered_users":0,"registered_devices":0}`.
+
+## 5. Verification
+
+- `python3 -m py_compile AI-SAGA/server/main.py` → OK
+- `flutter analyze` → no issues across the whole project
+- Server container reloaded cleanly (`StatReload detected changes in 'main.py'. Reloading...` → `Application startup complete.`) and `/api/health` is healthy on a fresh, empty database.

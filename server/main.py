@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -152,29 +153,29 @@ CREATE TABLE IF NOT EXISTS sync_data (
 );
 
 -- 小说正文：每段一行（追加新段 = 一条 INSERT，不用重写整本；seq 即数组下标）
+-- 每行额外记录本轮三个选择 + 生成该段时用户当前的设定快照（调试期直接建表，无需迁移）
 CREATE TABLE IF NOT EXISTS story_segments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    TEXT NOT NULL,
     seq        INTEGER NOT NULL,          -- 段下标（0,1,2,...），即 App 数组下标
     content    TEXT NOT NULL,             -- 这一段文本
     created_at INTEGER NOT NULL,
+    -- 本轮选择（一/二/三，对应本轮生成时提供给用户的三个选项）
+    choice_1   TEXT DEFAULT '',
+    choice_2   TEXT DEFAULT '',
+    choice_3   TEXT DEFAULT '',
+    -- 用户当前设定快照（生成该段时点上的设定值，服务器权威保存）
+    location       TEXT DEFAULT '',
+    era            TEXT DEFAULT '',
+    player_gender  TEXT DEFAULT '',
+    player_name    TEXT DEFAULT '',
+    partner_gender TEXT DEFAULT '',
+    partner_name   TEXT DEFAULT '',
+    partner_traits TEXT DEFAULT '',
+    language       TEXT DEFAULT '',
     UNIQUE(user_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_segments_user_seq ON story_segments(user_id, seq);
-
--- 用户设定（App 首次设定时上传，服务器权威保存；生成时按 user_id 读取）
-CREATE TABLE IF NOT EXISTS user_settings (
-    user_id        TEXT PRIMARY KEY,
-    location       TEXT DEFAULT '',
-    era            TEXT DEFAULT '',
-    player_name    TEXT DEFAULT '',
-    player_gender  TEXT DEFAULT '',
-    partner_name   TEXT DEFAULT '',
-    partner_gender TEXT DEFAULT '',
-    partner_traits TEXT DEFAULT '',
-    language       TEXT DEFAULT '',
-    updated_at     INTEGER
-);
 
 -- 注册挑战（一次性、短时有效）
 CREATE TABLE IF NOT EXISTS challenges (
@@ -297,6 +298,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger = logging.getLogger("ai_saga")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _extract_guardrail_output(dify_data: Any) -> str:
+    """从 Dify blocking 响应中稳健地取出审核结果（JSON 字符串）。
+
+    优先按标准结构 data.outputs.guardrail_return_json 读取：
+    - 值为字符串时原样返回；
+    - Dify guardrail 节点输出为 JSON 数组/对象（如 [{"action": "NONE", ...}]）
+      时序列化为 JSON 字符串返回，后续 _parse_audit_output 会自动解析；
+    若 Dify 返回结构出现嵌套 / 键名差异 / 大小写差异，则递归搜索整个响应，
+    返回第一个名为 *guardrail_return_json（不区分大小写）的非空值。
+    找不到返回 ""。
+    """
+    if not isinstance(dify_data, dict):
+        return ""
+
+    def _coerce(v: Any) -> str:
+        """把 guardrail 值规范化为非空 JSON 字符串；不可用返回 ""。"""
+        if isinstance(v, str):
+            return v if v.strip() else ""
+        if isinstance(v, (dict, list)) and v:
+            try:
+                return json.dumps(v, ensure_ascii=False)
+            except Exception:
+                return ""
+        return ""
+
+    data_block = dify_data.get("data")
+    if isinstance(data_block, dict):
+        outputs = data_block.get("outputs")
+        if isinstance(outputs, dict):
+            val = _coerce(outputs.get("guardrail_return_json"))
+            if val:
+                return val
+
+    # 兜底：递归搜索任意层级的 *guardrail_return_json 键
+    stack: list = [dify_data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if (
+                    isinstance(k, str)
+                    and k.strip().lower().endswith("guardrail_return_json")
+                ):
+                    val = _coerce(v)
+                    if val:
+                        return val
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(item for item in node if isinstance(item, (dict, list)))
+    return ""
+
+
 async_http_client = httpx.AsyncClient(timeout=60.0)
 
 
@@ -377,14 +439,18 @@ class InputData(BaseModel):
 
 class StoryInputData(BaseModel):
     """小说生成请求：App 只上传用户最新输入，其余设定/上一段由服务器从数据库读取。
-    （App 端有专门的 reset 功能，不走本生成接口。）"""
+    （App 端有专门的 reset 功能，不走本生成接口。）
+
+    choice_1/2/3：本轮用户在 App 三个输入框里输入的三个选项（随行快照，服务器存储）。
+    """
     token: str = ""
     user_id: str = ""
     user_input: str = ""
-
-
-class SettingsData(BaseModel):
-    """用户设定（App 首次设定/修改设定时上传，服务器权威保存）。"""
+    choice_1: str = ""
+    choice_2: str = ""
+    choice_3: str = ""
+    # 第一轮生成时，App 把用户设定随请求上传，服务器随小说正文一起落库
+    # （不再单独存储到 user_settings 表）
     location: str = ""
     era: str = ""
     player_name: str = ""
@@ -939,12 +1005,34 @@ async def audit_and_chat(data: InputData, request: Request):
                 detail=f"Dify 接口调用失败，状态码: {response.status_code}，详情: {response.text}",
             )
         dify_data = response.json()
-        dify_outputs = dify_data.get("data", {}).get("outputs", {})
-        final_text = dify_outputs.get("guardrail_return_json", "")
+        data_block = dify_data.get("data") or {}
+        # Dify blocking 模式下，工作流自身失败时 HTTP 仍为 200，但 status=failed 且无 outputs
+        if data_block.get("status") == "failed":
+            err = data_block.get("error") or data_block.get("message") or "未知错误"
+            raise HTTPException(
+                status_code=502,
+                detail=f"Dify 审核工作流执行失败: {err}",
+            )
+        final_text = _extract_guardrail_output(dify_data)
         if not final_text:
+            # 记录 Dify 原始返回，便于排查画板 End 节点输出结构
+            raw_preview = json.dumps(dify_data, ensure_ascii=False)[:1200]
+            logger.warning(
+                "audit-and-chat: Dify 响应中未找到 guardrail_return_json，"
+                "status=%s 原始响应=%s",
+                data_block.get("status"),
+                raw_preview,
+            )
+            keys = ", ".join(
+                map(str, (data_block.get("outputs") or {}).keys())
+            ) or "(未返回任何 outputs)"
             raise HTTPException(
                 status_code=500,
-                detail="Dify 未返回有效的 guardrail_return_json 字段，请检查画板 End 节点配置是否叫 guardrail_return_json",
+                detail=(
+                    "Dify 未返回有效的 guardrail_return_json 字段，"
+                    "请检查画板 End 节点输出变量名是否为 guardrail_return_json。"
+                    f"实际返回的输出字段: [{keys}]"
+                ),
             )
         # 输出兜底截断（成本已在 max_tokens 锁死，这里是防异常返回超长文本）
         final_text = final_text[: MAX_INPUT_CHARS * 2]
@@ -952,6 +1040,8 @@ async def audit_and_chat(data: InputData, request: Request):
         return _build_audit_verdict(final_text)
     except httpx.RequestError as exc:
         raise HTTPException(status_code=503, detail=f"与 Dify 服务器通信网络异常: {str(exc)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"网关内部解析异常: {str(e)}")
 
@@ -1141,7 +1231,7 @@ async def _moderate_story(text: str) -> bool:
         if resp.status_code != 200:
             return False
         data = resp.json()
-        out = data.get("data", {}).get("outputs", {}).get("guardrail_return_json", "") or ""
+        out = _extract_guardrail_output(data)
         # 审核工作流输出应为 JSON（含 action 字段），fail-closed
         return _audit_passed(out)
     except Exception:
@@ -1167,16 +1257,25 @@ def _get_story_tail(user_id: str) -> tuple:
         conn.close()
 
 
-def _persist_story_segment(user_id: str, new_segment: str) -> None:
+def _persist_story_segment(
+    user_id: str,
+    new_segment: str,
+    settings: Optional[dict] = None,
+    choices: Optional[dict] = None,
+) -> None:
     """追加本段为该用户小说数组的新元素（seq = 原最大下标 + 1），单行 INSERT。
 
     服务器从 Dify 收到完整文本（且审核通过）就立即写入，
     与 App 是否收全无关；App 断流/卡死重启后，冷启动同步即可拉回完整文本。
     每段一行，追加不重写任何旧数据。
+    同时把生成该段时点上的"本轮三个选择"与"用户设定快照"随行落库，
+    供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
     """
     if not new_segment or not new_segment.strip():
         return
     now = int(time.time())
+    settings = settings or {}
+    choices = choices or {}
     conn = _db()
     try:
         row = conn.execute(
@@ -1185,21 +1284,74 @@ def _persist_story_segment(user_id: str, new_segment: str) -> None:
         ).fetchone()
         next_seq = row["m"] + 1
         conn.execute(
-            """INSERT INTO story_segments (user_id, seq, content, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, next_seq, new_segment, now),
+            """INSERT INTO story_segments
+                 (user_id, seq, content, created_at,
+                  choice_1, choice_2, choice_3,
+                  location, era, player_gender, player_name,
+                  partner_gender, partner_name, partner_traits,
+                  language)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                next_seq,
+                new_segment,
+                now,
+                (choices.get("choice_1") or ""),
+                (choices.get("choice_2") or ""),
+                (choices.get("choice_3") or ""),
+                (settings.get("location") or ""),
+                (settings.get("era") or ""),
+                (settings.get("player_gender") or ""),
+                (settings.get("player_name") or ""),
+                (settings.get("partner_gender") or ""),
+                (settings.get("partner_name") or ""),
+                (settings.get("partner_traits") or ""),
+                (settings.get("language") or ""),
+            ),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def _get_user_settings(user_id: str) -> dict:
-    """读取服务器保存的该用户设定（无设定时返回空字典）。"""
+def _resolve_story_settings(user_id: str, data: StoryInputData) -> dict:
+    """解析本轮生成所用的用户设定快照。
+
+    - 第一轮生成：用 App 随请求上传的设定（并随当段写入 story_segments 快照列）；
+    - 续写：App 不再上传设定，从最新一段的快照列读取（含语言）。
+    """
+    req = {
+        "location": data.location or "",
+        "era": data.era or "",
+        "player_name": data.player_name or "",
+        "player_gender": data.player_gender or "",
+        "partner_name": data.partner_name or "",
+        "partner_gender": data.partner_gender or "",
+        "partner_traits": data.partner_traits or "",
+        "language": data.language or "",
+    }
+    if any(
+        req[k]
+        for k in (
+            "location",
+            "era",
+            "player_name",
+            "player_gender",
+            "partner_name",
+            "partner_gender",
+            "partner_traits",
+            "language",
+        )
+    ):
+        return req
+    # 续写：读取最新一段快照列（含语言）
     conn = _db()
     try:
         row = conn.execute(
-            "SELECT * FROM user_settings WHERE user_id=?", (user_id,)
+            """SELECT location, era, player_name, player_gender,
+                      partner_name, partner_gender, partner_traits, language
+               FROM story_segments WHERE user_id=? ORDER BY seq DESC LIMIT 1""",
+            (user_id,),
         ).fetchone()
         return dict(row) if row else {}
     finally:
@@ -1228,9 +1380,14 @@ async def generate_story(data: StoryInputData, request: Request):
     # 小说生成工作流全局每日配额（默认 1000 次 / 24 小时滚动）
     _check_story_quota(int(time.time()))
 
-    # 设定从数据库读取；续写/全新以数据库是否已有段落为准（App 端有专门 reset 功能，
-    # 不在此生成接口判断）。
-    settings = _get_user_settings(user_id)
+    # 设定解析：第一轮生成用 App 随请求上传的设定（随段落库），续写读最新一段快照
+    settings = _resolve_story_settings(user_id, data)
+    # 本轮选择快照：App 三个输入框的值（本轮生成时随行落库）
+    choices = {
+        "choice_1": data.choice_1 or "",
+        "choice_2": data.choice_2 or "",
+        "choice_3": data.choice_3 or "",
+    }
     # 以数据库是否已有段落决定续写/全新；空库自然返回 ("", 0)
     previous_story, user_input_counter = _get_story_tail(user_id)
 
@@ -1330,6 +1487,9 @@ async def generate_story(data: StoryInputData, request: Request):
                         if not sent_first:
                             # 全文不足首段字数：整体审一次再发
                             final_all = outputs.get("text", "") or full_text
+                            if not final_all or not final_all.strip():
+                                yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
+                                return
                             if not await _moderate_story(final_all):
                                 yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                                 return
@@ -1337,6 +1497,9 @@ async def generate_story(data: StoryInputData, request: Request):
                             yield _sse({"event": "chunk", "text": final_all})
                         else:
                             out_text = outputs.get("text", "") or full_text
+                            if not out_text or not out_text.strip():
+                                yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
+                                return
                             if out_text and out_text.startswith(first_buf):
                                 rest = out_text[len(first_buf):]   # 展示：首段(450)之后，避免重复
                             else:
@@ -1355,7 +1518,7 @@ async def generate_story(data: StoryInputData, request: Request):
                             else:
                                 yield _sse({"event": "reveal", "text": "", "outputs": outputs})
                         # 服务器已从 Dify 收到完整文本且审核通过：立即持久化，与 App 是否收全无关
-                        _persist_story_segment(user_id, final_segment)
+                        _persist_story_segment(user_id, final_segment, settings, choices)
                         yield _sse({"event": "done", "outputs": outputs})
                         return
 
@@ -1367,7 +1530,7 @@ async def generate_story(data: StoryInputData, request: Request):
                 if not sent_first and full_text:
                     if await _moderate_story(full_text):
                         yield _sse({"event": "chunk", "text": full_text})
-                        _persist_story_segment(user_id, full_text)
+                        _persist_story_segment(user_id, full_text, settings, choices)
                         yield _sse({"event": "done", "outputs": outputs})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
@@ -1375,12 +1538,15 @@ async def generate_story(data: StoryInputData, request: Request):
                     if await _moderate_story(rest_buf):
                         yield _sse({"event": "reveal", "text": rest_buf, "outputs": outputs})
                         # full_text = 首段 + 剩余，即完整文本
-                        _persist_story_segment(user_id, full_text)
+                        _persist_story_segment(user_id, full_text, settings, choices)
                         yield _sse({"event": "done", "outputs": outputs})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                 else:
-                    yield _sse({"event": "error", "message": "生成流意外中断"})
+                    if not full_text or not full_text.strip():
+                        yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
+                    else:
+                        yield _sse({"event": "error", "message": "生成流意外中断"})
         except httpx.RequestError as exc:
             yield _sse({"event": "error", "message": f"与 Dify 通信异常: {str(exc)}"})
         except Exception as e:
@@ -1670,37 +1836,6 @@ async def story_put(data: StoryData, request: Request):
     finally:
         conn.close()
     return {"status": "ok", "applied": True}
-
-
-@app.post("/api/settings")
-async def settings_put(data: SettingsData, request: Request):
-    """保存该用户的设定（App 首次设定/修改设定时调用，服务器权威保存）。"""
-    token = _extract_token(None, request)
-    claims = validate_token(token)
-    user_id = claims["user_id"]
-    device_id = claims["device_id"]
-    _enforce_active_device(user_id, device_id)
-    conn = _db()
-    try:
-        conn.execute(
-            """INSERT INTO user_settings
-                 (user_id, location, era, player_name, player_gender,
-                  partner_name, partner_gender, partner_traits, language, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(user_id) DO UPDATE SET
-                 location=excluded.location, era=excluded.era,
-                 player_name=excluded.player_name, player_gender=excluded.player_gender,
-                 partner_name=excluded.partner_name, partner_gender=excluded.partner_gender,
-                 partner_traits=excluded.partner_traits, language=excluded.language,
-                 updated_at=excluded.updated_at""",
-            (user_id, data.location, data.era, data.player_name, data.player_gender,
-             data.partner_name, data.partner_gender, data.partner_traits, data.language,
-             int(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return {"status": "ok"}
 
 
 def _extract_token(data: Optional[InputData], request: Request) -> str:

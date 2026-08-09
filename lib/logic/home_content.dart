@@ -3,6 +3,7 @@ import 'package:ai_saga/widgets/account_limit_warning.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
 import 'package:ai_saga/widgets/character_text.dart';
 import 'package:ai_saga/widgets/light_auth_page.dart';
+import 'package:ai_saga/widgets/story_choice_card.dart';
 import 'package:ai_saga/widgets/story_choice_marker.dart';
 import 'package:ai_saga/widgets/text_input_panel.dart';
 import 'package:ai_saga/widgets/initialization_page.dart';
@@ -13,12 +14,83 @@ import 'package:ai_saga/widgets/character_setup_page.dart';
 
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/auth_service.dart';
-import 'package:ai_saga/logic/settings_service.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/story_service.dart';
 import 'package:ai_saga/logic/sync_service.dart';
 import 'package:ai_saga/widgets/setup_confirmation_page.dart';
+
+/// 上插更早内容时用于"无闪"补偿的滚动控制器。
+///
+/// 调用 [armCompensation] 后，下一次内容高度增长（例如把更早文本段前插到顶部）
+/// 会在**同一帧的布局阶段**按实际新增高度同步修正滚动偏移（通过自定义
+/// [ScrollPosition.correctForNewDimensions]），因此渲染出来的正文从一开始就处于
+/// 正确位置——下方正文完全静止、上方像"长出"了更早内容，没有任何闪帧或跳动。
+class _CompensatingScrollController extends ScrollController {
+  bool _armCompensation = false;
+
+  /// 下次布局中的内容高度增长需要按新增高度补偿滚动偏移。
+  void armCompensation() {
+    _armCompensation = true;
+  }
+
+  /// 布局阶段消费补偿标记；返回是否需要在本次高度增长时补偿偏移。
+  bool consumeCompensation() {
+    final bool armed = _armCompensation;
+    _armCompensation = false;
+    return armed;
+  }
+
+  /// 兜底：若本帧未发生布局（极端情况），清除标记，避免误补偿后续内容增长。
+  void disarmCompensation() {
+    _armCompensation = false;
+  }
+
+  @override
+  ScrollPosition createScrollPosition(
+    ScrollPhysics physics,
+    ScrollContext context,
+    ScrollPosition? oldPosition,
+  ) {
+    return _CompensatingScrollPosition(
+      physics: physics,
+      context: context,
+      oldPosition: oldPosition,
+      controller: this,
+    );
+  }
+}
+
+/// 布局阶段按新增高度补偿滚动偏移的 ScrollPosition。
+///
+/// 当内容在上方前插导致 [maxScrollExtent] 增大时，把当前滚动偏移同步加上
+/// 新增高度，从而保持视野中的正文位置不动。补偿发生在 [applyContentDimensions]
+/// 的布局过程中（早于绘制），因此对用户完全无感。
+class _CompensatingScrollPosition extends ScrollPositionWithSingleContext {
+  _CompensatingScrollPosition({
+    required super.physics,
+    required super.context,
+    super.oldPosition,
+    required this.controller,
+  });
+
+  final _CompensatingScrollController controller;
+
+  @override
+  bool correctForNewDimensions(
+    ScrollMetrics oldPosition,
+    ScrollMetrics newPosition,
+  ) {
+    if (controller.consumeCompensation() &&
+        newPosition.maxScrollExtent > oldPosition.maxScrollExtent) {
+      final double delta =
+          newPosition.maxScrollExtent - oldPosition.maxScrollExtent;
+      correctPixels(pixels + delta);
+      return false; // 偏移已修正，请求在同一帧内重新布局一次
+    }
+    return super.correctForNewDimensions(oldPosition, newPosition);
+  }
+}
 
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
@@ -66,7 +138,8 @@ class _HomeContentState extends State<HomeContent>
     with SingleTickerProviderStateMixin {
   /// 尚无任何正文时显示的占位文本（本地生成，不持久化）
   String _emptyStoryText = '';
-  final ScrollController _scrollController = ScrollController();
+  final _CompensatingScrollController _scrollController =
+      _CompensatingScrollController();
   late final PageController _pageController;
 
   /// 主角性别: 0=男, 1=女, null=未设定（用于传递给搭档页面决定默认性别）
@@ -107,6 +180,12 @@ class _HomeContentState extends State<HomeContent>
   /// 是否正在向上加载更早的文本段（防止重复触发）
   bool _loadingPrevious = false;
 
+  /// 是否正在从服务器下载更早的文本段（屏幕顶部显示下载旋转动画）
+  bool _downloadingEarlier = false;
+
+  /// 上一次从服务器拉取更早内容的时刻（用于防止一次上滑连发多批拉取）
+  DateTime _lastServerLoad = DateTime.fromMillisecondsSinceEpoch(0);
+
   /// 冷启动同步门禁：为 true 时正在从服务器拉取数据（暂不开放后续功能）
   bool _startupSyncing = false;
 
@@ -128,6 +207,11 @@ class _HomeContentState extends State<HomeContent>
 
   /// 用户选择节点：正文中"用户选择：xxx" + 时间树返回占位按钮
   final List<_ChoiceRecord> _choices = [];
+
+  /// 本轮三个输入框的当前值（任一确认时随请求一并上传，作为本轮选择一/二/三快照）
+  String _inputChoice1 = '';
+  String _inputChoice2 = '';
+  String _inputChoice3 = '';
 
   @override
   void initState() {
@@ -206,6 +290,10 @@ class _HomeContentState extends State<HomeContent>
     // 已在最顶部且还有更早内容（内存未揭示完或服务器还有更早段）时才加载
     if (_visibleStartIndex <= 0 && _storyStartIndex <= 0) return;
     if (_scrollController.position.pixels <= 0) {
+      // 防止一次上滑/上移动画触发连发多批拉取：短时间内不重复请求服务器
+      if (DateTime.now().difference(_lastServerLoad).inMilliseconds < 800) {
+        return;
+      }
       _loadPreviousSegment();
     }
   }
@@ -214,28 +302,21 @@ class _HomeContentState extends State<HomeContent>
   /// 使当前视野内容保持不动（"平滑"衔接不跳动）。
   Future<void> _loadPreviousSegment() async {
     if (_loadingPrevious) return;
-    final oldPixels = _scrollController.hasClients
-        ? _scrollController.position.pixels
-        : 0.0;
-    final oldMax = _scrollController.hasClients
-        ? _scrollController.position.maxScrollExtent
-        : 0.0;
 
     // 1) 内存中仍有更早的段：直接揭示一个（不请求服务器）
     if (_visibleStartIndex > 0) {
       _loadingPrevious = true;
+      // 上插前先武装同帧补偿：布局阶段按实际新增高度同步修正滚动偏移，
+      // 使当前视野内的正文保持静止（"下方静止、上方长出内容"，无闪帧）。
+      _scrollController.armCompensation();
       setState(() {
         _visibleStartIndex--;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        if (_scrollController.hasClients) {
-          final added = _scrollController.position.maxScrollExtent - oldMax;
-          if (added > 0) {
-            _scrollController.jumpTo(oldPixels + added);
-          }
-        }
         _loadingPrevious = false;
+        // 兜底清除补偿标记：若本帧未发生布局（极少数情况），避免误补偿后续内容增长
+        _scrollController.disarmCompensation();
         // 若内容仍不足以滚动，则继续加载更早的内容，直到填满一屏或到小说开头
         if (_scrollController.hasClients &&
             _scrollController.position.maxScrollExtent <= 0 &&
@@ -246,43 +327,54 @@ class _HomeContentState extends State<HomeContent>
       return;
     }
 
-    // 2) 内存已到顶部：从服务器取更早的段前插，保持绝对下标与服务器 seq 对齐
+    // 2) 内存已到顶部：从服务器取最近一批更早段前插（每次只取一批，快速返回）
     if (_storyStartIndex <= 0) return; // 已是小说开头
     _loadingPrevious = true;
+    _lastServerLoad = DateTime.now(); // 记录本次拉取时刻（防一次上滑连发多批）
+    setState(() {
+      _downloadingEarlier = true; // 顶部预留空间显示下载旋转动画
+    });
     try {
       final earlier = await SyncService.fetchPreviousSegments(_storyStartIndex);
       if (!mounted) return;
       if (earlier.segments.isEmpty) {
         _storyStartIndex = 0; // 没有更早的段了
+        _loadingPrevious = false;
+        setState(() {
+          _downloadingEarlier = false;
+        });
         return;
       }
       final addedCount = earlier.segments.length;
+      // 上插更早内容：先在布局阶段（同一帧、渲染之前）按"新增高度"补偿滚动偏移。
+      // 这样渲染出来的正文一开始就处于正确位置，下方正文完全静止、上方长出更早内容，
+      // 彻底避免"先以错位渲染一帧、再 jumpTo 跳回"造成的闪烁。
+      _scrollController.armCompensation();
       setState(() {
         _storyTexts.insertAll(0, earlier.segments);
         _storyStartIndex = earlier.startSeq;
-        // 新段在上方；保持原可见内容（原下标 0 现在位于 addedCount）
-        _visibleStartIndex += addedCount;
+        // 新段直接渲染（从 0 开始渲染全部已加载段），上方即刚拉取的更早内容
+        _visibleStartIndex = 0;
         // 本会话流式段的本地下标随之后移
         _sessionStreamStartIndex += addedCount;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        if (_scrollController.hasClients) {
-          final added = _scrollController.position.maxScrollExtent - oldMax;
-          if (added > 0) {
-            _scrollController.jumpTo(oldPixels + added);
-          }
-        }
-        if (_scrollController.hasClients &&
-            _scrollController.position.maxScrollExtent <= 0 &&
-            _storyStartIndex > 0) {
-          _loadPreviousSegment();
-        }
+        _loadingPrevious = false;
+        // 兜底清除补偿标记：若本帧未发生布局（极少数情况），避免误补偿后续内容增长
+        _scrollController.disarmCompensation();
+        setState(() {
+          _downloadingEarlier = false;
+        });
       });
     } catch (_) {
       // 加载更早章节失败：静默，允许下次滚动重试
-    } finally {
       _loadingPrevious = false;
+      if (mounted) {
+        setState(() {
+          _downloadingEarlier = false;
+        });
+      }
     }
   }
 
@@ -385,13 +477,22 @@ class _HomeContentState extends State<HomeContent>
   /// 占位回调（LightAuthPage 授权完成后由 push 返回值触发重试）。
   static void _dummyAuthComplete() {}
 
-  /// 是否显示正文下方的三个输入框：接收正文期间隐藏，彻底显示完成后恢复。
-  /// 额外要求"本次正文已完整接收"（收到 done）或"违规中止"（允许用户改输入重试），
+  /// 是否显示正文下方的三个输入框：
+  /// - 已有正文且生成/接收中：保持可见，但“继续”按钮置灰禁用（不消失）；
+  /// - 正文彻底显示完成（收到 done）或违规中止：可见、按钮可用；
+  /// - 尚无正文（首次生成前）：隐藏。
   /// 断流/出错时保持隐藏，避免基于未传完的残缺文本续写。
   bool get _storyInputsVisible =>
-      !_storyStreaming &&
-      _storyTyped &&
-      (_storyReceivedCompletely || _storyAbortReason != null);
+      _storyTexts.isNotEmpty &&
+      ((_storyTyped &&
+              (_storyReceivedCompletely || _storyAbortReason != null)) ||
+          _storyStreaming);
+
+  /// 顶部“上拉加载更早内容”空白区高度：约屏幕的 1/4，旋转图标居中。
+  double get _earlierPullHeight {
+    final h = MediaQuery.of(context).size.height;
+    return (h / 4).clamp(80.0, 280.0);
+  }
 
   void _onInput1Confirm(String text) => _continueStory(text);
 
@@ -407,6 +508,8 @@ class _HomeContentState extends State<HomeContent>
     final int preStreamLen = _storyTexts.length;
     // 新一段内容是否已作为数组新元素创建（每次续写独占一个数组元素）
     bool segmentStarted = false;
+    // 本次续写是否收到过非空正文（LLM 返回空白时用于弹窗警告）
+    bool hadContent = false;
     setState(() {
       _generating = true;
       _storyAbortReason = null;
@@ -414,7 +517,8 @@ class _HomeContentState extends State<HomeContent>
       _storyTyped = false;
       _storyReceivedCompletely = false; // 本次正文尚未完整接收
       // 记录用户选择节点（时间树返回功能的占位数据）；重新授权重试时避免重复记录
-      final alreadyRecorded = _choices.isNotEmpty &&
+      final alreadyRecorded =
+          _choices.isNotEmpty &&
           _choices.last.text == userInput.trim() &&
           _choices.last.segmentIndex == _storyStartIndex + _storyTexts.length;
       if (!alreadyRecorded) {
@@ -429,74 +533,95 @@ class _HomeContentState extends State<HomeContent>
       }
     });
     try {
-    await StoryService.generateStoryStream(
-      userInput: userInput,
-      onDeviceConflict: _onDeviceConflict,
-      onStalled: _onStreamStalled,
-      onChunk: (text) {
-        if (!mounted) return;
-        setState(() {
-          if (!segmentStarted) {
-            // 新一段内容：若已有前文则以空行分隔，单独存入数组新元素
-            final prefix = _storyTexts.isNotEmpty ? '\n\n' : '';
-            _storyTexts.add(prefix + text);
-            segmentStarted = true;
-          } else {
-            _storyTexts[_storyTexts.length - 1] += text;
+      await StoryService.generateStoryStream(
+        userInput: userInput,
+        choice1: _inputChoice1,
+        choice2: _inputChoice2,
+        choice3: _inputChoice3,
+        onDeviceConflict: _onDeviceConflict,
+        onStalled: _onStreamStalled,
+        onChunk: (text) {
+          if (!mounted) return;
+          if (text.trim().isNotEmpty) hadContent = true;
+          setState(() {
+            if (!segmentStarted) {
+              // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
+              _storyTexts.add(text);
+              segmentStarted = true;
+            } else {
+              _storyTexts[_storyTexts.length - 1] += text;
+            }
+            _generating = false;
+            _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
+          });
+        },
+        onReveal: (text, outputs) {
+          if (!mounted) return;
+          if (text.trim().isNotEmpty) hadContent = true;
+          // 剩余部分不再一次性显示，而是由打字机以不断加速的方式接续打出
+          setState(() {
+            if (!segmentStarted) {
+              // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
+              _storyTexts.add(text);
+              segmentStarted = true;
+            } else {
+              _storyTexts[_storyTexts.length - 1] += text;
+            }
+            _generating = false;
+            _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
+          });
+        },
+        onAbort: (reason) {
+          if (!mounted) return;
+          setState(() {
+            _storyAbortReason = reason;
+            _generating = false;
+            _storyStreaming = false;
+            _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
+          });
+        },
+        onError: (message, {code}) {
+          if (!mounted) return;
+          setState(() {
+            // 流未完整结束（未收到 done）：丢弃本次未传完的段落，
+            // 避免基于残缺文本续写/误判；_storyReceivedCompletely 保持 false，
+            // 输入框保持隐藏（除非违规中止）。
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
+            _generating = false;
+            _storyStreaming = false;
+            _storyTyped = true;
+          });
+          // 服务器未返回有效正文（如额度用尽）：按当前语言提示检查额度
+          _showGenerateError(
+            code == 'empty_output' ? _getQuotaWarningText() : message,
+          );
+        },
+        onDone: (outputs) async {
+          if (!mounted) return;
+          if (!hadContent) {
+            // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：丢弃空段落并弹窗警告
+            setState(() {
+              if (_storyTexts.length > preStreamLen) {
+                _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+              }
+              _generating = false;
+              _storyStreaming = false;
+              _storyTyped = true;
+              _storyReceivedCompletely = true;
+            });
+            _showGenerateError(_getQuotaWarningText());
+            return;
           }
-          _generating = false;
-          _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
-        });
-      },
-      onReveal: (text, outputs) {
-        if (!mounted) return;
-        // 剩余部分不再一次性显示，而是由打字机以不断加速的方式接续打出
-        setState(() {
-          if (!segmentStarted) {
-            final prefix = _storyTexts.isNotEmpty ? '\n\n' : '';
-            _storyTexts.add(prefix + text);
-            segmentStarted = true;
-          } else {
-            _storyTexts[_storyTexts.length - 1] += text;
-          }
-          _generating = false;
-          _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
-        });
-      },
-      onAbort: (reason) {
-        if (!mounted) return;
-        setState(() {
-          _storyAbortReason = reason;
-          _generating = false;
-          _storyStreaming = false;
-          _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
-        });
-      },
-      onError: (message) {
-        if (!mounted) return;
-        setState(() {
-          // 流未完整结束（未收到 done）：丢弃本次未传完的段落，
-          // 避免基于残缺文本续写/误判；_storyReceivedCompletely 保持 false，
-          // 输入框保持隐藏（除非违规中止）。
-          if (_storyTexts.length > preStreamLen) {
-            _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-          }
-          _generating = false;
-          _storyStreaming = false;
-          _storyTyped = true;
-        });
-        _showGenerateError(message);
-      },
-      onDone: (outputs) async {
-        if (!mounted) return;
-        setState(() {
-          _storyStreaming = false; // 正文已全部接收完成
-          _storyReceivedCompletely = true; // 已完整接收：放行继续续写
-        });
-        await StorageService.saveMainTextList(List.of(_storyTexts));
-        await StorageService.saveMainTextStartIndex(_storyStartIndex);
-      },
-    );
+          setState(() {
+            _storyStreaming = false; // 正文已全部接收完成
+            _storyReceivedCompletely = true; // 已完整接收：放行继续续写
+          });
+          await StorageService.saveMainTextList(List.of(_storyTexts));
+          await StorageService.saveMainTextStartIndex(_storyStartIndex);
+        },
+      );
     } on HardwareAccountLimitException {
       // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
       if (!mounted) return;
@@ -606,13 +731,7 @@ class _HomeContentState extends State<HomeContent>
           );
         }
         children.add(
-          StoryChoiceMarker(
-            prefix: _getChoicePrefixText(),
-            text: choice.text,
-            buttonText: _getContinueHereButtonText(),
-            enabled: _storyTyped,
-            onPressed: _onChoiceButtonPressed,
-          ),
+          StoryChoiceMarker(prefix: _getChoicePrefixText(), text: choice.text),
         );
         cursor = offset;
       }
@@ -624,6 +743,20 @@ class _HomeContentState extends State<HomeContent>
                   isLast: segIndex == _storyTexts.length - 1,
                 )
               : CharacterText(text: segment.substring(cursor)),
+        );
+      }
+      // 历史段落（非最新一段）下方：三个输入框 + 三个"从这里重新开始"按钮，
+      // 三个按钮用于实现"时间树"功能（当前为占位）。
+      // 最新一段下方不插入卡片，其下方的输入框由页面底部的三个（"按照上面
+      // 输入指引继续故事选择"）承载。
+      if (segIndex < _storyTexts.length - 1) {
+        children.add(
+          StoryChoiceCard(
+            buttonText: _getRestartHereButtonText(),
+            inputPlaceholder: _getInputPlaceholder(),
+            enabled: _storyTyped,
+            onPressed: _onRestartHerePressed,
+          ),
         );
       }
     }
@@ -788,54 +921,91 @@ class _HomeContentState extends State<HomeContent>
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
+                              // 顶部预留空白区（约 1/4 屏）：仅当服务器还有更早内容
+                              // （_storyStartIndex>0）时才提供“上拉加载更早内容”的区域，
+                              // 图标居中；已到小说开头（_storyStartIndex==0，如新用户首篇）不显示。
+                              if (_storyStartIndex > 0)
+                                SizedBox(
+                                  height: _earlierPullHeight,
+                                  child: _downloadingEarlier
+                                      ? const Center(
+                                          child: CupertinoActivityIndicator(
+                                            radius: 14,
+                                          ),
+                                        )
+                                      : null,
+                                ),
                               ..._buildStoryBody(),
-                              if (_generating && _storyTexts.isNotEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 16,
-                                    vertical: 4,
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      const CupertinoActivityIndicator(
-                                        radius: 10,
+                                    // 输入框隐藏时保留其占位空间，避免正文文字位置跳动
+                                    Visibility(
+                                      visible: _storyInputsVisible,
+                                      maintainSize: true,
+                                      maintainAnimation: true,
+                                      maintainState: true,
+                                      maintainInteractivity: false,
+                                      child: Column(
+                                        children: [
+                                          const SizedBox(height: 12),
+                                          TextInputPanel(
+                                            placeholder:
+                                                _getFirstInputPlaceholder(),
+                                            confirmText:
+                                                _getLatestContinueButtonText(),
+                                            buttonBelow: true,
+                                            disabled: _storyStreaming,
+                                            onConfirm: _onInput1Confirm,
+                                            onChanged: (v) =>
+                                                _inputChoice1 = v,
+                                          ),
+                                          const SizedBox(height: 12),
+                                          TextInputPanel(
+                                            placeholder:
+                                                _getInputPlaceholder(),
+                                            confirmText:
+                                                _getLatestContinueButtonText(),
+                                            buttonBelow: true,
+                                            disabled: _storyStreaming,
+                                            onConfirm: _onInput2Confirm,
+                                            onChanged: (v) =>
+                                                _inputChoice2 = v,
+                                          ),
+                                          const SizedBox(height: 12),
+                                          TextInputPanel(
+                                            placeholder:
+                                                _getInputPlaceholder(),
+                                            confirmText:
+                                                _getLatestContinueButtonText(),
+                                            buttonBelow: true,
+                                            disabled: _storyStreaming,
+                                            onConfirm: _onInputConfirm,
+                                            onChanged: (v) =>
+                                                _inputChoice3 = v,
+                                          ),
+                                          const SizedBox(height: 24),
+                                        ],
                                       ),
-                                      const SizedBox(width: 8),
-                                      Text(_getTypingIndicatorText()),
-                                    ],
-                                  ),
-                                ),
-                              // 输入框隐藏时保留其占位空间，避免正文文字位置跳动
-                              Visibility(
-                                visible: _storyInputsVisible,
-                                maintainSize: true,
-                                maintainAnimation: true,
-                                maintainState: true,
-                                maintainInteractivity: false,
-                                child: Column(
-                                  children: [
-                                    const SizedBox(height: 12),
-                                    TextInputPanel(
-                                      placeholder: _getFirstInputPlaceholder(),
-                                      confirmText: _getInputConfirmText(),
-                                      onConfirm: _onInput1Confirm,
                                     ),
-                                    const SizedBox(height: 12),
-                                    TextInputPanel(
-                                      placeholder: _getInputPlaceholder(),
-                                      confirmText: _getInputConfirmText(),
-                                      onConfirm: _onInput2Confirm,
-                                    ),
-                                    const SizedBox(height: 12),
-                                    TextInputPanel(
-                                      placeholder: _getInputPlaceholder(),
-                                      confirmText: _getInputConfirmText(),
-                                      onConfirm: _onInputConfirm,
-                                    ),
-                                    const SizedBox(height: 24),
-                                  ],
-                                ),
-                              ),
+                                    // “正在生成/续写”提示：置于按钮下方
+                                    if (_generating && _storyTexts.isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.only(
+                                          left: 16,
+                                          right: 16,
+                                          top: 8,
+                                          bottom: 12,
+                                        ),
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            const CupertinoActivityIndicator(
+                                              radius: 10,
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Text(_getTypingIndicatorText()),
+                                          ],
+                                        ),
+                                      ),
                             ],
                           ),
                         ),
@@ -918,84 +1088,111 @@ class _HomeContentState extends State<HomeContent>
     });
     // 记录本次生成开始前的段数（已清空为 0）：断流出错时据此丢弃未传完的内容
     final int preStreamLen = _storyTexts.length;
+    // 本次生成是否收到过非空正文（LLM 返回空白时用于弹窗警告）
+    bool hadContent = false;
 
     // 流式：服务器先审首段，通过后 chunk 开始打字；剩余全审后 reveal 一次性显示
     try {
-    // 先把设定上传服务器（服务器权威保存，之后生成只传最新输入）
-    await SettingsService.saveSettings();
-    await StoryService.generateStoryStream(
-      onDeviceConflict: _onDeviceConflict,
-      onStalled: _onStreamStalled,
-      onChunk: (text) {
-        if (!mounted) return;
-        setState(() {
-          if (_storyTexts.isEmpty) {
-            // 首次生成：正文存入数组下标 0
-            _storyTexts.add(text);
-          } else {
-            _storyTexts[_storyTexts.length - 1] += text;
+      // 设定不再单独上传服务器：仅在第一轮生成时随请求一并发送，随小说正文落库
+      await StoryService.generateStoryStream(
+        location: SetupDraft.instance.location,
+        era: SetupDraft.instance.era,
+        playerName: SetupDraft.instance.playerName,
+        playerGender: SetupDraft.instance.playerGender,
+        partnerName: SetupDraft.instance.partnerName,
+        partnerGender: SetupDraft.instance.partnerGender,
+        partnerTraits: SetupDraft.instance.partnerTraits,
+        language: StorageService.getLanguage(),
+        onDeviceConflict: _onDeviceConflict,
+        onStalled: _onStreamStalled,
+        onChunk: (text) {
+          if (!mounted) return;
+          if (text.trim().isNotEmpty) hadContent = true;
+          setState(() {
+            if (_storyTexts.isEmpty) {
+              // 首次生成：正文存入数组下标 0
+              _storyTexts.add(text);
+            } else {
+              _storyTexts[_storyTexts.length - 1] += text;
+            }
+            _generating = false;
+            _setupStep = 6;
+            showMenuNotifier.value = true;
+            _blackoutActive = false;
+            _blackoutController.value = 1;
+            _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
+          });
+        },
+        onReveal: (text, outputs) {
+          if (!mounted) return;
+          if (text.trim().isNotEmpty) hadContent = true;
+          // 剩余部分不再一次性显示，由打字机以不断加速的方式接续打出
+          setState(() {
+            if (_storyTexts.isEmpty) {
+              _storyTexts.add(text);
+            } else {
+              _storyTexts[_storyTexts.length - 1] += text;
+            }
+            _generating = false;
+            _blackoutActive = false;
+            _blackoutController.value = 1;
+            _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
+          });
+        },
+        onAbort: (reason) {
+          if (!mounted) return;
+          setState(() {
+            _storyAbortReason = reason;
+            _generating = false;
+            _setupStep = 6;
+            showMenuNotifier.value = true;
+            _blackoutActive = false;
+            _blackoutController.value = 1;
+            _storyStreaming = false;
+            _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
+          });
+        },
+        onError: (message, {code}) {
+          if (!mounted) return;
+          setState(() {
+            // 流未完整结束（未收到 done）：丢弃本次未传完的内容，
+            // 避免半截文本进入主页面/被误判为完整正文
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
+            _generating = false;
+            _blackoutActive = false;
+            _storyStreaming = false;
+            _storyTyped = true;
+          });
+          // 服务器未返回有效正文（如额度用尽）：按当前语言提示检查额度
+          _showGenerateError(
+            code == 'empty_output' ? _getQuotaWarningText() : message,
+          );
+        },
+        onDone: (outputs) async {
+          if (!mounted) return;
+          if (!hadContent) {
+            // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：结束加载状态并弹窗警告
+            setState(() {
+              if (_storyTexts.length > preStreamLen) {
+                _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+              }
+              _generating = false;
+              _storyStreaming = false;
+              _storyTyped = true;
+            });
+            _showGenerateError(_getQuotaWarningText());
+            return;
           }
-          _generating = false;
-          _setupStep = 6;
-          showMenuNotifier.value = true;
-          _blackoutActive = false;
-          _blackoutController.value = 1;
-          _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
-        });
-      },
-      onReveal: (text, outputs) {
-        if (!mounted) return;
-        // 剩余部分不再一次性显示，由打字机以不断加速的方式接续打出
-        setState(() {
-          if (_storyTexts.isEmpty) {
-            _storyTexts.add(text);
-          } else {
-            _storyTexts[_storyTexts.length - 1] += text;
-          }
-          _generating = false;
-          _blackoutActive = false;
-          _blackoutController.value = 1;
-          _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
-        });
-      },
-      onAbort: (reason) {
-        if (!mounted) return;
-        setState(() {
-          _storyAbortReason = reason;
-          _generating = false;
-          _setupStep = 6;
-          showMenuNotifier.value = true;
-          _blackoutActive = false;
-          _blackoutController.value = 1;
-          _storyStreaming = false;
-          _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
-        });
-      },
-      onError: (message) {
-        if (!mounted) return;
-        setState(() {
-          // 流未完整结束（未收到 done）：丢弃本次未传完的内容，
-          // 避免半截文本进入主页面/被误判为完整正文
-          if (_storyTexts.length > preStreamLen) {
-            _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-          }
-          _generating = false;
-          _blackoutActive = false;
-          _storyStreaming = false;
-          _storyTyped = true;
-        });
-        _showGenerateError(message);
-      },
-      onDone: (outputs) async {
-        if (!mounted) return;
-        setState(() {
-          _storyStreaming = false; // 正文已全部接收完成
-          _storyReceivedCompletely = true; // 已完整接收：放行继续续写
-        });
-        await StorageService.saveMainTextList(List.of(_storyTexts));
-        await StorageService.saveMainTextStartIndex(_storyStartIndex);
-      },
-    );
+          setState(() {
+            _storyStreaming = false; // 正文已全部接收完成
+            _storyReceivedCompletely = true; // 已完整接收：放行继续续写
+          });
+          await StorageService.saveMainTextList(List.of(_storyTexts));
+          await StorageService.saveMainTextStartIndex(_storyStartIndex);
+        },
+      );
     } on HardwareAccountLimitException {
       // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
       if (!mounted) return;
@@ -1095,29 +1292,6 @@ class _HomeContentState extends State<HomeContent>
         return '문자 입력...';
       default:
         return '输入文字...';
-    }
-  }
-
-  /// 输入框确定按钮文字
-  String _getInputConfirmText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-      case 'yue':
-      case 'ja':
-        return '確定';
-      case 'en':
-        return 'Confirm';
-      case 'es':
-      case 'pt':
-        return 'Confirmar';
-      case 'fr':
-        return 'Confirmer';
-      case 'de':
-        return 'Bestätigen';
-      case 'ko':
-        return '확인';
-      default:
-        return '确定';
     }
   }
 
@@ -1222,6 +1396,31 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 服务器返回空白正文时的额度警告（本地化，不出现 LLM 字样）
+  String _getQuotaWarningText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '伺服器未回傳有效的小說正文，請檢查額度是否已用盡，或稍後重試';
+      case 'en':
+        return 'The server did not return valid story content. Please check whether your quota is exhausted, or try again later.';
+      case 'es':
+        return 'El servidor no devolvió contenido de la historia válido. Verifique si su cuota se agotó, o inténtelo de nuevo más tarde.';
+      case 'fr':
+        return "Le serveur n'a pas renvoyé de contenu d'histoire valide. Vérifiez si votre quota est épuisé, ou réessayez plus tard.";
+      case 'de':
+        return 'Der Server hat keinen gültigen Story-Inhalt zurückgegeben. Bitte prüfen Sie, ob Ihr Kontingent aufgebraucht ist, oder versuchen Sie es später erneut.';
+      case 'pt':
+        return 'O servidor não retornou conteúdo de história válido. Verifique se sua cota foi esgotada ou tente novamente mais tarde.';
+      case 'ja':
+        return 'サーバーが有効な小説本文を返しませんでした。割り当てが尽きていないか確認して、後でもう一度お試しください。';
+      case 'ko':
+        return '서버가 유효한 소설 본문을 반환하지 않았습니다. 할당량이 소진되었는지 확인하고 나중에 다시 시도해 주세요.';
+      default:
+        return '服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试';
+    }
+  }
+
   /// 生成失败弹窗"跳过"按钮
   String _getSkipText() {
     switch (StorageService.getLanguage()) {
@@ -1298,34 +1497,60 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 时间树返回占位按钮文字（本地化）
-  String _getContinueHereButtonText() {
+  /// 最新的三个输入框对应按钮文字：按照上面输入指引继续故事选择（本地化）
+  String _getLatestContinueButtonText() {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
-        return '點擊選擇在此重續故事';
+        return '按照上面輸入指引繼續故事選擇';
       case 'yue':
-        return '撳呢度喺度重續故事';
+        return '跟住上面嘅輸入指引繼續故事選擇';
       case 'en':
-        return 'Tap to continue the story from here';
+        return 'Continue the story following the guidance above';
       case 'es':
-        return 'Toca para continuar la historia desde aquí';
+        return 'Continúa la historia siguiendo las indicaciones de arriba';
       case 'fr':
-        return 'Touchez pour continuer l\'histoire à partir d\'ici';
+        return 'Continuez l\'histoire selon les consignes ci-dessus';
       case 'de':
-        return 'Tippen, um die Geschichte von hier fortzusetzen';
+        return 'Setze die Geschichte gemäß den obigen Anweisungen fort';
       case 'pt':
-        return 'Toque para continuar a história a partir daqui';
+        return 'Continue a história seguindo as orientações acima';
       case 'ja':
-        return 'ここから物語を続けるにはタップ';
+        return '上記の入力ガイドに従って物語を続ける';
       case 'ko':
-        return '여기서부터 이야기를 이어가려면 탭';
+        return '위 입력 안내에 따라 이야기를 계속하기';
       default:
-        return '点击选择在此重续故事';
+        return '按照上面输入指引继续故事选择';
     }
   }
 
-  /// 时间树返回占位：未来在此实现"返回该时间点"功能
-  void _onChoiceButtonPressed() {
+  /// 历史段落选择卡片按钮文字：从这里重新开始（本地化）
+  String _getRestartHereButtonText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '從這裡重新開始';
+      case 'yue':
+        return '由呢度重新開始';
+      case 'en':
+        return 'Restart from here';
+      case 'es':
+        return 'Reiniciar desde aquí';
+      case 'fr':
+        return 'Recommencer à partir d\'ici';
+      case 'de':
+        return 'Von hier neu starten';
+      case 'pt':
+        return 'Recomeçar daqui';
+      case 'ja':
+        return 'ここからやり直す';
+      case 'ko':
+        return '여기서부터 다시 시작하기';
+      default:
+        return '从这里重新开始';
+    }
+  }
+
+  /// 历史段落"从这里重新开始"占位：未来在此实现"返回该时间点/重开"功能
+  void _onRestartHerePressed() {
     // TODO: 时间树返回功能（当前为占位，点击暂不跳转）
   }
 

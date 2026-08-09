@@ -11,6 +11,9 @@ import 'package:ai_saga/logic/text_width.dart';
 class TextInputPanel extends StatefulWidget {
   final void Function(String text) onConfirm;
 
+  /// 输入内容变化回调：用于在确认前把当前输入值上报给外部（如记录本轮三个选择）
+  final void Function(String text)? onChanged;
+
   /// 输入框占位文字（背景提示）
   final String placeholder;
 
@@ -20,12 +23,22 @@ class TextInputPanel extends StatefulWidget {
   /// 加权字数上限（汉字/日文/韩文按 2 字，英文按 1 字）
   final int maxLength;
 
+  /// 按钮是否放在输入框下方（true=纵向：输入框在上、按钮在下全宽；
+  /// false=横向：输入框在左、按钮在右，默认）
+  final bool buttonBelow;
+
+  /// 生成中置灰禁用确定按钮：保持按钮可见但不可点击
+  final bool disabled;
+
   const TextInputPanel({
     super.key,
     required this.onConfirm,
+    this.onChanged,
     this.placeholder = '输入文字...',
     this.confirmText = '确定',
     this.maxLength = 200,
+    this.buttonBelow = false,
+    this.disabled = false,
   });
 
   @override
@@ -51,92 +64,108 @@ class _TextInputPanelState extends State<TextInputPanel> {
     final isDark = AppTheme.isDark(context);
     final overLimit = _isOverLimit;
 
+    // 输入框（iOS风格）
+    final Widget inputField = Container(
+      decoration: BoxDecoration(
+        color: isDark
+            ? AppTheme.fieldBackgroundDark
+            : AppTheme.fieldBackgroundLight,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isDark
+              ? AppTheme.inputBorderDark
+              : AppTheme.inputBorderLight,
+          width: 1.0,
+        ),
+      ),
+      child: CupertinoTextField(
+        controller: _textController,
+        maxLines: 5,
+        minLines: 1,
+        keyboardType: TextInputType.multiline,
+        textInputAction: TextInputAction.newline,
+        placeholder: widget.placeholder,
+        placeholderStyle: TextStyle(
+          color: isDark
+              ? AppTheme.tertiaryTextDark
+              : AppTheme.tertiaryTextLight,
+        ),
+        padding: const EdgeInsets.all(12),
+        decoration: null,
+        style: TextStyle(
+          color: overLimit
+              ? (isDark
+                    ? AppTheme.destructiveRedDark
+                    : AppTheme.destructiveRedLight)
+              : (isDark
+                    ? AppTheme.primaryTextDark
+                    : AppTheme.primaryTextLight),
+          fontSize: 17,
+        ),
+        onChanged: (value) {
+          setState(() {});
+          widget.onChanged?.call(value);
+        },
+      ),
+    );
+
+    // 确定输入按钮（生成中/超限/为空时置灰禁用）
+    final bool canConfirm = !widget.disabled && _canConfirm;
+    final Widget confirmButton = SizedBox(
+      height: 44,
+      child: CupertinoButton.filled(
+        onPressed: canConfirm
+            ? () {
+                SoundService.playConfirm();
+                widget.onConfirm(_textController.text);
+                _textController.clear();
+                setState(() {});
+              }
+            : null,
+        borderRadius: BorderRadius.circular(10),
+        padding: EdgeInsets.zero,
+        color: isDark
+            ? AppTheme.buttonFillDark
+            : AppTheme.buttonFillLight,
+        disabledColor: isDark
+            ? const Color(0xFF2C2C2E)
+            : const Color(0xFFF2F2F7),
+        child: Text(
+          widget.confirmText,
+          style: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w600,
+            color: canConfirm
+                ? AppTheme.buttonText
+                : (isDark
+                      ? AppTheme.buttonDisabledTextDark
+                      : AppTheme.buttonDisabledTextLight),
+          ),
+        ),
+      ),
+    );
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // 输入框（iOS风格）
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                color: isDark
-                    ? AppTheme.fieldBackgroundDark
-                    : AppTheme.fieldBackgroundLight,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: isDark
-                      ? AppTheme.inputBorderDark
-                      : AppTheme.inputBorderLight,
-                  width: 1.0,
-                ),
-              ),
-              child: CupertinoTextField(
-                controller: _textController,
-                maxLines: 5,
-                minLines: 1,
-                keyboardType: TextInputType.multiline,
-                textInputAction: TextInputAction.newline,
-                placeholder: widget.placeholder,
-                placeholderStyle: TextStyle(
-                  color: isDark
-                      ? AppTheme.tertiaryTextDark
-                      : AppTheme.tertiaryTextLight,
-                ),
-                padding: const EdgeInsets.all(12),
-                decoration: null,
-                style: TextStyle(
-                  color: overLimit
-                      ? (isDark
-                            ? AppTheme.destructiveRedDark
-                            : AppTheme.destructiveRedLight)
-                      : (isDark
-                            ? AppTheme.primaryTextDark
-                            : AppTheme.primaryTextLight),
-                  fontSize: 17,
-                ),
-                onChanged: (_) => setState(() {}),
-              ),
+      child: widget.buttonBelow
+          // 纵向布局：输入框在上、按钮在下（全宽）
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                inputField,
+                const SizedBox(height: 8),
+                confirmButton,
+              ],
+            )
+          // 横向布局：输入框在左、按钮在右（默认）
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: inputField),
+                const SizedBox(width: 10),
+                SizedBox(width: 80, child: confirmButton),
+              ],
             ),
-          ),
-          const SizedBox(width: 10),
-          // 确定输入按钮（超限或为空时变灰禁用）
-          SizedBox(
-            width: 80,
-            height: 44,
-            child: CupertinoButton.filled(
-              onPressed: _canConfirm
-                  ? () {
-                      SoundService.playConfirm();
-                      widget.onConfirm(_textController.text);
-                      _textController.clear();
-                      setState(() {});
-                    }
-                  : null,
-              borderRadius: BorderRadius.circular(10),
-              padding: EdgeInsets.zero,
-              color: isDark
-                  ? AppTheme.buttonFillDark
-                  : AppTheme.buttonFillLight,
-              disabledColor: isDark
-                  ? const Color(0xFF2C2C2E)
-                  : const Color(0xFFF2F2F7),
-              child: Text(
-                widget.confirmText,
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: _canConfirm
-                      ? AppTheme.buttonText
-                      : (isDark
-                            ? AppTheme.buttonDisabledTextDark
-                            : AppTheme.buttonDisabledTextLight),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
     );
   }
 }

@@ -34,6 +34,8 @@ class StoryService {
     String choice1 = '',
     String choice2 = '',
     String choice3 = '',
+    // 时间树"从这里重写"：>=0 时服务器从该 seq 截断后续段，并作为新段续写
+    int? rewriteFrom,
     // 用户设定（第一轮生成时随请求上传，服务器与小说正文一起落库）
     String location = '',
     String era = '',
@@ -81,6 +83,7 @@ class StoryService {
         'partner_gender': partnerGender,
         'partner_traits': partnerTraits,
         'language': language,
+        if (rewriteFrom != null) 'rewrite_from': rewriteFrom,
       });
 
       final response = await client

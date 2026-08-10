@@ -7,8 +7,14 @@ import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/hardware_key_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 
-/// 一次小说数据快照：本地数组 + 首元素绝对下标（与服务器 seq 对齐）+ 总段数。
-typedef StorySnapshot = ({List<String> segments, int startSeq, int total});
+/// 一次小说数据快照：本地数组 + 与 segments 一一对应的三个选项（choice_1/2/3）
+/// + 首元素绝对下标（与服务器 seq 对齐）+ 总段数。
+typedef StorySnapshot = ({
+  List<String> segments,
+  List<List<String>> choices,
+  int startSeq,
+  int total,
+});
 
 /// 启动同步服务：每次 App 启动时
 /// 1) 上传本机硬件公钥 + 用户 id，服务器校验后更新硬件公钥并登记为活跃设备；
@@ -67,7 +73,12 @@ class SyncService {
     final token = await AuthService.ensureToken();
     final url = _storyApiUrl;
     if (url.isEmpty) {
-      return (segments: const <String>[], startSeq: 0, total: 0);
+      return (
+        segments: const <String>[],
+        choices: const <List<String>>[],
+        startSeq: 0,
+        total: 0,
+      );
     }
     final resp = await http
         .get(
@@ -119,7 +130,12 @@ class SyncService {
   }) async {
     final url = _storyApiUrl;
     if (url.isEmpty) {
-      return (segments: const <String>[], startSeq: 0, total: 0);
+      return (
+        segments: const <String>[],
+        choices: const <List<String>>[],
+        startSeq: 0,
+        total: 0,
+      );
     }
     final uri = limit > 0
         ? Uri.parse(url).replace(queryParameters: {'limit': '$limit'})
@@ -145,8 +161,22 @@ class SyncService {
             ?.map((e) => e.toString())
             .toList() ??
         [];
+    // choices 与 segments 一一对应；缺失/不足 3 个时用空串补齐
+    final rawChoices = (data['choices'] as List?) ?? const [];
+    final choices = rawChoices.map((c) {
+      final list = (c as List?) ?? const <dynamic>[];
+      return <String>[
+        for (int i = 0; i < 3; i++)
+          (i < list.length ? list[i]?.toString() : null) ?? '',
+      ];
+    }).toList();
     final startSeq = (data['start_seq'] as num?)?.toInt() ?? 0;
     final total = (data['total'] as num?)?.toInt() ?? segments.length;
-    return (segments: segments, startSeq: startSeq, total: total);
+    return (
+      segments: segments,
+      choices: choices,
+      startSeq: startSeq,
+      total: total,
+    );
   }
 }

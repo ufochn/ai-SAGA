@@ -208,10 +208,21 @@ class _HomeContentState extends State<HomeContent>
   /// 用户选择节点：正文中"用户选择：xxx" + 时间树返回占位按钮
   final List<_ChoiceRecord> _choices = [];
 
+  /// 每段对应的三个选项（choice_1/2/3）：键为绝对下标（= 服务器 seq），
+  /// 由启动同步 / 上拉加载时与正文一起从服务器拉取，显示在对应段落的按钮/输入框中。
+  final Map<int, List<String>> _segmentChoices = {};
+
   /// 本轮三个输入框的当前值（任一确认时随请求一并上传，作为本轮选择一/二/三快照）
   String _inputChoice1 = '';
   String _inputChoice2 = '';
   String _inputChoice3 = '';
+
+  /// 第 2、3 个输入框的外部控制器：收到服务器推荐行动（action_a/action_b）后预填
+  final TextEditingController _choice2Ctrl = TextEditingController();
+  final TextEditingController _choice3Ctrl = TextEditingController();
+
+  /// 是否已收到本轮的推荐行动（action_a/action_b）：没收到就不显示输入框
+  bool _hasRecommendedActions = false;
 
   @override
   void initState() {
@@ -281,6 +292,8 @@ class _HomeContentState extends State<HomeContent>
     _scrollController.dispose();
     _pageController.dispose();
     _blackoutController.dispose();
+    _choice2Ctrl.dispose();
+    _choice3Ctrl.dispose();
     super.dispose();
   }
 
@@ -353,6 +366,11 @@ class _HomeContentState extends State<HomeContent>
       setState(() {
         _storyTexts.insertAll(0, earlier.segments);
         _storyStartIndex = earlier.startSeq;
+        // 记录新加载段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
+        for (int i = 0; i < earlier.segments.length; i++) {
+          _segmentChoices[earlier.startSeq + i] =
+              (i < earlier.choices.length ? earlier.choices[i] : const <String>[]);
+        }
         // 新段直接渲染（从 0 开始渲染全部已加载段），上方即刚拉取的更早内容
         _visibleStartIndex = 0;
         // 本会话流式段的本地下标随之后移
@@ -394,6 +412,12 @@ class _HomeContentState extends State<HomeContent>
           ..clear()
           ..addAll(snap.segments);
         _storyStartIndex = snap.startSeq;
+        // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
+        _segmentChoices.clear();
+        for (int i = 0; i < snap.segments.length; i++) {
+          _segmentChoices[_storyStartIndex + i] =
+              (i < snap.choices.length ? snap.choices[i] : const <String>[]);
+        }
         if (_storyTexts.isNotEmpty) {
           _sessionStreamStartIndex = _storyTexts.length;
           _visibleStartIndex = _storyTexts.length - 1;
@@ -485,7 +509,8 @@ class _HomeContentState extends State<HomeContent>
   bool get _storyInputsVisible =>
       _storyTexts.isNotEmpty &&
       ((_storyTyped &&
-              (_storyReceivedCompletely || _storyAbortReason != null)) ||
+              (_storyReceivedCompletely || _storyAbortReason != null) &&
+              _hasRecommendedActions) ||
           _storyStreaming);
 
   /// 顶部“上拉加载更早内容”空白区高度：约屏幕的 1/4，旋转图标居中。
@@ -500,9 +525,30 @@ class _HomeContentState extends State<HomeContent>
 
   void _onInputConfirm(String text) => _continueStory(text);
 
+  /// 收到服务器返回的后续变量后，把两个推荐行动分别填入第 2、3 个输入框，
+  /// 供用户后续选择使用（覆盖上一轮的旧推荐）；收到任一推荐即标记 _hasRecommendedActions。
+  void _applyRecommendedActions(Map<String, dynamic> outputs) {
+    final actionA = outputs['action_a'] as String? ?? '';
+    final actionB = outputs['action_b'] as String? ?? '';
+    final got = actionA.isNotEmpty || actionB.isNotEmpty;
+    if (!mounted) return;
+    setState(() {
+      if (got) _hasRecommendedActions = true;
+      if (actionA.isNotEmpty && actionA != _inputChoice2) {
+        _choice2Ctrl.text = actionA;
+        _inputChoice2 = actionA;
+      }
+      if (actionB.isNotEmpty && actionB != _inputChoice3) {
+        _choice3Ctrl.text = actionB;
+        _inputChoice3 = actionB;
+      }
+    });
+  }
+
   /// 任一输入框确认后：把输入作为 user_input，连同用户设定请求续写生成，
   /// 新内容在屏幕上接力显示（作为 _storyTexts 数组的新元素，由打字机继续揭示）。
-  Future<void> _continueStory(String userInput, {int retryDepth = 0}) async {
+  Future<void> _continueStory(String userInput,
+      {int retryDepth = 0, int? rewriteFrom}) async {
     if (!mounted || userInput.trim().isEmpty) return;
     // 记录本次续写开始前的段数：断流出错时据此丢弃未传完的段落
     final int preStreamLen = _storyTexts.length;
@@ -516,6 +562,7 @@ class _HomeContentState extends State<HomeContent>
       _storyStreaming = true; // 接收正文中：隐藏下方输入框
       _storyTyped = false;
       _storyReceivedCompletely = false; // 本次正文尚未完整接收
+      _hasRecommendedActions = false; // 本轮尚未收到推荐行动前不显示输入框
       // 记录用户选择节点（时间树返回功能的占位数据）；重新授权重试时避免重复记录
       final alreadyRecorded =
           _choices.isNotEmpty &&
@@ -538,6 +585,7 @@ class _HomeContentState extends State<HomeContent>
         choice1: _inputChoice1,
         choice2: _inputChoice2,
         choice3: _inputChoice3,
+        rewriteFrom: rewriteFrom,
         onDeviceConflict: _onDeviceConflict,
         onStalled: _onStreamStalled,
         onChunk: (text) {
@@ -570,6 +618,7 @@ class _HomeContentState extends State<HomeContent>
             _generating = false;
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
+          _applyRecommendedActions(outputs);
         },
         onAbort: (reason) {
           if (!mounted) return;
@@ -618,6 +667,12 @@ class _HomeContentState extends State<HomeContent>
             _storyStreaming = false; // 正文已全部接收完成
             _storyReceivedCompletely = true; // 已完整接收：放行继续续写
           });
+          _applyRecommendedActions(outputs);
+          if (!_hasRecommendedActions) {
+            // 没收到可选项：用和正文一样的网络警告并提示重启（重启后重拉可取回已落库的可选项）
+            await _onStreamStalled();
+            return;
+          }
           await StorageService.saveMainTextList(List.of(_storyTexts));
           await StorageService.saveMainTextStartIndex(_storyStartIndex);
         },
@@ -752,6 +807,11 @@ class _HomeContentState extends State<HomeContent>
       if (segIndex < _storyTexts.length - 1) {
         children.add(
           StoryChoiceCard(
+            // 绝对下标 = 服务器 seq：让本段按钮 ↔ 文本 ↔ 数据库行一一对应
+            segmentIndex: _storyStartIndex + segIndex,
+            // 显示本段对应的三个选项（从服务器拉取的 choice_1/2/3）
+            initialValues:
+                _segmentChoices[_storyStartIndex + segIndex] ?? const <String>[],
             buttonText: _getRestartHereButtonText(),
             inputPlaceholder: _getInputPlaceholder(),
             enabled: _storyTyped,
@@ -936,76 +996,71 @@ class _HomeContentState extends State<HomeContent>
                                       : null,
                                 ),
                               ..._buildStoryBody(),
-                                    // 输入框隐藏时保留其占位空间，避免正文文字位置跳动
-                                    Visibility(
-                                      visible: _storyInputsVisible,
-                                      maintainSize: true,
-                                      maintainAnimation: true,
-                                      maintainState: true,
-                                      maintainInteractivity: false,
-                                      child: Column(
-                                        children: [
-                                          const SizedBox(height: 12),
-                                          TextInputPanel(
-                                            placeholder:
-                                                _getFirstInputPlaceholder(),
-                                            confirmText:
-                                                _getLatestContinueButtonText(),
-                                            buttonBelow: true,
-                                            disabled: _storyStreaming,
-                                            onConfirm: _onInput1Confirm,
-                                            onChanged: (v) =>
-                                                _inputChoice1 = v,
-                                          ),
-                                          const SizedBox(height: 12),
-                                          TextInputPanel(
-                                            placeholder:
-                                                _getInputPlaceholder(),
-                                            confirmText:
-                                                _getLatestContinueButtonText(),
-                                            buttonBelow: true,
-                                            disabled: _storyStreaming,
-                                            onConfirm: _onInput2Confirm,
-                                            onChanged: (v) =>
-                                                _inputChoice2 = v,
-                                          ),
-                                          const SizedBox(height: 12),
-                                          TextInputPanel(
-                                            placeholder:
-                                                _getInputPlaceholder(),
-                                            confirmText:
-                                                _getLatestContinueButtonText(),
-                                            buttonBelow: true,
-                                            disabled: _storyStreaming,
-                                            onConfirm: _onInputConfirm,
-                                            onChanged: (v) =>
-                                                _inputChoice3 = v,
-                                          ),
-                                          const SizedBox(height: 24),
-                                        ],
-                                      ),
+                              // 输入框隐藏时保留其占位空间，避免正文文字位置跳动
+                              Visibility(
+                                visible: _storyInputsVisible,
+                                maintainSize: true,
+                                maintainAnimation: true,
+                                maintainState: true,
+                                maintainInteractivity: false,
+                                child: Column(
+                                  children: [
+                                    const SizedBox(height: 12),
+                                    TextInputPanel(
+                                      placeholder: _getFirstInputPlaceholder(),
+                                      confirmText:
+                                          _getLatestContinueButtonText(),
+                                      buttonBelow: true,
+                                      disabled: _storyStreaming,
+                                      onConfirm: _onInput1Confirm,
+                                      onChanged: (v) => _inputChoice1 = v,
                                     ),
-                                    // “正在生成/续写”提示：置于按钮下方
-                                    if (_generating && _storyTexts.isNotEmpty)
-                                      Padding(
-                                        padding: const EdgeInsets.only(
-                                          left: 16,
-                                          right: 16,
-                                          top: 8,
-                                          bottom: 12,
-                                        ),
-                                        child: Row(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.center,
-                                          children: [
-                                            const CupertinoActivityIndicator(
-                                              radius: 10,
-                                            ),
-                                            const SizedBox(width: 8),
-                                            Text(_getTypingIndicatorText()),
-                                          ],
-                                        ),
+                                    const SizedBox(height: 12),
+                                    TextInputPanel(
+                                      placeholder: _getInputPlaceholder(),
+                                      confirmText:
+                                          _getLatestContinueButtonText(),
+                                      buttonBelow: true,
+                                      disabled: _storyStreaming,
+                                      controller: _choice2Ctrl,
+                                      onConfirm: _onInput2Confirm,
+                                      onChanged: (v) => _inputChoice2 = v,
+                                    ),
+                                    const SizedBox(height: 12),
+                                    TextInputPanel(
+                                      placeholder: _getInputPlaceholder(),
+                                      confirmText:
+                                          _getLatestContinueButtonText(),
+                                      buttonBelow: true,
+                                      disabled: _storyStreaming,
+                                      controller: _choice3Ctrl,
+                                      onConfirm: _onInputConfirm,
+                                      onChanged: (v) => _inputChoice3 = v,
+                                    ),
+                                    const SizedBox(height: 24),
+                                  ],
+                                ),
+                              ),
+                              // “正在生成/续写”提示：置于按钮下方
+                              if (_generating && _storyTexts.isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(
+                                    left: 16,
+                                    right: 16,
+                                    top: 8,
+                                    bottom: 12,
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      const CupertinoActivityIndicator(
+                                        radius: 10,
                                       ),
+                                      const SizedBox(width: 8),
+                                      Text(_getTypingIndicatorText()),
+                                    ],
+                                  ),
+                                ),
                             ],
                           ),
                         ),
@@ -1085,6 +1140,7 @@ class _HomeContentState extends State<HomeContent>
       _storyStreaming = true; // 接收正文中：隐藏下方输入框
       _storyTyped = false;
       _storyReceivedCompletely = false; // 本次正文尚未完整接收
+      _hasRecommendedActions = false; // 本轮尚未收到推荐行动前不显示输入框
     });
     // 记录本次生成开始前的段数（已清空为 0）：断流出错时据此丢弃未传完的内容
     final int preStreamLen = _storyTexts.length;
@@ -1138,6 +1194,7 @@ class _HomeContentState extends State<HomeContent>
             _blackoutController.value = 1;
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
+          _applyRecommendedActions(outputs);
         },
         onAbort: (reason) {
           if (!mounted) return;
@@ -1189,6 +1246,12 @@ class _HomeContentState extends State<HomeContent>
             _storyStreaming = false; // 正文已全部接收完成
             _storyReceivedCompletely = true; // 已完整接收：放行继续续写
           });
+          _applyRecommendedActions(outputs);
+          if (!_hasRecommendedActions) {
+            // 没收到可选项：用和正文一样的网络警告并提示重启（重启后重拉可取回已落库的可选项）
+            await _onStreamStalled();
+            return;
+          }
           await StorageService.saveMainTextList(List.of(_storyTexts));
           await StorageService.saveMainTextStartIndex(_storyStartIndex);
         },
@@ -1549,9 +1612,150 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 历史段落"从这里重新开始"占位：未来在此实现"返回该时间点/重开"功能
-  void _onRestartHerePressed() {
-    // TODO: 时间树返回功能（当前为占位，点击暂不跳转）
+  /// 历史段落"从这里重新开始"：用客户语言弹出确认窗口，警告从该段重写会永久废弃之后内容。
+  /// 用户确认后：先截断该段之后的内容（显示/本地），再走与标准生成完全一致的流程，
+  /// 从该时间点续写（服务器在生成时同步截断数据库）。
+  Future<void> _onRestartHerePressed(int segmentIndex, String userInput) async {
+    if (!mounted) return;
+    final confirmed = await showCupertinoDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        content: Text(_getRestartMessageText()),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(_getRestartCancelText()),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(_getRestartConfirmText()),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+
+    // 1) 先截断本段之后的内容：文本显示页 + App 本地存储
+    await _truncateStoryFrom(segmentIndex);
+    if (!mounted) return;
+    // 2) 走标准生成流程从该时间点续写（服务器端同步截断数据库并续写）
+    //    用户未输入时给一个本地化默认续写提示
+    final input =
+        userInput.trim().isEmpty ? _getRewriteDefaultInputText() : userInput;
+    await _continueStory(input, rewriteFrom: segmentIndex);
+  }
+
+  /// 时间树"从这里重写"：截断该段之后的所有内容（内存数组 + 本地存储），
+  /// 保留 0..segmentIndex（含该段）；服务器端在生成时同步截断数据库。
+  Future<void> _truncateStoryFrom(int segmentIndex) async {
+    final keepLocal = segmentIndex - _storyStartIndex; // 该段在本地数组中的下标
+    if (keepLocal < 0 || keepLocal >= _storyTexts.length) return;
+    setState(() {
+      _storyTexts.removeRange(keepLocal + 1, _storyTexts.length);
+      // 清除该段之后的选择节点与分段选项
+      _choices.removeWhere((c) => c.segmentIndex > segmentIndex);
+      _segmentChoices.removeWhere((k, _) => k > segmentIndex);
+      _visibleStartIndex = _storyTexts.length - 1;
+      _sessionStreamStartIndex = _storyTexts.length; // 之后的新段均为会话流式段（打字机）
+      _storyReceivedCompletely = false;
+      _storyAbortReason = null;
+    });
+    await StorageService.saveMainTextList(List.of(_storyTexts));
+    await StorageService.saveMainTextStartIndex(_storyStartIndex);
+  }
+
+  /// 重写但用户未输入内容时的默认续写提示（本地化）
+  String _getRewriteDefaultInputText() {
+    switch (StorageService.getLanguage()) {
+      case 'en':
+        return 'Continue the story';
+      case 'ja':
+        return '物語を続けて';
+      case 'ko':
+        return '이야기를 계속해';
+      default:
+        return '继续';
+    }
+  }
+
+  /// "从这里重新续写"确认弹窗内容（本地化）
+  String _getRestartMessageText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '小說將從這一段重新續寫，其後已生成的內容將永久廢棄。確定要重寫嗎？';
+      case 'yue':
+        return '小說會由呢段重新續寫，之後已經生成嘅內容會永久作廢。係咪確定要重寫？';
+      case 'en':
+        return 'The story will be rewritten from this point, and all content generated after it will be permanently discarded. Continue?';
+      case 'es':
+        return 'La historia se reescribirá desde este punto y todo el contenido generado después se descartará permanentemente. ¿Continuar?';
+      case 'fr':
+        return 'L\'histoire sera réécrite à partir de ce point et tout le contenu généré ensuite sera définitivement supprimé. Continuer ?';
+      case 'de':
+        return 'Die Geschichte wird von diesem Punkt an neu geschrieben; der gesamte danach erzeugte Inhalt wird dauerhaft verworfen. Fortfahren?';
+      case 'pt':
+        return 'A história será reescrita a partir deste ponto e todo o conteúdo gerado depois será descartado permanentemente. Continuar?';
+      case 'ja':
+        return 'この地点から物語を書き直し、以降に生成された内容は永久に破棄されます。続行しますか？';
+      case 'ko':
+        return '이 지점부터 이야기를 다시 쓰면 이후 생성된 내용은 영구히 폐기됩니다. 계속할까요?';
+      default:
+        return '小说将从这段重新续写，其后面已经生成的内容将永久废弃。确定要重写吗？';
+    }
+  }
+
+  /// "确认重写"按钮文字（本地化）
+  String _getRestartConfirmText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '確認重寫';
+      case 'yue':
+        return '確認重寫';
+      case 'en':
+        return 'Rewrite';
+      case 'es':
+        return 'Reescribir';
+      case 'fr':
+        return 'Réécrire';
+      case 'de':
+        return 'Neu schreiben';
+      case 'pt':
+        return 'Reescrever';
+      case 'ja':
+        return '書き直す';
+      case 'ko':
+        return '다시 쓰기';
+      default:
+        return '确认重写';
+    }
+  }
+
+  /// "放弃"按钮文字（本地化）
+  String _getRestartCancelText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '放棄';
+      case 'yue':
+        return '放棄';
+      case 'en':
+        return 'Cancel';
+      case 'es':
+        return 'Cancelar';
+      case 'fr':
+        return 'Annuler';
+      case 'de':
+        return 'Abbrechen';
+      case 'pt':
+        return 'Cancelar';
+      case 'ja':
+        return 'やめる';
+      case 'ko':
+        return '취소';
+      default:
+        return '放弃';
+    }
   }
 
   /// 服务器判定本机已不是活跃设备（检测到多设备同时登入）：

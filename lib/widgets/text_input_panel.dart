@@ -14,6 +14,10 @@ class TextInputPanel extends StatefulWidget {
   /// 输入内容变化回调：用于在确认前把当前输入值上报给外部（如记录本轮三个选择）
   final void Function(String text)? onChanged;
 
+  /// 可选的外部输入控制器：由外部持有并预填/读取文本（如服务器推荐行动预填）。
+  /// 不传时内部自行管理控制器。
+  final TextEditingController? controller;
+
   /// 输入框占位文字（背景提示）
   final String placeholder;
 
@@ -34,6 +38,7 @@ class TextInputPanel extends StatefulWidget {
     super.key,
     required this.onConfirm,
     this.onChanged,
+    this.controller,
     this.placeholder = '输入文字...',
     this.confirmText = '确定',
     this.maxLength = 200,
@@ -48,15 +53,18 @@ class TextInputPanel extends StatefulWidget {
 class _TextInputPanelState extends State<TextInputPanel> {
   final TextEditingController _textController = TextEditingController();
 
+  /// 优先使用外部传入的控制器（用于外部预填/读取），否则用内部控制器
+  TextEditingController get _controller => widget.controller ?? _textController;
+
   @override
   void dispose() {
     _textController.dispose();
     super.dispose();
   }
 
-  bool get _hasText => _textController.text.trim().isNotEmpty;
+  bool get _hasText => _controller.text.trim().isNotEmpty;
   bool get _isOverLimit =>
-      weightedCharCount(_textController.text) > widget.maxLength;
+      weightedCharCount(_controller.text) > widget.maxLength;
   bool get _canConfirm => !_isOverLimit && _hasText;
 
   @override
@@ -79,7 +87,7 @@ class _TextInputPanelState extends State<TextInputPanel> {
         ),
       ),
       child: CupertinoTextField(
-        controller: _textController,
+        controller: _controller,
         maxLines: 5,
         minLines: 1,
         keyboardType: TextInputType.multiline,

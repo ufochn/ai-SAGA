@@ -897,3 +897,78 @@ Because the schema changed and `CREATE TABLE IF NOT EXISTS` never alters an exis
 - `python3 -m py_compile AI-SAGA/server/main.py` → OK
 - `flutter analyze` → no issues across the whole project
 - Server container reloaded cleanly (`StatReload detected changes in 'main.py'. Reloading...` → `Application startup complete.`) and `/api/health` is healthy on a fresh, empty database.
+
+---
+
+# Session Update (2026-08-10)
+
+> Session covering: the **Dify fiction workflow redesign** (story text streams first, structured metadata arrives afterwards), the **`<think>`-block stripping & unwrap** hardening on the server, **metadata persistence with guaranteed fallbacks**, the **recommended-action input boxes** on the story page, **per-segment choice display** pulled from `/api/story`, and the **time-tree "restart from here" rewrite** that reuses the standard continuation pipeline. Written in English for other developers. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. Dify fiction workflow: story-first streaming + metadata-after
+
+### 1.1 The core constraint
+
+The server consumes the Dify stream as follows: every `text_chunk` is accumulated into the story, and `workflow_finished.outputs.text` is the authoritative full story (used for two-phase moderation and persistence). Therefore the LLM's `text` output must be **pure novel prose only** — a model that appends JSON/metadata to its `text` would pollute the typewriter, the moderation, and the stored story.
+
+### 1.2 Two-LLM graph, one streamed, one structural
+
+- **LLM① (fiction)** — outputs ONLY the pure story text; this is what streams as `text_chunk` from the start.
+- **LLM② (metadata)** — placed **downstream** of LLM① (its input references LLM①'s `text`), so it only runs after the story has fully streamed. It returns a strict JSON object via Dify **structured output (JSON schema)** with four string fields: `outline`, `action_a`, `action_b`, `music_style`. Dify auto-splits the schema into separate node outputs, and the **End node** maps them (plus `text = LLM①.text`) — so all four metadata arrive in `workflow_finished.outputs` exactly when the story stream ends, and the server forwards them to the client in the `reveal`/`done` events.
+
+This is the "story text first, variables after" design. The full prompt templates live in [`dify/PROMPT_TEMPLATE.md`](AI-SAGA/dify/PROMPT_TEMPLATE.md) and a copy-paste test prompt (with every Dify variable resolved to realistic values) in [`dify/TEST_PROMPT_LLM1.md`](AI-SAGA/dify/TEST_PROMPT_LLM1.md).
+
+### 1.3 Model selection & the thinking-mode gotcha
+
+- **Model**: a non-reasoning generation tier (DeepSeek `v4 flash` was selected) — cheap, strong multilingual prose, and it does not emit reasoning by default.
+- **Cost/quality notes**: at ~650 input + ~450 output tokens per round, the cost difference between the flagship and the flash tier over 40 rounds is negligible (< a few cents), so the choice is purely about prose quality; the metadata LLM is a short call (~150 output tokens).
+- **Dify UI gotcha**: the "Thinking mode" switch is *"whether to explicitly send the `thinking` param"*, not *"whether the model thinks"*. If the switch is **off**, Dify omits the param and the model defaults to thinking ON (re-emitting `<think>`). To actually disable thinking you must set the switch **ON + value False** (sending `thinking: false`). This was the root cause of the recurring `<think>` pollution.
+- The story LLM node uses **Text** reply format (never JSON); the metadata LLM node uses **structured output / JSON schema** with all four fields required, temperature ~0.3, `max_tokens` 500–600, thinking off.
+
+## 2. Server hardening: `<think>` stripping + unwrap
+
+Reasoning models can still leak `<<think>>...<<think>>` into `text` even when thinking is nominally off. Two malformed shapes were observed: a thinking prefix before the story, and (worse) the **whole story wrapped inside `<think>`**. Three helpers in [`server/main.py`](AI-SAGA/server/main.py) handle both:
+
+| Function | Role |
+|---|---|
+| [`_strip_think`](AI-SAGA/server/main.py:1371) | Strips `<think>...</think>` from each streamed `text_chunk`, buffering across chunk boundaries (a block split over multiple `text_chunk`s is held until `</think>` and then dropped). |
+| [`_unwrap_wrapped`](AI-SAGA/server/main.py:1405) | If the whole text is wrapped in `<think>…</think>` and/or backticks, unwrap it and return the inner content — provided its "content weight" is ≥ 1000 (CJK char = 1, ASCII letter/digit = 0.5, so ≈ 1000 Chinese chars or ≈ 2000 English letters; below that it is treated as empty, fail-closed). |
+| [`_clean_story_text`](AI-SAGA/server/main.py:1421) | Runs `_strip_think` first; if the result is empty but the raw text had substantial content, falls back to `_unwrap_wrapped`. Used for `workflow_finished.outputs.text`. |
+
+Result: whether the model leaks a thinking prefix, a whole-story wrapper, or backtick code fences, the server never displays, audits, or persists reasoning content.
+
+## 3. Metadata persistence with guaranteed fallbacks
+
+- **Schema**: `story_segments` gained `outline`, `action_a`, `action_b`, `music_style` (TEXT DEFAULT ''), added to the `CREATE TABLE` and to the idempotent `_migrate_schema` (`ALTER TABLE ... ADD COLUMN` when missing) — safe for existing databases.
+- [`_extract_story_meta`](AI-SAGA/server/main.py:1271): pulls the four fields from `outputs`; any missing / empty / non-string field, or a `music_style` not in the 9-value whitelist (`MUSIC_STYLE_VALUES`), falls back to [`META_DEFAULTS`](AI-SAGA/server/main.py:1260).
+- [`_finalize_meta`](AI-SAGA/server/main.py:1287): `outline` has **no static default** — when the LLM outline is missing, it falls back to **the segment's own story text** (accepted trade-off: the outline column duplicates content in the fallback path only).
+- [`_persist_story_segment`](AI-SAGA/server/main.py:1292) stores the four values per segment (re-running the defaulting internally, belt-and-suspenders). The `reveal`/`done` SSE events forward `{...outputs, ...meta}` so the client always receives all four (defaulted if needed).
+- **Quota-exhaustion safety**: the "overwrite latest segment's `choice_1/2/3` with the three current input-box values" UPDATE runs **before** `_check_story_quota`. So when a user is out of quota, they can still edit and confirm the three boxes, the server saves their latest choices to the DB, and the request is rejected at the quota gate **without any LLM call** — the user's state is preserved at zero cost.
+
+## 4. Flutter: recommended-action input boxes
+
+- [`TextInputPanel`](AI-SAGA/lib/widgets/text_input_panel.dart:11) gained an optional external `TextEditingController` (falls back to the internal one).
+- On `reveal`/`done`, [`_applyRecommendedActions`](AI-SAGA/lib/logic/home_content.dart:530) fills the **2nd** box with `action_a` and the **3rd** with `action_b` (box 1 remains free text). The three box values are sent as `choice_1/2/3` on confirm.
+- A new [`_hasRecommendedActions`](AI-SAGA/lib/logic/home_content.dart:221) flag gates input-box visibility: the boxes only appear after recommendations arrive; if a round completes without them, the app reuses the same "network issue — please restart" flow ([`_onStreamStalled`](AI-SAGA/lib/logic/home_content.dart:1773), 30s stall already handled by `onStalled`) so the user restarts and re-pulls the persisted metadata.
+
+## 5. Per-segment choices pulled with the text
+
+- `/api/story` GET now returns a `choices` array parallel to `segments` (each entry `[choice_1, choice_2, choice_3]`).
+- [`sync_service.dart`](AI-SAGA/lib/logic/sync_service.dart:11): `StorySnapshot` now carries `List<List<String>> choices`; `_parseStory` reads them (padded to 3 strings).
+- [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart:211): a `Map<int, List<String>> _segmentChoices` keyed by absolute seq is populated during startup sync and scroll-up loading, and each historical segment's [`StoryChoiceCard`](AI-SAGA/lib/widgets/story_choice_card.dart:11) receives its three values as `initialValues`, prefilled into its three input boxes.
+- `StoryChoiceCard` now carries `segmentIndex` (= server seq) so every button/input row is bound to the exact DB row (button → seq → row), which underpins the rewrite feature.
+
+## 6. Time-tree rewrite ("Restart from here")
+
+Tapping the rewrite button under a historical segment shows a **localized confirmation dialog** (no title; body warns the story will be rewritten from this point and all later content will be **permanently discarded**; buttons **Rewrite / Cancel**, translated across all supported languages). On confirm:
+
+1. [`_truncateStoryFrom`](AI-SAGA/lib/logic/home_content.dart:1651) removes the in-memory story segments after the chosen point, prunes choice records/segment-choices after it, and saves the truncated list to local storage.
+2. The flow then calls the **standard** [`_continueStory`](AI-SAGA/lib/logic/home_content.dart:550) with `rewriteFrom: segmentIndex` — every subsequent step (waiting, streaming, two-phase moderation, typewriter, `chunk/reveal/done`, stall/quota errors) is the **exact same continuation code path**. If the user typed nothing in the historical box, a localized default continuation prompt is used.
+3. Server: `StoryInputData.rewrite_from` (`-1` = no rewrite); [`generate_story`](AI-SAGA/server/main.py:1551) runs `DELETE FROM story_segments WHERE user_id=? AND seq > ?` after the quota check, then continues the unmodified pipeline (settings/tail are re-resolved from the now-latest segment, `previous_story` = the chosen segment, and the new segment becomes `seq = rewrite_from + 1`).
+
+Net effect: deleting abandoned content happens in three places (display page, app local storage, server DB) and then the old continuation pipeline is reused unchanged — one code path for both normal continuation and rewrites, so future changes stay consistent.
+
+## 7. Deployment & tooling notes
+
+- **Server deploy**: the updated `server/main.py` is written into the running container's writable layer (`docker cp` to a temp name then `cat > /code/main.py`, because `uvicorn --reload` holds the file open and a direct `docker cp` over it fails with "device or resource busy"); uvicorn's `StatReload` then reloads cleanly. **This copy lives in the container's writable layer — a container recreate/image rebuild discards it.** For durable deployment the image must be rebuilt from the updated source (the build directory's `main.py` is kept current by the normal sync, so rebuilding bakes in the new code).
+- **Dev data seeding**: [`server/seed_choices.py`](AI-SAGA/server/seed_choices.py) fills every row's `choice_1/2/3` with random ≤70-char action directives and leaves a few rows fully blank, for visually testing the per-segment buttons (run against the server DB path).
+- **Verification**: `python3 -m py_compile server/main.py` OK; `flutter analyze` no issues; server `StatReload` → `Application startup complete.` with no tracebacks.

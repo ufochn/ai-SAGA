@@ -164,6 +164,11 @@ CREATE TABLE IF NOT EXISTS story_segments (
     choice_1   TEXT DEFAULT '',
     choice_2   TEXT DEFAULT '',
     choice_3   TEXT DEFAULT '',
+    -- 后续变量（LLM② 生成；任一原因取不到时写入保底默认值）
+    outline     TEXT DEFAULT '',
+    action_a    TEXT DEFAULT '',
+    action_b    TEXT DEFAULT '',
+    music_style TEXT DEFAULT '',
     -- 用户当前设定快照（生成该段时点上的设定值，服务器权威保存）
     location       TEXT DEFAULT '',
     era            TEXT DEFAULT '',
@@ -241,12 +246,19 @@ def init_db() -> None:
 
 
 def _migrate_schema() -> None:
-    """对已有数据库做幂等迁移：为 users 补充 active_device_id 列。"""
+    """对已有数据库做幂等迁移：
+    - users 补充 active_device_id 列；
+    - story_segments 补充后续变量 4 列（outline/action_a/action_b/music_style）。
+    """
     conn = _db()
     try:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "active_device_id" not in cols:
+        ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "active_device_id" not in ucols:
             conn.execute("ALTER TABLE users ADD COLUMN active_device_id TEXT")
+        scols = {r["name"] for r in conn.execute("PRAGMA table_info(story_segments)").fetchall()}
+        for col in ("outline", "action_a", "action_b", "music_style"):
+            if col not in scols:
+                conn.execute(f"ALTER TABLE story_segments ADD COLUMN {col} TEXT DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -449,6 +461,8 @@ class StoryInputData(BaseModel):
     choice_1: str = ""
     choice_2: str = ""
     choice_3: str = ""
+    # 时间树"从这里重写"：>=0 时表示从该 seq 截断后续段，并作为新段续写（-1=不重写）
+    rewrite_from: int = -1
     # 第一轮生成时，App 把用户设定随请求上传，服务器随小说正文一起落库
     # （不再单独存储到 user_settings 表）
     location: str = ""
@@ -1257,25 +1271,68 @@ def _get_story_tail(user_id: str) -> tuple:
         conn.close()
 
 
+# 后续变量保底默认值：任一原因取不到这 4 个变量时写入数据库的兜底值
+# outline 无静态默认：缺失时由 _finalize_meta 用本段小说正文原文兜底（用户要求）
+META_DEFAULTS = {
+    "outline": "",
+    "action_a": "继续当前行动，深入探索",
+    "action_b": "停下脚步，先观察四周再行动",
+    "music_style": "悬疑",
+}
+# 大纲的终极兜底：仅当正文也为空时使用（正常不会走到）
+OUTLINE_FALLBACK = "本段剧情继续推进，主角做出新的选择。"
+# music_style 合法取值白名单（与 Dify 提示词一致）
+MUSIC_STYLE_VALUES = ["喜悦", "温情", "爱情", "黑暗", "悬疑", "推理", "惊悚", "幸福", "兴奋"]
+
+
+def _extract_story_meta(outputs: Optional[dict]) -> dict:
+    """从 Dify outputs 中提取后续 4 变量（outline/action_a/action_b/music_style）。
+
+    任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值，
+    保证无论什么原因失败，写入数据库与返回给 App 的都是"能用的完整数据"。
+    """
+    src = outputs if isinstance(outputs, dict) else {}
+    meta = {}
+    for key, default in META_DEFAULTS.items():
+        v = src.get(key)
+        meta[key] = v.strip() if isinstance(v, str) and v.strip() else default
+    if meta["music_style"] not in MUSIC_STYLE_VALUES:
+        meta["music_style"] = META_DEFAULTS["music_style"]
+    return meta
+
+
+def _finalize_meta(meta: dict, story_text: str) -> dict:
+    """补全 outline 兜底：LLM 大纲缺失/为空时，用本段小说正文原文作大纲。
+
+    正文也为空时才退回 OUTLINE_FALLBACK（正常不会走到）。
+    """
+    m = dict(meta)
+    if not m.get("outline"):
+        m["outline"] = (story_text or "").strip() or OUTLINE_FALLBACK
+    return m
+
+
 def _persist_story_segment(
     user_id: str,
     new_segment: str,
     settings: Optional[dict] = None,
     choices: Optional[dict] = None,
+    meta: Optional[dict] = None,
 ) -> None:
     """追加本段为该用户小说数组的新元素（seq = 原最大下标 + 1），单行 INSERT。
 
     服务器从 Dify 收到完整文本（且审核通过）就立即写入，
     与 App 是否收全无关；App 断流/卡死重启后，冷启动同步即可拉回完整文本。
     每段一行，追加不重写任何旧数据。
-    同时把生成该段时点上的"本轮三个选择"与"用户设定快照"随行落库，
-    供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
+    同时把生成该段时点上的"本轮三个选择"、"后续 4 变量（取不到用保底默认值）"
+    与"用户设定快照"随行落库，供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
     """
     if not new_segment or not new_segment.strip():
         return
     now = int(time.time())
     settings = settings or {}
     choices = choices or {}
+    meta = _finalize_meta(_extract_story_meta(meta), new_segment)
     conn = _db()
     try:
         row = conn.execute(
@@ -1287,10 +1344,11 @@ def _persist_story_segment(
             """INSERT INTO story_segments
                  (user_id, seq, content, created_at,
                   choice_1, choice_2, choice_3,
+                  outline, action_a, action_b, music_style,
                   location, era, player_gender, player_name,
                   partner_gender, partner_name, partner_traits,
                   language)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 next_seq,
@@ -1299,6 +1357,10 @@ def _persist_story_segment(
                 (choices.get("choice_1") or ""),
                 (choices.get("choice_2") or ""),
                 (choices.get("choice_3") or ""),
+                meta["outline"],
+                meta["action_a"],
+                meta["action_b"],
+                meta["music_style"],
                 (settings.get("location") or ""),
                 (settings.get("era") or ""),
                 (settings.get("player_gender") or ""),
@@ -1368,6 +1430,81 @@ def _reset_story(user_id: str) -> None:
         conn.close()
 
 
+def _strip_think(chunk: str, state: dict) -> str:
+    """从流式文本中剥离 <think>...</think> 思考块（兼容跨 chunk 拆分）。
+
+    - state 需在流开始时初始化为 {"in_think": False, "hold": ""}；
+    - 思考块可能跨多个 text_chunk：未闭合前先缓冲到 state["hold"]，闭合后整段丢弃；
+    - 若模型始终不闭合（格式坏），则该部分被整体丢弃（fail-closed，
+      宁可少正文也不把思考内容显示/落库）。
+    """
+    buf = state["hold"] + (chunk or "")
+    if state["in_think"]:
+        end = buf.find("</think>")
+        if end == -1:
+            state["hold"] = buf
+            return ""
+        buf = buf[end + len("</think>"):]
+        state["in_think"] = False
+        state["hold"] = ""
+    out = []
+    while True:
+        start = buf.find("<think>")
+        if start == -1:
+            out.append(buf)
+            state["hold"] = ""
+            break
+        out.append(buf[:start])
+        end = buf.find("</think>", start)
+        if end == -1:
+            state["hold"] = buf[start:]
+            state["in_think"] = True
+            break
+        buf = buf[end + len("</think>"):]
+    return "".join(out)
+
+
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
+
+
+def _content_weight(text: str) -> int:
+    """按内容量加权长度：汉字/全角字符计 1，英文字母/数字/半角符号计 0.5。
+
+    使「1000 汉字」与「2000 英文字母」视为同等体量（对齐用户设定：
+    每段约 1500 汉字 ≈ 3000 英文字母）。用于解壳兜底的体量门槛。
+    """
+    t = text or ""
+    cjk = len(_CJK_RE.findall(t))
+    other = len(t) - cjk
+    return cjk + other // 2
+
+
+def _unwrap_wrapped(text: str) -> str:
+    """解壳兜底：模型把整段正文包在 <think>…</think> 或反引号代码块里时，
+    去掉包裹壳，提取内部正文。壳内体量不足 1000 汉字当量视为无效
+    （≈1000 汉字 或 2000 英文字母；避免把"纯思考没写正文"误当正文返回）。"""
+    t = (text or "").strip()
+    if t.startswith("<think>") and t.endswith("</think>"):
+        t = t[len("<think>"):-len("</think>")].strip()
+    if t.startswith("```") and t.endswith("```"):
+        t = t[3:-3].strip()
+    elif t.startswith("`") and t.endswith("`"):
+        t = t[1:-1].strip()
+    if _content_weight(t) < 1000:
+        return ""
+    return t.strip()
+
+
+def _clean_story_text(raw: str) -> str:
+    """净化小说正文：先按常规剥离 <think> 思考块；
+    若剥离后为空但原文有实质内容（整篇被 think/反引号壳包住），改用解壳提取。"""
+    state = {"in_think": False, "hold": ""}
+    cleaned = _strip_think(raw or "", state)
+    if not cleaned or not cleaned.strip():
+        cleaned = _unwrap_wrapped(raw or "")
+    return cleaned
+
+
 # ================= 路由：小说生成（流式：先审首段 → 打字 → 剩余全审 → reveal） =================
 @app.post("/api/generate-story")
 async def generate_story(data: StoryInputData, request: Request):
@@ -1377,17 +1514,61 @@ async def generate_story(data: StoryInputData, request: Request):
     device_id = claims["device_id"]
     _enforce_active_device(user_id, device_id)
 
-    # 小说生成工作流全局每日配额（默认 1000 次 / 24 小时滚动）
-    _check_story_quota(int(time.time()))
-
-    # 设定解析：第一轮生成用 App 随请求上传的设定（随段落库），续写读最新一段快照
-    settings = _resolve_story_settings(user_id, data)
-    # 本轮选择快照：App 三个输入框的值（本轮生成时随行落库）
+    # 本轮选择快照：App 三个输入框的值（用户确认时上传，本轮生成时随行落库）
     choices = {
         "choice_1": data.choice_1 or "",
         "choice_2": data.choice_2 or "",
         "choice_3": data.choice_3 or "",
     }
+    # 用户确认时，把三个输入框当前值覆盖到"最新已生成那一段"的 choice_1/2/3，
+    # 替换它原先存的推荐/默认值，记录用户实际选择的行动。
+    # 放在配额检查【之前】：即使配额不足（不允许再生成新文本），也先把用户
+    # 最新编辑的未来行动保存进数据库，且不消耗任何 LLM 资源。
+    try:
+        conn = _db()
+        try:
+            conn.execute(
+                """UPDATE story_segments
+                      SET choice_1=?, choice_2=?, choice_3=?
+                    WHERE user_id=?
+                      AND seq=(SELECT MAX(seq) FROM story_segments WHERE user_id=?)""",
+                (
+                    data.choice_1 or "",
+                    data.choice_2 or "",
+                    data.choice_3 or "",
+                    user_id,
+                    user_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # 覆盖失败不影响生成主流程
+        logger.warning("覆盖最新段选择失败", exc_info=True)
+
+    # 小说生成工作流全局每日配额（默认 1000 次 / 24 小时滚动）
+    _check_story_quota(int(time.time()))
+
+    # 时间树"从这里重写"：截断该用户所有 seq > rewrite_from 的段落，
+    # 之后的生成将作为 rewrite_from+1 续写（previous_story 自动取截断后的末段）。
+    if data.rewrite_from is not None and data.rewrite_from >= 0:
+        try:
+            conn = _db()
+            try:
+                conn.execute(
+                    "DELETE FROM story_segments WHERE user_id=? AND seq > ?",
+                    (user_id, data.rewrite_from),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("时间树重写截断失败", exc_info=True)
+
+    # 设定解析：第一轮生成用 App 随请求上传的设定（随段落库），续写读最新一段快照
+    settings = _resolve_story_settings(user_id, data)
+
     # 以数据库是否已有段落决定续写/全新；空库自然返回 ("", 0)
     previous_story, user_input_counter = _get_story_tail(user_id)
 
@@ -1454,6 +1635,8 @@ async def generate_story(data: StoryInputData, request: Request):
                 full_text = ""      # 累计全部文本
                 sent_first = False
                 outputs = {}
+                think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
+                meta = _extract_story_meta({})  # 后续 4 变量；workflow_finished 时更新，失败用保底默认
 
                 async for line in resp.aiter_lines():
                     if not line.strip().startswith("data:"):
@@ -1469,7 +1652,7 @@ async def generate_story(data: StoryInputData, request: Request):
                     edata = evt.get("data") or {}
 
                     if etype == "text_chunk":
-                        txt = edata.get("text", "") or ""
+                        txt = _strip_think(edata.get("text", "") or "", think_state)
                         full_text += txt
                         if not sent_first:
                             first_buf += txt
@@ -1484,9 +1667,12 @@ async def generate_story(data: StoryInputData, request: Request):
 
                     elif etype == "workflow_finished":
                         outputs = edata.get("outputs") or {}
+                        meta = _extract_story_meta(outputs)
                         if not sent_first:
                             # 全文不足首段字数：整体审一次再发
-                            final_all = outputs.get("text", "") or full_text
+                            final_all = _clean_story_text(
+                                outputs.get("text", "") or full_text,
+                            )
                             if not final_all or not final_all.strip():
                                 yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
                                 return
@@ -1496,7 +1682,9 @@ async def generate_story(data: StoryInputData, request: Request):
                             final_segment = final_all
                             yield _sse({"event": "chunk", "text": final_all})
                         else:
-                            out_text = outputs.get("text", "") or full_text
+                            out_text = _clean_story_text(
+                                outputs.get("text", "") or full_text,
+                            )
                             if not out_text or not out_text.strip():
                                 yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
                                 return
@@ -1514,12 +1702,13 @@ async def generate_story(data: StoryInputData, request: Request):
                                 if not await _moderate_story(audit_text):
                                     yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                                     return
-                                yield _sse({"event": "reveal", "text": rest, "outputs": outputs})
+                                yield _sse({"event": "reveal", "text": rest, "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
                             else:
-                                yield _sse({"event": "reveal", "text": "", "outputs": outputs})
+                                yield _sse({"event": "reveal", "text": "", "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
                         # 服务器已从 Dify 收到完整文本且审核通过：立即持久化，与 App 是否收全无关
-                        _persist_story_segment(user_id, final_segment, settings, choices)
-                        yield _sse({"event": "done", "outputs": outputs})
+                        fmeta = _finalize_meta(meta, final_segment)
+                        _persist_story_segment(user_id, final_segment, settings, choices, fmeta)
+                        yield _sse({"event": "done", "outputs": {**outputs, **fmeta}})
                         return
 
                     elif etype in ("error", "workflow_failed"):
@@ -1530,16 +1719,16 @@ async def generate_story(data: StoryInputData, request: Request):
                 if not sent_first and full_text:
                     if await _moderate_story(full_text):
                         yield _sse({"event": "chunk", "text": full_text})
-                        _persist_story_segment(user_id, full_text, settings, choices)
-                        yield _sse({"event": "done", "outputs": outputs})
+                        _persist_story_segment(user_id, full_text, settings, choices, _finalize_meta(meta, full_text))
+                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                 elif rest_buf:
                     if await _moderate_story(rest_buf):
-                        yield _sse({"event": "reveal", "text": rest_buf, "outputs": outputs})
+                        yield _sse({"event": "reveal", "text": rest_buf, "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
                         # full_text = 首段 + 剩余，即完整文本
-                        _persist_story_segment(user_id, full_text, settings, choices)
-                        yield _sse({"event": "done", "outputs": outputs})
+                        _persist_story_segment(user_id, full_text, settings, choices, _finalize_meta(meta, full_text))
+                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
                     else:
                         yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                 else:
@@ -1753,21 +1942,24 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     try:
         if limit > 0 and before_seq >= 0:
             rows = conn.execute(
-                """SELECT seq, content FROM story_segments
+                """SELECT seq, content, choice_1, choice_2, choice_3
+                   FROM story_segments
                    WHERE user_id=? AND seq < ? ORDER BY seq DESC LIMIT ?""",
                 (user_id, before_seq, limit),
             ).fetchall()
             rows = list(reversed(rows))
         elif limit > 0:
             rows = conn.execute(
-                """SELECT seq, content FROM story_segments
+                """SELECT seq, content, choice_1, choice_2, choice_3
+                   FROM story_segments
                    WHERE user_id=? ORDER BY seq DESC LIMIT ?""",
                 (user_id, limit),
             ).fetchall()
             rows = list(reversed(rows))
         else:
             rows = conn.execute(
-                """SELECT seq, content FROM story_segments
+                """SELECT seq, content, choice_1, choice_2, choice_3
+                   FROM story_segments
                    WHERE user_id=? ORDER BY seq ASC""",
                 (user_id,),
             ).fetchall()
@@ -1782,10 +1974,23 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
             ).fetchone()["c"]
     finally:
         conn.close()
-    segments = [r["content"] for r in rows if isinstance(r["content"], str)]
+    segments = []
+    choices = []
+    for r in rows:
+        if isinstance(r["content"], str):
+            segments.append(r["content"])
+            choices.append(
+                [
+                    (r["choice_1"] or "") if isinstance(r["choice_1"], str) else "",
+                    (r["choice_2"] or "") if isinstance(r["choice_2"], str) else "",
+                    (r["choice_3"] or "") if isinstance(r["choice_3"], str) else "",
+                ]
+            )
     start_seq = rows[0]["seq"] if rows else 0
     resp = {
         "segments": segments,
+        # 与 segments 一一对应的三个选项（choice_1/2/3），App 显示在对应段落的按钮中
+        "choices": choices,
         "start_seq": start_seq,
         "updated_at": updated_at,
     }

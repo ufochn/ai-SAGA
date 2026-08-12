@@ -1,17 +1,20 @@
 /// 按"显示宽度"统计字数的工具。
 ///
-/// 规则：宽字符（汉字/日文假名/韩文谚文/全角符号等）按 2 字计，
+/// 规则：宽字符（汉字/日文假名/韩文谚文/全角符号等）按 3 字计，
 /// 窄字符（英文字母/数字/ASCII 标点）按 1 字计。
 library;
 
-/// 计算文本的加权字数（宽字符=2，窄字符=1）。
+/// 计算文本的加权字数（宽字符=3，窄字符=1）。
 int weightedCharCount(String text) {
   var count = 0;
   for (final rune in text.runes) {
-    count += isWideChar(rune) ? 2 : 1;
+    count += isWideChar(rune) ? 3 : 1;
   }
   return count;
 }
+
+/// 特质输入是否超过字数上限（宽字符=3、窄字符=1，全部累加不超过 150）。
+bool isTraitsOverLimit(String text) => weightedCharCount(text) > 150;
 
 /// 是否为宽字符（一个汉字/日文/韩文 ≈ 两个英文字母的宽度）。
 bool isWideChar(int r) {

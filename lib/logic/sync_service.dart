@@ -7,13 +7,16 @@ import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/hardware_key_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 
-/// 一次小说数据快照：本地数组 + 与 segments 一一对应的三个选项（choice_1/2/3）
-/// + 首元素绝对下标（与服务器 seq 对齐）+ 总段数。
+/// 一次小说数据快照：本地数组 + 与 segments 一一对应的三个选项（choice_1/2/3，
+/// LLM② 推荐的下一轮行动）+ 与 segments 一一对应的用户本轮实际选择文本（user_choices）
+/// + 首元素绝对下标（与服务器 seq 对齐）+ 总段数 + 服务器金标准语言。
 typedef StorySnapshot = ({
   List<String> segments,
   List<List<String>> choices,
+  List<String> userChoices,
   int startSeq,
   int total,
+  String language,
 });
 
 /// 启动同步服务：每次 App 启动时
@@ -59,10 +62,31 @@ class SyncService {
     final token = await AuthService.ensureToken();
     final publicKey = await HardwareKeyService.getPublicKey();
     await _activate(token, publicKey);
-    final snap = await _pullStory(token, limit: tailLimit);
-    await StorageService.saveMainTextList(snap.segments);
-    await StorageService.saveMainTextStartIndex(snap.startSeq);
-    return snap;
+    return _pullStory(token, limit: tailLimit);
+  }
+
+  /// 重新开始：清空服务器上该用户的全部小说正文（POST /api/story/reset）。
+  /// 成功后 App 重启，重启后同步拉取为空 → 判定为新用户 → 从设置重新开始。
+  static Future<void> resetStory() async {
+    final token = await AuthService.ensureToken();
+    final url = _storyApiUrl;
+    if (url.isEmpty) {
+      throw Exception('小说存储地址未配置，无法清空服务器数据');
+    }
+    final base = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
+    final resp = await http
+        .post(
+          Uri.parse('$base/reset'),
+          headers: {
+            'accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+        )
+        .timeout(const Duration(seconds: 30));
+    if (resp.statusCode != 200) {
+      throw Exception('清空服务器数据失败：HTTP ${resp.statusCode} ${resp.body}');
+    }
   }
 
   /// 向上懒加载更早的段落：取 seq < [beforeSeq] 的最近 [limit] 段，前插到本地数组。
@@ -76,8 +100,10 @@ class SyncService {
       return (
         segments: const <String>[],
         choices: const <List<String>>[],
+        userChoices: const <String>[],
         startSeq: 0,
         total: 0,
+        language: '',
       );
     }
     final resp = await http
@@ -133,8 +159,10 @@ class SyncService {
       return (
         segments: const <String>[],
         choices: const <List<String>>[],
+        userChoices: const <String>[],
         startSeq: 0,
         total: 0,
+        language: '',
       );
     }
     final uri = limit > 0
@@ -170,13 +198,22 @@ class SyncService {
           (i < list.length ? list[i]?.toString() : null) ?? '',
       ];
     }).toList();
+    // 用户本轮实际选择文本（user_choices）与 segments 一一对应；缺失用空串
+    final rawUserChoices = (data['user_choices'] as List?) ?? const [];
+    final userChoices = rawUserChoices
+        .map((e) => (e as String?) ?? '')
+        .toList();
     final startSeq = (data['start_seq'] as num?)?.toInt() ?? 0;
     final total = (data['total'] as num?)?.toInt() ?? segments.length;
+    // 服务器金标准语言（老用户换新设备时据此覆盖本地语言）
+    final language = (data['language'] as String?) ?? '';
     return (
       segments: segments,
       choices: choices,
+      userChoices: userChoices,
       startSeq: startSeq,
       total: total,
+      language: language,
     );
   }
 }

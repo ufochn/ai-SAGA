@@ -5,8 +5,8 @@ import 'package:ai_saga/logic/text_width.dart';
 
 /// 输入框和确定输入按钮组件（iOS风格）。
 ///
-/// 字数按"显示宽度"统计：汉字/日文/韩文等宽字符按 2 字计，英文字母/数字/
-/// 标点按 1 字计；加权总字数超过 [maxLength]（默认 200）时，输入文字变红、
+/// 字数按"显示宽度"统计：汉字/日文/韩文等宽字符按 3 字计，英文字母/数字/
+/// 标点按 1 字计；加权总字数超过 [maxLength]（默认 300）时，输入文字变红、
 /// 确定按钮变灰禁用（不截断输入，与地名设置页一致）。
 class TextInputPanel extends StatefulWidget {
   final void Function(String text) onConfirm;
@@ -14,7 +14,7 @@ class TextInputPanel extends StatefulWidget {
   /// 输入内容变化回调：用于在确认前把当前输入值上报给外部（如记录本轮三个选择）
   final void Function(String text)? onChanged;
 
-  /// 可选的外部输入控制器：由外部持有并预填/读取文本（如服务器推荐行动预填）。
+  /// 可选的外部输入控制器：由外部持有并预填/读取文本（如服务器推荐选择预填）。
   /// 不传时内部自行管理控制器。
   final TextEditingController? controller;
 
@@ -24,7 +24,7 @@ class TextInputPanel extends StatefulWidget {
   /// 确定按钮文字
   final String confirmText;
 
-  /// 加权字数上限（汉字/日文/韩文按 2 字，英文按 1 字）
+  /// 加权字数上限（汉字/日文/韩文按 3 字，英文按 1 字）
   final int maxLength;
 
   /// 按钮是否放在输入框下方（true=纵向：输入框在上、按钮在下全宽；
@@ -41,7 +41,7 @@ class TextInputPanel extends StatefulWidget {
     this.controller,
     this.placeholder = '输入文字...',
     this.confirmText = '确定',
-    this.maxLength = 200,
+    this.maxLength = 300,
     this.buttonBelow = false,
     this.disabled = false,
   });
@@ -88,6 +88,8 @@ class _TextInputPanelState extends State<TextInputPanel> {
       ),
       child: CupertinoTextField(
         controller: _controller,
+        // 生成/接收中（disabled=true）置灰不可输入，但输入框保持显示（不消失）
+        enabled: !widget.disabled,
         maxLines: 5,
         minLines: 1,
         keyboardType: TextInputType.multiline,
@@ -125,8 +127,14 @@ class _TextInputPanelState extends State<TextInputPanel> {
         onPressed: canConfirm
             ? () {
                 SoundService.playConfirm();
-                widget.onConfirm(_textController.text);
-                _textController.clear();
+                // 必须读"生效中的控制器"（外部传入时用户输入在外部控制器里，
+                // 内部 _textController 是空的，读它会误判为空输入导致无反应）
+                widget.onConfirm(_controller.text);
+                // 仅当没有外部控制器时才清空内部控制器（外部控制器由持有方管理，
+                // 不清空预填的推荐/兜底内容）
+                if (widget.controller == null) {
+                  _textController.clear();
+                }
                 setState(() {});
               }
             : null,

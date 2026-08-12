@@ -4,6 +4,7 @@ import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/text_width.dart';
+import 'package:ai_saga/logic/trait_defaults.dart';
 
 /// 搭档设定页面 - 性别 + 姓名 + 特质（iOS风格表单）
 class CharacterSetupPage extends StatefulWidget {
@@ -37,22 +38,23 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _partnerNameEdited = false;
 
+  /// 标记用户是否已手动编辑过特质（防止性别切换时覆盖用户输入）
+  bool _partnerTraitsEdited = false;
+
   /// 最近一次加载默认姓名所使用的语言（用于检测语言变更）
   String? _loadedLanguage;
 
   /// 搭档姓名输入字数上限（按显示宽度统计）
-  static const int _maxNameLength = 20;
+  static const int _maxNameLength = 30;
 
-  /// 当前搭档姓名是否超过字数上限（宽字符=2、窄字符=1）
+  /// 当前搭档姓名是否超过字数上限（宽字符=3、窄字符=1）
   bool get _isNameOverLimit =>
       weightedCharCount(_partnerNameController.text) > _maxNameLength;
 
-  /// 搭档性格设定输入字数上限（按显示宽度统计）
-  static const int _maxTraitsLength = 20;
-
-  /// 当前搭档性格设定是否超过字数上限（宽字符=2、窄字符=1）
+  /// 当前搭档性格设定是否超过字数上限
+  /// （宽字符按 3 计、窄字符按 1 计，全部累加不超过 150）
   bool get _isTraitsOverLimit =>
-      weightedCharCount(_partnerTraitsController.text) > _maxTraitsLength;
+      isTraitsOverLimit(_partnerTraitsController.text);
 
   @override
   void initState() {
@@ -74,7 +76,15 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     _partnerNameController.text = savedName.isNotEmpty
         ? savedName
         : _getDefaultName(genderIndex: _partnerGenderIndex);
-    _partnerTraitsController.text = SetupDraft.instance.partnerTraits.trim();
+    // 特质默认值：按性别 + 语言自动填入；用户此前已确认过则恢复已保存值
+    final savedTraits = SetupDraft.instance.partnerTraits.trim();
+    _partnerTraitsController.text = savedTraits.isNotEmpty
+        ? savedTraits
+        : buildDefaultTraits(
+            genderIndex: _partnerGenderIndex,
+            language: _language,
+            location: SetupDraft.instance.location,
+          );
 
     // 记录当前已加载语言（用于检测语言变更）
     _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
@@ -122,7 +132,12 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
         _partnerNameController.text = _getDefaultName(
           genderIndex: _partnerGenderIndex,
         );
-        _partnerTraitsController.text = '';
+        _partnerTraitsEdited = false;
+        _partnerTraitsController.text = buildDefaultTraits(
+          genderIndex: _partnerGenderIndex,
+          language: newLanguage,
+          location: SetupDraft.instance.location,
+        );
         _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
       });
     }
@@ -133,6 +148,13 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
         if (!_partnerNameEdited) {
           _partnerNameController.text = _getDefaultName(
             genderIndex: _partnerGenderIndex,
+          );
+        }
+        if (!_partnerTraitsEdited) {
+          _partnerTraitsController.text = buildDefaultTraits(
+            genderIndex: _partnerGenderIndex,
+            language: _language,
+            location: SetupDraft.instance.location,
           );
         }
       });
@@ -205,6 +227,14 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
       _partnerGenderIndex = value;
       if (!_partnerNameEdited) {
         _partnerNameController.text = _getDefaultName(genderIndex: value);
+      }
+      if (!_partnerTraitsEdited) {
+        // 性别切换时，特质输入框随性别自动换成对应的默认文案
+        _partnerTraitsController.text = buildDefaultTraits(
+          genderIndex: value,
+          language: _language,
+          location: SetupDraft.instance.location,
+        );
       }
     });
   }
@@ -743,6 +773,8 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
                               fontSize: 17,
                             ),
                             onChanged: (value) {
+                              // 用户手动输入后，性别切换不再覆盖其自定义内容
+                              _partnerTraitsEdited = true;
                               setState(() {});
                             },
                           ),

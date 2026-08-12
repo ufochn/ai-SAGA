@@ -3,11 +3,11 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:ai_saga/logic/account_service.dart';
 import 'package:ai_saga/logic/home_content.dart';
 import 'package:ai_saga/logic/storage_service.dart';
+import 'package:ai_saga/logic/sync_service.dart';
 import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/security_service.dart';
 import 'package:ai_saga/widgets/light_auth_page.dart';
-import 'package:ai_saga/widgets/initialization_page.dart';
 import 'package:ai_saga/widgets/security_warning_page.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
 
@@ -117,40 +117,6 @@ class LightAuthGate extends StatelessWidget {
   }
 }
 
-/// 语言优先门卫：新用户先选择语言，完成后再进入轻授权页（开始你的故事）。
-/// 使用 push 而非 pushReplacement，保留语言选择页在导航栈中，
-/// 以便用户在轻授权页通过左上角返回按钮回到语言选择页。
-class LanguageFirstGate extends StatelessWidget {
-  const LanguageFirstGate({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return InitializationPage(
-      onComplete: () {
-        Navigator.of(context).push(
-          PageRouteBuilder(
-            pageBuilder: (context, animation, secondaryAnimation) =>
-                const LightAuthGate(),
-            transitionsBuilder:
-                (context, animation, secondaryAnimation, child) {
-                  return FadeTransition(
-                    opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
-                      CurvedAnimation(
-                        parent: animation,
-                        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-                      ),
-                    ),
-                    child: child,
-                  );
-                },
-            transitionDuration: const Duration(milliseconds: 1200),
-          ),
-        );
-      },
-    );
-  }
-}
-
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -186,19 +152,13 @@ class _SplashScreenState extends State<SplashScreen>
     Future.delayed(const Duration(milliseconds: 2600), () async {
       SoundService.playHorror();
       if (!mounted) return;
-      // 新用户最先选择语言：尚未选择语言且未授权时，先进入语言选择页，
-      // 完成后进入轻授权页（开始你的故事）；已选择语言或已授权则直接进入对应页面。
+      // 语言不再在启动时单独选择：StorageService.getLanguage() 按
+      // 「已存语言 → 系统语言」回退；语言选择统一放在设定流程
+      // （新用户从语言页开始设置，老用户用服务器金标准语言覆盖）。
       final authorized = await AccountService.isAuthorized();
-      final hasLanguage = StorageService.getLanguage().isNotEmpty;
       if (!mounted) return;
-      final Widget nextPage;
-      if (authorized) {
-        nextPage = const MyHomePage();
-      } else if (hasLanguage) {
-        nextPage = const LightAuthGate();
-      } else {
-        nextPage = const LanguageFirstGate();
-      }
+      final Widget nextPage =
+          authorized ? const MyHomePage() : const LightAuthGate();
       Navigator.of(context).pushReplacement(
         // Apple 风格的交叉溶解过渡（cross dissolve）
         PageRouteBuilder(
@@ -726,6 +686,147 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  /// 正在清空数据（进度弹窗文案）
+  String _getResettingText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '正在清空數據，請稍後…';
+      case 'en':
+        return 'Clearing data, please wait…';
+      case 'es':
+        return 'Borrando datos, espere…';
+      case 'fr':
+        return 'Suppression des données, veuillez patienter…';
+      case 'de':
+        return 'Daten werden gelöscht, bitte warten…';
+      case 'pt':
+        return 'Limpando dados, aguarde…';
+      case 'ja':
+        return 'データを消去しています。しばらくお待ちください…';
+      case 'ko':
+        return '데이터를 삭제하는 중입니다. 잠시만 기다려 주세요…';
+      default:
+        return '正在清空数据，请稍后…';
+    }
+  }
+
+  /// 重置完成标题
+  String _getResetDoneTitleText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '重設完成';
+      case 'en':
+        return 'Reset Complete';
+      case 'es':
+        return 'Restablecimiento Completado';
+      case 'fr':
+        return 'Réinitialisation terminée';
+      case 'de':
+        return 'Zurücksetzen abgeschlossen';
+      case 'pt':
+        return 'Redefinição Concluída';
+      case 'ja':
+        return 'リセット完了';
+      case 'ko':
+        return '초기화 완료';
+      default:
+        return '重置完成';
+    }
+  }
+
+  /// 重置完成内容
+  String _getResetDoneMessageText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '所有小說數據已清空，現在重新啟動 App。';
+      case 'en':
+        return 'All story data has been cleared. The app will restart now.';
+      case 'es':
+        return 'Se han borrado todos los datos de la historia. La app se reiniciará ahora.';
+      case 'fr':
+        return 'Toutes les données de l\'histoire ont été effacées. L\'application va redémarrer.';
+      case 'de':
+        return 'Alle Story-Daten wurden gelöscht. Die App wird jetzt neu gestartet.';
+      case 'pt':
+        return 'Todos os dados da história foram apagados. O app será reiniciado agora.';
+      case 'ja':
+        return 'すべての物語データを消去しました。アプリを再起動します。';
+      case 'ko':
+        return '모든 스토리 데이터가 삭제되었습니다. 앱을 다시 시작합니다.';
+      default:
+        return '所有小说数据已清空，现在重启 App。';
+    }
+  }
+
+  /// "现在重启"按钮文字
+  String _getRestartNowButtonText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '重新啟動';
+      case 'en':
+        return 'Restart';
+      case 'es':
+        return 'Reiniciar';
+      case 'fr':
+        return 'Redémarrer';
+      case 'de':
+        return 'Neu starten';
+      case 'pt':
+        return 'Reiniciar';
+      case 'ja':
+        return '再起動';
+      case 'ko':
+        return '다시 시작';
+      default:
+        return '重启';
+    }
+  }
+
+  /// 重置失败标题
+  String _getResetFailedTitleText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '重設失敗';
+      case 'en':
+        return 'Reset Failed';
+      case 'es':
+        return 'Error al Restablecer';
+      case 'fr':
+        return 'Échec de la réinitialisation';
+      case 'de':
+        return 'Zurücksetzen fehlgeschlagen';
+      case 'pt':
+        return 'Falha na Redefinição';
+      case 'ja':
+        return 'リセット失敗';
+      case 'ko':
+        return '초기화 실패';
+      default:
+        return '重置失败';
+    }
+  }
+
+  /// 重置失败内容
+  String _getResetFailedMessageText(String detail) {
+    final prefix = switch (StorageService.getLanguage()) {
+      'zh-TW' || 'yue' => '無法清空數據，請檢查網絡後重試。',
+      'en' => 'Failed to clear data. Please check your network and try again.',
+      'es' => 'No se pudieron borrar los datos. Revisa tu red e inténtalo de nuevo.',
+      'fr' => 'Échec de la suppression des données. Vérifiez le réseau et réessayez.',
+      'de' => 'Daten konnten nicht gelöscht werden. Prüfen Sie das Netzwerk und versuchen Sie es erneut.',
+      'pt' => 'Não foi possível apagar os dados. Verifique a rede e tente novamente.',
+      'ja' => 'データを消去できませんでした。ネットワークを確認して再試行してください。',
+      'ko' => '데이터를 삭제하지 못했습니다. 네트워크를 확인하고 다시 시도해 주세요.',
+      _ => '无法清空数据，请检查网络后重试。',
+    };
+    return '$prefix\n$detail';
+  }
+
   void _showSubscriptionSheet() {
     final isDark = themeBrightnessNotifier.value == Brightness.dark;
     showCupertinoModalPopup(
@@ -921,10 +1022,7 @@ class _MyHomePageState extends State<MyHomePage> {
             isDestructiveAction: true,
             onPressed: () {
               Navigator.of(context).pop();
-              StorageService.clearAll();
-              setState(() {
-                _homeContentKey++;
-              });
+              _performRestart();
             },
             child: Text(
               _getConfirmRestartButtonText(),
@@ -952,6 +1050,127 @@ class _MyHomePageState extends State<MyHomePage> {
         ],
       ),
     );
+  }
+
+  /// 重新开始流程：先弹出"正在清空数据"进度弹窗 → 清空服务器正文 + 本地数据 →
+  /// 完成后弹出"重置完成，重启"弹窗，用户确认后重启 App。
+  Future<void> _performRestart() async {
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    // 1) 进度弹窗：旋转图标 + "正在清空数据，请稍后…"（不可关闭）
+    showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => CupertinoAlertDialog(
+        content: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CupertinoActivityIndicator(),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                _getResettingText(),
+                textAlign: TextAlign.left,
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.secondaryTextDark
+                      : AppTheme.secondaryTextLight,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    try {
+      // 2) 清空服务器小说正文（权威）→ 再清空本地数据
+      await SyncService.resetStory();
+      await StorageService.clearAll();
+      if (!mounted) return;
+      // 3) 关闭进度弹窗，弹出"重置完成，重启"弹窗
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      await showCupertinoDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => CupertinoAlertDialog(
+          title: Text(
+            _getResetDoneTitleText(),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.primaryTextDark
+                  : AppTheme.primaryTextLight,
+            ),
+          ),
+          content: Text(
+            _getResetDoneMessageText(),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.secondaryTextDark
+                  : AppTheme.secondaryTextLight,
+            ),
+          ),
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                RestartWidget.restartApp(dialogContext);
+              },
+              child: Text(
+                _getRestartNowButtonText(),
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.accentBlueDark
+                      : AppTheme.accentBlueLight,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      // 关闭进度弹窗，弹出失败提示
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      await showCupertinoDialog<void>(
+        context: context,
+        builder: (dialogContext) => CupertinoAlertDialog(
+          title: Text(
+            _getResetFailedTitleText(),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.destructiveRedDark
+                  : AppTheme.destructiveRedLight,
+            ),
+          ),
+          content: Text(
+            _getResetFailedMessageText(e.toString()),
+            style: TextStyle(
+              color: isDark
+                  ? AppTheme.secondaryTextDark
+                  : AppTheme.secondaryTextLight,
+            ),
+          ),
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(
+                _getCancelText(),
+                style: TextStyle(
+                  color: isDark
+                      ? AppTheme.accentBlueDark
+                      : AppTheme.accentBlueLight,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
   }
 
   @override

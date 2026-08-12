@@ -24,6 +24,7 @@ import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Optional
 
 import httpx
@@ -160,20 +161,21 @@ CREATE TABLE IF NOT EXISTS story_segments (
     seq        INTEGER NOT NULL,          -- 段下标（0,1,2,...），即 App 数组下标
     content    TEXT NOT NULL,             -- 这一段文本
     created_at INTEGER NOT NULL,
-    -- 本轮选择（一/二/三，对应本轮生成时提供给用户的三个选项）
+    -- 本轮三个选择（choice_1/2/3，LLM② 推荐的下一轮行动；任一原因取不到时写入保底默认值）
     choice_1   TEXT DEFAULT '',
     choice_2   TEXT DEFAULT '',
     choice_3   TEXT DEFAULT '',
+    -- 用户本轮实际选择（点击"继续"时从三个输入框所选/所输的文本；未选择时为空）
+    user_choice TEXT DEFAULT '',
     -- 后续变量（LLM② 生成；任一原因取不到时写入保底默认值）
     outline     TEXT DEFAULT '',
-    action_a    TEXT DEFAULT '',
-    action_b    TEXT DEFAULT '',
     music_style TEXT DEFAULT '',
     -- 用户当前设定快照（生成该段时点上的设定值，服务器权威保存）
     location       TEXT DEFAULT '',
     era            TEXT DEFAULT '',
     player_gender  TEXT DEFAULT '',
     player_name    TEXT DEFAULT '',
+    player_traits  TEXT DEFAULT '',   -- 主角性格特质（与 partner_traits 对应）
     partner_gender TEXT DEFAULT '',
     partner_name   TEXT DEFAULT '',
     partner_traits TEXT DEFAULT '',
@@ -239,26 +241,6 @@ def init_db() -> None:
     conn = _db()
     try:
         conn.executescript(SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-    _migrate_schema()
-
-
-def _migrate_schema() -> None:
-    """对已有数据库做幂等迁移：
-    - users 补充 active_device_id 列；
-    - story_segments 补充后续变量 4 列（outline/action_a/action_b/music_style）。
-    """
-    conn = _db()
-    try:
-        ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "active_device_id" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN active_device_id TEXT")
-        scols = {r["name"] for r in conn.execute("PRAGMA table_info(story_segments)").fetchall()}
-        for col in ("outline", "action_a", "action_b", "music_style"):
-            if col not in scols:
-                conn.execute(f"ALTER TABLE story_segments ADD COLUMN {col} TEXT DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -469,6 +451,7 @@ class StoryInputData(BaseModel):
     era: str = ""
     player_name: str = ""
     player_gender: str = ""
+    player_traits: str = ""
     partner_name: str = ""
     partner_gender: str = ""
     partner_traits: str = ""
@@ -1186,9 +1169,18 @@ def _parse_audit_json(out: str) -> Optional[str]:
     return action.strip().lower()
 
 
-def _audit_passed(out: str) -> bool:
-    """审核通过判定：只认 JSON 中的 action 字段 == "none"，否则不通过（fail-closed）。"""
-    return _parse_audit_json(out) == "none"
+class ModerationOutcome(Enum):
+    """审核结果三态：区分"明确违规"与"审核不可用"。
+
+    - PASS：明确判定通过（action == "none"）。
+    - REJECT：审核成功并返回非 none 的 action（明确判定违规）。
+    - UNAVAILABLE：审核不可用（配额超限 / 网络失败 / 非 200 / 输出无法解析）。
+      这是审核链路自身的问题，不代表内容违规，调用方应作为可重试错误处理，
+      而不是弹出"内容违规"警告（避免弱网/审核服务抖动被误判为用户违规）。
+    """
+    PASS = "pass"
+    REJECT = "reject"
+    UNAVAILABLE = "unavailable"
 
 
 def _build_audit_verdict(out: str) -> dict:
@@ -1219,16 +1211,20 @@ def _build_audit_verdict(out: str) -> dict:
     }
 
 
-async def _moderate_story(text: str) -> bool:
-    """调用审核工作流，返回 True=通过，False=不通过或审核异常（fail-closed）。"""
+async def _moderate_story(text: str) -> ModerationOutcome:
+    """调用审核工作流，返回三态判定（见 ModerationOutcome）。
+
+    只把"审核成功且明确判为违规"当作 REJECT；配额超限、网络失败、
+    非 200、输出无法解析等一律返回 UNAVAILABLE（可重试，非违规）。
+    """
     if not text or not text.strip():
-        return True
+        return ModerationOutcome.PASS
     # 审核工作流全局配额（所有用户合计 AUDIT_DAILY_LIMIT 次/天）：
-    # 超限时 fail-closed（不调用 Dify，视为不通过），保证审核链路始终受控。
+    # 超限时不调用 Dify，视为"审核不可用"（可重试），而非"内容违规"。
     try:
         _check_audit_quota(int(time.time()))
     except HTTPException:
-        return False
+        return ModerationOutcome.UNAVAILABLE
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
@@ -1243,13 +1239,32 @@ async def _moderate_story(text: str) -> bool:
             DIFY_API_URL, json=payload, headers=headers, timeout=60.0
         )
         if resp.status_code != 200:
-            return False
+            return ModerationOutcome.UNAVAILABLE
         data = resp.json()
         out = _extract_guardrail_output(data)
-        # 审核工作流输出应为 JSON（含 action 字段），fail-closed
-        return _audit_passed(out)
+        action = _parse_audit_json(out)
+        if action is None:
+            # 审核成功但无有效 action 判定：视为审核链路异常（可重试），非违规
+            return ModerationOutcome.UNAVAILABLE
+        return ModerationOutcome.PASS if action == "none" else ModerationOutcome.REJECT
     except Exception:
-        return False
+        # 网络 / 超时 / 解析异常：审核不可用（可重试），非违规
+        return ModerationOutcome.UNAVAILABLE
+
+
+def _moderation_failure_sse(mr: ModerationOutcome) -> Optional[dict]:
+    """把非 PASS 的审核结果映射为应发送的 SSE 事件；PASS 返回 None。
+
+    REJECT → abort（违规，弹"内容违规"）；UNAVAILABLE → error（可重试，网络式警告）。
+    """
+    if mr is ModerationOutcome.REJECT:
+        return {"event": "abort", "reason": "生成内容包含违规信息，已中止"}
+    if mr is ModerationOutcome.UNAVAILABLE:
+        return {
+            "event": "error",
+            "message": "内容审核服务暂时不可用，请检查网络后重试",
+        }
+    return None
 
 
 def _get_story_tail(user_id: str) -> tuple:
@@ -1271,33 +1286,113 @@ def _get_story_tail(user_id: str) -> tuple:
         conn.close()
 
 
-# 后续变量保底默认值：任一原因取不到这 4 个变量时写入数据库的兜底值
+# 后续变量保底默认值：任一原因取不到时写入数据库的兜底值
 # outline 无静态默认：缺失时由 _finalize_meta 用本段小说正文原文兜底（用户要求）
+# choice_1/2/3 即 LLM② 推荐的下一轮行动（统一用 choices_1/2/3）。
+# 默认行动选项按用户语言（App 随请求上传 / 最新段快照的 language）选择对应语言版本；
+# 未知语言回退简体中文。music_style 是 Dify 工作流结构化枚举（白名单 MUSIC_STYLE_VALUES），
+# 为保持与画布兼容，各语言统一用白名单内取值，不做本地化。
 META_DEFAULTS = {
     "outline": "",
-    "action_a": "继续当前行动，深入探索",
-    "action_b": "停下脚步，先观察四周再行动",
+    "choice_1": "继续当前行动，深入探索",
+    "choice_2": "停下脚步，先观察四周再行动",
+    "choice_3": "换一个方向，探索其它可能",
     "music_style": "悬疑",
 }
+META_DEFAULTS_BY_LANG = {
+    "zh": META_DEFAULTS,
+    "zh-TW": {
+        "outline": "",
+        "choice_1": "繼續目前行動，深入探索",
+        "choice_2": "停下腳步，先觀察四周再行動",
+        "choice_3": "換一個方向，探索其他可能",
+        "music_style": "悬疑",
+    },
+    "yue": {
+        "outline": "",
+        "choice_1": "繼續而家嘅行動，深入探索",
+        "choice_2": "停低腳步，先睇下四周再行動",
+        "choice_3": "轉另一個方向，探索其他可能",
+        "music_style": "悬疑",
+    },
+    "en": {
+        "outline": "",
+        "choice_1": "Continue your current action and explore deeper",
+        "choice_2": "Pause, observe your surroundings before acting",
+        "choice_3": "Change direction and explore other possibilities",
+        "music_style": "悬疑",
+    },
+    "es": {
+        "outline": "",
+        "choice_1": "Continúa tu acción actual y explora a fondo",
+        "choice_2": "Detente, observa tu entorno antes de actuar",
+        "choice_3": "Cambia de dirección y explora otras posibilidades",
+        "music_style": "悬疑",
+    },
+    "fr": {
+        "outline": "",
+        "choice_1": "Continuez votre action actuelle et explorez en profondeur",
+        "choice_2": "Arrêtez-vous, observez les alentours avant d'agir",
+        "choice_3": "Changez de direction et explorez d'autres possibilités",
+        "music_style": "悬疑",
+    },
+    "de": {
+        "outline": "",
+        "choice_1": "Setze deine aktuelle Handlung fort und erkunde tiefer",
+        "choice_2": "Halte inne und beobachte zuerst deine Umgebung",
+        "choice_3": "Schlage eine andere Richtung ein und erkunde weitere Möglichkeiten",
+        "music_style": "悬疑",
+    },
+    "pt": {
+        "outline": "",
+        "choice_1": "Continue sua ação atual e explore a fundo",
+        "choice_2": "Pare, observe ao redor antes de agir",
+        "choice_3": "Mude de direção e explore outras possibilidades",
+        "music_style": "悬疑",
+    },
+    "ja": {
+        "outline": "",
+        "choice_1": "現在の行動を続けて、深く探索する",
+        "choice_2": "立ち止まり、まず周囲を観察してから行動する",
+        "choice_3": "方向を変えて、他の可能性を探る",
+        "music_style": "悬疑",
+    },
+    "ko": {
+        "outline": "",
+        "choice_1": "현재 행동을 계속하며 깊이 탐험한다",
+        "choice_2": "멈추고, 먼저 주변을 관찰한 뒤 행동한다",
+        "choice_3": "방향을 바꿔 다른 가능성을 탐색한다",
+        "music_style": "悬疑",
+    },
+}
+
+
+def _meta_defaults(language: Optional[str]) -> dict:
+    """按用户语言返回后续变量保底默认值；未知/为空回退简体中文。"""
+    return META_DEFAULTS_BY_LANG.get((language or "").strip(), META_DEFAULTS)
 # 大纲的终极兜底：仅当正文也为空时使用（正常不会走到）
 OUTLINE_FALLBACK = "本段剧情继续推进，主角做出新的选择。"
 # music_style 合法取值白名单（与 Dify 提示词一致）
 MUSIC_STYLE_VALUES = ["喜悦", "温情", "爱情", "黑暗", "悬疑", "推理", "惊悚", "幸福", "兴奋"]
 
 
-def _extract_story_meta(outputs: Optional[dict]) -> dict:
-    """从 Dify outputs 中提取后续 4 变量（outline/action_a/action_b/music_style）。
+def _extract_story_meta(
+    outputs: Optional[dict], language: Optional[str] = None
+) -> dict:
+    """从 Dify outputs 中提取后续变量（outline/choice_1/choice_2/choice_3/music_style）。
 
-    任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值，
+    任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值；
+    choice_1/2/3 的默认值按 [language] 选择对应语言版本（未知语言回退简体中文），
     保证无论什么原因失败，写入数据库与返回给 App 的都是"能用的完整数据"。
     """
     src = outputs if isinstance(outputs, dict) else {}
+    defaults = _meta_defaults(language)
     meta = {}
-    for key, default in META_DEFAULTS.items():
+    for key, default in defaults.items():
         v = src.get(key)
         meta[key] = v.strip() if isinstance(v, str) and v.strip() else default
     if meta["music_style"] not in MUSIC_STYLE_VALUES:
-        meta["music_style"] = META_DEFAULTS["music_style"]
+        meta["music_style"] = defaults["music_style"]
     return meta
 
 
@@ -1316,7 +1411,6 @@ def _persist_story_segment(
     user_id: str,
     new_segment: str,
     settings: Optional[dict] = None,
-    choices: Optional[dict] = None,
     meta: Optional[dict] = None,
 ) -> None:
     """追加本段为该用户小说数组的新元素（seq = 原最大下标 + 1），单行 INSERT。
@@ -1324,15 +1418,17 @@ def _persist_story_segment(
     服务器从 Dify 收到完整文本（且审核通过）就立即写入，
     与 App 是否收全无关；App 断流/卡死重启后，冷启动同步即可拉回完整文本。
     每段一行，追加不重写任何旧数据。
-    同时把生成该段时点上的"本轮三个选择"、"后续 4 变量（取不到用保底默认值）"
-    与"用户设定快照"随行落库，供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
+    同时把生成该段时点上的"本轮三个选择（choice_1/2/3，LLM② 推荐的下一轮行动，
+    取不到用保底默认值）"、"后续变量（outline/music_style）"与"用户设定快照"
+    随行落库，供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
     """
     if not new_segment or not new_segment.strip():
         return
     now = int(time.time())
     settings = settings or {}
-    choices = choices or {}
-    meta = _finalize_meta(_extract_story_meta(meta), new_segment)
+    meta = _finalize_meta(
+        _extract_story_meta(meta, settings.get("language")), new_segment
+    )
     conn = _db()
     try:
         row = conn.execute(
@@ -1344,8 +1440,9 @@ def _persist_story_segment(
             """INSERT INTO story_segments
                  (user_id, seq, content, created_at,
                   choice_1, choice_2, choice_3,
-                  outline, action_a, action_b, music_style,
-                  location, era, player_gender, player_name,
+                  user_choice,
+                  outline, music_style,
+                  location, era, player_gender, player_name, player_traits,
                   partner_gender, partner_name, partner_traits,
                   language)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1354,17 +1451,17 @@ def _persist_story_segment(
                 next_seq,
                 new_segment,
                 now,
-                (choices.get("choice_1") or ""),
-                (choices.get("choice_2") or ""),
-                (choices.get("choice_3") or ""),
+                meta["choice_1"],
+                meta["choice_2"],
+                meta["choice_3"],
+                "",  # user_choice：新段刚生成，用户尚未选择；选择后由 generate_story 覆盖写入
                 meta["outline"],
-                meta["action_a"],
-                meta["action_b"],
                 meta["music_style"],
                 (settings.get("location") or ""),
                 (settings.get("era") or ""),
                 (settings.get("player_gender") or ""),
                 (settings.get("player_name") or ""),
+                (settings.get("player_traits") or ""),
                 (settings.get("partner_gender") or ""),
                 (settings.get("partner_name") or ""),
                 (settings.get("partner_traits") or ""),
@@ -1387,6 +1484,7 @@ def _resolve_story_settings(user_id: str, data: StoryInputData) -> dict:
         "era": data.era or "",
         "player_name": data.player_name or "",
         "player_gender": data.player_gender or "",
+        "player_traits": data.player_traits or "",
         "partner_name": data.partner_name or "",
         "partner_gender": data.partner_gender or "",
         "partner_traits": data.partner_traits or "",
@@ -1399,6 +1497,7 @@ def _resolve_story_settings(user_id: str, data: StoryInputData) -> dict:
             "era",
             "player_name",
             "player_gender",
+            "player_traits",
             "partner_name",
             "partner_gender",
             "partner_traits",
@@ -1410,7 +1509,7 @@ def _resolve_story_settings(user_id: str, data: StoryInputData) -> dict:
     conn = _db()
     try:
         row = conn.execute(
-            """SELECT location, era, player_name, player_gender,
+            """SELECT location, era, player_name, player_gender, player_traits,
                       partner_name, partner_gender, partner_traits, language
                FROM story_segments WHERE user_id=? ORDER BY seq DESC LIMIT 1""",
             (user_id,),
@@ -1514,38 +1613,51 @@ async def generate_story(data: StoryInputData, request: Request):
     device_id = claims["device_id"]
     _enforce_active_device(user_id, device_id)
 
-    # 本轮选择快照：App 三个输入框的值（用户确认时上传，本轮生成时随行落库）
-    choices = {
-        "choice_1": data.choice_1 or "",
-        "choice_2": data.choice_2 or "",
-        "choice_3": data.choice_3 or "",
-    }
-    # 用户确认时，把三个输入框当前值覆盖到"最新已生成那一段"的 choice_1/2/3，
-    # 替换它原先存的推荐/默认值，记录用户实际选择的行动。
-    # 放在配额检查【之前】：即使配额不足（不允许再生成新文本），也先把用户
-    # 最新编辑的未来行动保存进数据库，且不消耗任何 LLM 资源。
+    # 用户最新选择持久化：无论最新一段，还是时间树"从这里重新开始"的历史段
+    # （rewrite_from），用户点击确定/继续时，把三个输入框当前值覆盖到对应段的
+    # choice_1/2/3，永远保持服务器保存的是用户的最新选择。
+    # 放在配额检查【之前】：即使配额不足（不允许再生成新文本），也先保存用户
+    # 最新编辑的选择，且不消耗任何 LLM 资源。
     try:
         conn = _db()
         try:
-            conn.execute(
-                """UPDATE story_segments
-                      SET choice_1=?, choice_2=?, choice_3=?
-                    WHERE user_id=?
-                      AND seq=(SELECT MAX(seq) FROM story_segments WHERE user_id=?)""",
-                (
-                    data.choice_1 or "",
-                    data.choice_2 or "",
-                    data.choice_3 or "",
-                    user_id,
-                    user_id,
-                ),
-            )
+            if data.rewrite_from is not None and data.rewrite_from >= 0:
+                # 时间树重写：覆盖到被重写的历史段
+                conn.execute(
+                    """UPDATE story_segments
+                          SET choice_1=?, choice_2=?, choice_3=?, user_choice=?
+                        WHERE user_id=? AND seq=?""",
+                    (
+                        data.choice_1 or "",
+                        data.choice_2 or "",
+                        data.choice_3 or "",
+                        data.user_input or "",  # 用户本轮实际选择文本
+                        user_id,
+                        data.rewrite_from,
+                    ),
+                )
+            else:
+                # 最新一段续写：覆盖到最新已生成段
+                conn.execute(
+                    """UPDATE story_segments
+                          SET choice_1=?, choice_2=?, choice_3=?, user_choice=?
+                        WHERE user_id=?
+                          AND seq=(SELECT MAX(seq) FROM story_segments WHERE user_id=?)""",
+                    (
+                        data.choice_1 or "",
+                        data.choice_2 or "",
+                        data.choice_3 or "",
+                        data.user_input or "",  # 用户本轮实际选择文本
+                        user_id,
+                        user_id,
+                    ),
+                )
             conn.commit()
         finally:
             conn.close()
     except Exception:
-        # 覆盖失败不影响生成主流程
-        logger.warning("覆盖最新段选择失败", exc_info=True)
+        # 保存用户选择失败不影响生成主流程
+        logger.warning("保存用户选择失败", exc_info=True)
 
     # 小说生成工作流全局每日配额（默认 1000 次 / 24 小时滚动）
     _check_story_quota(int(time.time()))
@@ -1579,6 +1691,7 @@ async def generate_story(data: StoryInputData, request: Request):
             settings.get("era") or "",
             settings.get("player_name") or "",
             settings.get("player_gender") or "",
+            settings.get("player_traits") or "",
             settings.get("partner_name") or "",
             settings.get("partner_gender") or "",
             settings.get("partner_traits") or "",
@@ -1604,6 +1717,7 @@ async def generate_story(data: StoryInputData, request: Request):
             "era": _fill(settings.get("era") or ""),
             "player_name": _fill(settings.get("player_name") or ""),
             "player_gender": _fill(settings.get("player_gender") or ""),
+            "player_traits": _fill(settings.get("player_traits") or ""),
             "partner_name": _fill(settings.get("partner_name") or ""),
             "partner_gender": _fill(settings.get("partner_gender") or ""),
             "partner_traits": _fill(settings.get("partner_traits") or ""),
@@ -1636,7 +1750,7 @@ async def generate_story(data: StoryInputData, request: Request):
                 sent_first = False
                 outputs = {}
                 think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
-                meta = _extract_story_meta({})  # 后续 4 变量；workflow_finished 时更新，失败用保底默认
+                meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/outline/music_style）；workflow_finished 时更新，失败用保底默认
 
                 async for line in resp.aiter_lines():
                     if not line.strip().startswith("data:"):
@@ -1657,17 +1771,22 @@ async def generate_story(data: StoryInputData, request: Request):
                         if not sent_first:
                             first_buf += txt
                             if len(first_buf) >= STORY_FIRST_CHUNK:
-                                if not await _moderate_story(first_buf):
-                                    yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                                mr = await _moderate_story(first_buf)
+                                fail = _moderation_failure_sse(mr)
+                                if fail is not None:
+                                    yield _sse(fail)
                                     return
                                 yield _sse({"event": "chunk", "text": first_buf})
+                                logger.warning("STREAM first_chunk sent len=%d", len(first_buf))
                                 sent_first = True
                         else:
                             rest_buf += txt
 
                     elif etype == "workflow_finished":
                         outputs = edata.get("outputs") or {}
-                        meta = _extract_story_meta(outputs)
+                        meta = _extract_story_meta(
+                            outputs, settings.get("language")
+                        )
                         if not sent_first:
                             # 全文不足首段字数：整体审一次再发
                             final_all = _clean_story_text(
@@ -1676,8 +1795,10 @@ async def generate_story(data: StoryInputData, request: Request):
                             if not final_all or not final_all.strip():
                                 yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
                                 return
-                            if not await _moderate_story(final_all):
-                                yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                            mr = await _moderate_story(final_all)
+                            fail = _moderation_failure_sse(mr)
+                            if fail is not None:
+                                yield _sse(fail)
                                 return
                             final_segment = final_all
                             yield _sse({"event": "chunk", "text": final_all})
@@ -1699,15 +1820,24 @@ async def generate_story(data: StoryInputData, request: Request):
                                     audit_text = out_text[STORY_SECOND_AUDIT_START:]
                                 else:
                                     audit_text = rest
-                                if not await _moderate_story(audit_text):
-                                    yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                                mr = await _moderate_story(audit_text)
+                                fail = _moderation_failure_sse(mr)
+                                if fail is not None:
+                                    logger.warning("STREAM moderate2 FAILED: %s", mr.value)
+                                    yield _sse(fail)
                                     return
+                                logger.warning("STREAM moderate2 OK")
                                 yield _sse({"event": "reveal", "text": rest, "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
                             else:
                                 yield _sse({"event": "reveal", "text": "", "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
                         # 服务器已从 Dify 收到完整文本且审核通过：立即持久化，与 App 是否收全无关
                         fmeta = _finalize_meta(meta, final_segment)
-                        _persist_story_segment(user_id, final_segment, settings, choices, fmeta)
+                        try:
+                            _persist_story_segment(user_id, final_segment, settings, fmeta)
+                            logger.warning("STREAM persisted ok final_len=%d", len(final_segment))
+                        except Exception as pe:
+                            logger.warning("STREAM persist EXCEPTION: %s", pe, exc_info=True)
+                        logger.warning("STREAM yielding done")
                         yield _sse({"event": "done", "outputs": {**outputs, **fmeta}})
                         return
 
@@ -1717,28 +1847,36 @@ async def generate_story(data: StoryInputData, request: Request):
 
                 # 流意外结束（未收到 workflow_finished）：兜底，但剩余内容仍须先审核再 reveal
                 if not sent_first and full_text:
-                    if await _moderate_story(full_text):
-                        yield _sse({"event": "chunk", "text": full_text})
-                        _persist_story_segment(user_id, full_text, settings, choices, _finalize_meta(meta, full_text))
-                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
+                    mr = await _moderate_story(full_text)
+                    fail = _moderation_failure_sse(mr)
+                    if fail is not None:
+                        yield _sse(fail)
                     else:
-                        yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
+                        yield _sse({"event": "chunk", "text": full_text})
+                        _persist_story_segment(user_id, full_text, settings, _finalize_meta(meta, full_text))
+                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
                 elif rest_buf:
-                    if await _moderate_story(rest_buf):
+                    mr = await _moderate_story(rest_buf)
+                    fail = _moderation_failure_sse(mr)
+                    if fail is not None:
+                        yield _sse(fail)
+                    else:
                         yield _sse({"event": "reveal", "text": rest_buf, "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
                         # full_text = 首段 + 剩余，即完整文本
-                        _persist_story_segment(user_id, full_text, settings, choices, _finalize_meta(meta, full_text))
+                        _persist_story_segment(user_id, full_text, settings, _finalize_meta(meta, full_text))
                         yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
-                    else:
-                        yield _sse({"event": "abort", "reason": "生成内容包含违规信息，已中止"})
                 else:
                     if not full_text or not full_text.strip():
+                        logger.warning("STREAM fallback empty_output full_len=%d sent_first=%s", len(full_text), sent_first)
                         yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
                     else:
+                        logger.warning("STREAM fallback unexpected-end full_len=%d sent_first=%s rest_len=%d", len(full_text), sent_first, len(rest_buf))
                         yield _sse({"event": "error", "message": "生成流意外中断"})
         except httpx.RequestError as exc:
+            logger.warning("STREAM RequestError: %s", exc, exc_info=True)
             yield _sse({"event": "error", "message": f"与 Dify 通信异常: {str(exc)}"})
         except Exception as e:
+            logger.warning("STREAM Exception: %s", e, exc_info=True)
             yield _sse({"event": "error", "message": f"网关异常: {str(e)}"})
 
     return StreamingResponse(
@@ -1942,7 +2080,7 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     try:
         if limit > 0 and before_seq >= 0:
             rows = conn.execute(
-                """SELECT seq, content, choice_1, choice_2, choice_3
+                """SELECT seq, content, choice_1, choice_2, choice_3, user_choice
                    FROM story_segments
                    WHERE user_id=? AND seq < ? ORDER BY seq DESC LIMIT ?""",
                 (user_id, before_seq, limit),
@@ -1950,7 +2088,7 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
             rows = list(reversed(rows))
         elif limit > 0:
             rows = conn.execute(
-                """SELECT seq, content, choice_1, choice_2, choice_3
+                """SELECT seq, content, choice_1, choice_2, choice_3, user_choice
                    FROM story_segments
                    WHERE user_id=? ORDER BY seq DESC LIMIT ?""",
                 (user_id, limit),
@@ -1958,7 +2096,7 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
             rows = list(reversed(rows))
         else:
             rows = conn.execute(
-                """SELECT seq, content, choice_1, choice_2, choice_3
+                """SELECT seq, content, choice_1, choice_2, choice_3, user_choice
                    FROM story_segments
                    WHERE user_id=? ORDER BY seq ASC""",
                 (user_id,),
@@ -1967,6 +2105,13 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
             """SELECT COALESCE(MAX(created_at), 0) AS u FROM story_segments WHERE user_id=?""",
             (user_id,),
         ).fetchone()["u"]
+        # 用户的金标准语言：取最新一段的语言快照（老用户换新设备时据此覆盖本地语言）
+        lang_row = conn.execute(
+            """SELECT language FROM story_segments
+               WHERE user_id=? ORDER BY seq DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        language = (lang_row["language"] or "") if lang_row else ""
         total = None
         if limit <= 0:
             total = conn.execute(
@@ -1976,6 +2121,7 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
         conn.close()
     segments = []
     choices = []
+    user_choices = []
     for r in rows:
         if isinstance(r["content"], str):
             segments.append(r["content"])
@@ -1986,13 +2132,23 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
                     (r["choice_3"] or "") if isinstance(r["choice_3"], str) else "",
                 ]
             )
+            user_choices.append(
+                (r["user_choice"] or "")
+                if isinstance(r["user_choice"], str)
+                else ""
+            )
     start_seq = rows[0]["seq"] if rows else 0
     resp = {
         "segments": segments,
         # 与 segments 一一对应的三个选项（choice_1/2/3），App 显示在对应段落的按钮中
+        # 并预填正文底部第 1/2/3 个输入框
         "choices": choices,
+        # 与 segments 一一对应的用户本轮实际选择文本（未选择为空）
+        "user_choices": user_choices,
         "start_seq": start_seq,
         "updated_at": updated_at,
+        # 用户的金标准语言（最新一段的语言快照；老用户换新设备时 App 用它覆盖本地语言）
+        "language": language,
     }
     if total is not None:
         resp["total"] = total
@@ -2041,6 +2197,22 @@ async def story_put(data: StoryData, request: Request):
     finally:
         conn.close()
     return {"status": "ok", "applied": True}
+
+
+@app.post("/api/story/reset")
+async def story_reset(request: Request):
+    """重新开始：清空该用户全部小说正文（服务器权威）。
+
+    App 在「重新开始」确认后调用本接口删除服务器上该用户的所有小说正文，
+    成功后 App 会重启；重启后同步拉取为空 → 判定为新用户 → 从设置重新开始。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
+    _reset_story(user_id)
+    return {"status": "ok", "cleared": True}
 
 
 def _extract_token(data: Optional[InputData], request: Request) -> str:

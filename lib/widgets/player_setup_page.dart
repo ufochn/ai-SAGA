@@ -4,6 +4,7 @@ import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/text_width.dart';
+import 'package:ai_saga/logic/trait_defaults.dart';
 
 /// 主角设定页面 - 性别 + 姓名（iOS风格表单）
 class PlayerSetupPage extends StatefulWidget {
@@ -26,6 +27,7 @@ class PlayerSetupPage extends StatefulWidget {
 
 class _PlayerSetupPageState extends State<PlayerSetupPage> {
   final TextEditingController _playerNameController = TextEditingController();
+  final TextEditingController _playerTraitsController = TextEditingController();
   final FocusNode _playerNameFocusNode = FocusNode();
 
   int _playerGenderIndex = 0; // 0=男, 1=女
@@ -33,15 +35,23 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
   bool _playerNameEdited = false;
 
+  /// 标记用户是否已手动编辑过特质（防止性别切换时覆盖用户输入）
+  bool _playerTraitsEdited = false;
+
   /// 最近一次加载姓名所使用的语言（用于检测语言变更）
   String? _loadedLanguage;
 
   /// 姓名输入字数上限（按显示宽度统计）
-  static const int _maxNameLength = 20;
+  static const int _maxNameLength = 30;
 
-  /// 当前姓名是否超过字数上限（宽字符=2、窄字符=1）
+  /// 当前姓名是否超过字数上限（宽字符=3、窄字符=1）
   bool get _isNameOverLimit =>
       weightedCharCount(_playerNameController.text) > _maxNameLength;
+
+  /// 当前主角性格特质是否超过字数上限
+  /// （宽字符按 3 计、窄字符按 1 计，全部累加不超过 150）
+  bool get _isTraitsOverLimit =>
+      isTraitsOverLimit(_playerTraitsController.text);
 
   @override
   void initState() {
@@ -58,6 +68,15 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     _playerNameController.text = savedName.isNotEmpty
         ? savedName
         : _getDefaultName(genderIndex: _playerGenderIndex);
+    // 特质默认值：按性别 + 语言自动填入；用户此前已确认过则恢复已保存值
+    final savedTraits = SetupDraft.instance.playerTraits.trim();
+    _playerTraitsController.text = savedTraits.isNotEmpty
+        ? savedTraits
+        : buildDefaultTraits(
+            genderIndex: _playerGenderIndex,
+            language: _language,
+            location: SetupDraft.instance.location,
+          );
 
     // 记录当前已加载语言（用于检测语言变更）
     _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
@@ -93,8 +112,15 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
         _playerGenderIndex = 0;
         SetupDraft.instance.playerName = '';
         SetupDraft.instance.playerGender = '';
+        SetupDraft.instance.playerTraits = '';
         _playerNameController.text = _getDefaultName(
           genderIndex: _playerGenderIndex,
+        );
+        _playerTraitsEdited = false;
+        _playerTraitsController.text = buildDefaultTraits(
+          genderIndex: _playerGenderIndex,
+          language: newLanguage,
+          location: SetupDraft.instance.location,
         );
         _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
       });
@@ -104,6 +130,7 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   @override
   void dispose() {
     _playerNameController.dispose();
+    _playerTraitsController.dispose();
     _playerNameFocusNode.dispose();
     super.dispose();
   }
@@ -173,16 +200,26 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
       if (!_playerNameEdited) {
         _playerNameController.text = _getDefaultName(genderIndex: value);
       }
+      if (!_playerTraitsEdited) {
+        // 性别切换时，特质输入框随性别自动换成对应的默认文案
+        _playerTraitsController.text = buildDefaultTraits(
+          genderIndex: value,
+          language: _language,
+          location: SetupDraft.instance.location,
+        );
+      }
     });
   }
 
   void _onSubmit() {
     final playerName = _playerNameController.text.trim();
-    if (playerName.isEmpty) return;
+    final playerTraits = _playerTraitsController.text.trim();
+    if (playerName.isEmpty || playerTraits.isEmpty) return;
     SoundService.playHorror2();
     // 保存主角设定并进入下一步（审核统一在最终确认页进行）
     SetupDraft.instance.playerName = playerName;
     SetupDraft.instance.playerGender = _playerGenderIndex == 0 ? '男' : '女';
+    SetupDraft.instance.playerTraits = playerTraits;
     widget.onComplete();
   }
 
@@ -410,11 +447,89 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     }
   }
 
+  /// 根据语言返回特质标签
+  String _getTraitsLabel() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '您的個人特質';
+      case 'en':
+        return 'Your Personal Traits';
+      case 'es':
+        return 'Tus Rasgos Personales';
+      case 'fr':
+        return 'Vos Traits Personnels';
+      case 'de':
+        return 'Deine Persönlichen Eigenschaften';
+      case 'pt':
+        return 'Suas Características Pessoais';
+      case 'ja':
+        return 'あなたの特徴';
+      case 'ko':
+        return '당신의 특징';
+      default:
+        return '您的个人特质';
+    }
+  }
+
+  /// 根据语言返回特质提示
+  String _getTraitsHint() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '性格、外貌、喜好等，請輸入您對主角的設定。';
+      case 'en':
+        return 'Personality, appearance, hobbies, etc. Describe your character.';
+      case 'es':
+        return 'Personalidad, apariencia, pasatiempos, etc. Describe a tu personaje.';
+      case 'fr':
+        return 'Personnalité, apparence, loisirs, etc. Décrivez votre personnage.';
+      case 'de':
+        return 'Persönlichkeit, Aussehen, Hobbys usw. Beschreiben Sie Ihren Charakter.';
+      case 'pt':
+        return 'Personalidade, aparência, hobbies, etc. Descreva seu personagem.';
+      case 'ja':
+        return '性格、外見、趣味など、あなたのキャラクターの設定を入力してください。';
+      case 'ko':
+        return '성격, 외모, 취미 등 자신의 캐릭터 설정을 입력하세요.';
+      default:
+        return '性格、外貌、喜好等，请输入您对主角的设定。';
+    }
+  }
+
+  /// 根据语言返回特质输入框占位文字
+  String _getTraitsPlaceholder() {
+    switch (_language) {
+      case 'zh-TW':
+      case 'yue':
+        return '請輸入性格、外貌、喜好等';
+      case 'en':
+        return 'Enter personality, appearance, hobbies, etc.';
+      case 'es':
+        return 'Ingrese personalidad, apariencia, pasatiempos, etc.';
+      case 'fr':
+        return 'Saisissez la personnalité, l\'apparence, les loisirs, etc.';
+      case 'de':
+        return 'Persönlichkeit, Aussehen, Hobbys usw. eingeben';
+      case 'pt':
+        return 'Digite personalidade, aparência, hobbies, etc.';
+      case 'ja':
+        return '性格、外見、趣味などを入力';
+      case 'ko':
+        return '성격, 외모, 취미 등을 입력하세요';
+      default:
+        return '请输入性格、外貌、喜好等';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
     final canSubmit =
-        !_isNameOverLimit && _playerNameController.text.trim().isNotEmpty;
+        !_isNameOverLimit &&
+        !_isTraitsOverLimit &&
+        _playerNameController.text.trim().isNotEmpty &&
+        _playerTraitsController.text.trim().isNotEmpty;
     return CupertinoPageScaffold(
       backgroundColor: isDark
           ? AppTheme.pageBackgroundDark
@@ -578,6 +693,86 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                                   ? AppTheme.secondaryTextDark
                                   : AppTheme.secondaryTextLight,
                             ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              // 主角性格特质卡片
+              Container(
+                decoration: BoxDecoration(
+                  color: isDark
+                      ? AppTheme.cardBackgroundDark
+                      : AppTheme.cardBackgroundLight,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _getTraitsLabel(),
+                            style: TextStyle(
+                              fontSize: 15,
+                              color: isDark
+                                  ? AppTheme.primaryTextDark
+                                  : AppTheme.primaryTextLight,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _getTraitsHint(),
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: isDark
+                                  ? AppTheme.secondaryTextDark
+                                  : AppTheme.secondaryTextLight,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          CupertinoTextField(
+                            controller: _playerTraitsController,
+                            placeholder: _getTraitsPlaceholder(),
+                            placeholderStyle: TextStyle(
+                              color: isDark
+                                  ? AppTheme.tertiaryTextDark
+                                  : AppTheme.tertiaryTextLight,
+                            ),
+                            maxLines: 3,
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: isDark
+                                  ? AppTheme.fieldBackgroundDark
+                                  : AppTheme.fieldBackgroundLight,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: isDark
+                                    ? AppTheme.inputBorderDark
+                                    : AppTheme.inputBorderLight,
+                                width: 0.5,
+                              ),
+                            ),
+                            style: TextStyle(
+                              color: _isTraitsOverLimit
+                                  ? (isDark
+                                        ? AppTheme.destructiveRedDark
+                                        : AppTheme.destructiveRedLight)
+                                  : (isDark
+                                        ? AppTheme.primaryTextDark
+                                        : AppTheme.primaryTextLight),
+                              fontSize: 17,
+                            ),
+                            onChanged: (value) {
+                              // 用户手动输入后，性别切换不再覆盖其自定义内容
+                              _playerTraitsEdited = true;
+                              setState(() {});
+                            },
                           ),
                         ],
                       ),

@@ -7,8 +7,10 @@ import 'package:ai_saga/logic/text_width.dart';
 ///
 /// 每个已生成的历史正文段落下方固定显示三个输入框（选择一/选择二/选择三），
 /// 每个输入框下方各带一个按钮。历史段落的按钮文字为"从这里重新开始"，
-/// 该按钮是"时间树"功能的占位：点击暂不跳转；打字期间按钮变灰不可点击。
-class StoryChoiceCard extends StatelessWidget {
+/// 该按钮是"时间树"功能的入口：点击后把本段三个输入框当前值（用户可能已编辑）
+/// 连同本段绝对下标一起回传给上层，由上层覆盖保存到服务器对应段，并从此处重写续写。
+/// 打字期间按钮变灰不可点击。
+class StoryChoiceCard extends StatefulWidget {
   /// 本地化后的按钮文字（历史段落："从这里重新开始"）
   final String buttonText;
 
@@ -22,15 +24,16 @@ class StoryChoiceCard extends StatelessWidget {
   /// 在代码与数据库中定位到正确的段落（按钮 ↔ 文本 ↔ 数据库行的对应）。
   final int segmentIndex;
 
-  /// 重写按钮回调：携带本卡片所属的段下标 + 该段输入框当前文本
-  /// （时间树"从这里重写"：用该文本作为从该段续写的用户输入）
-  final void Function(int segmentIndex, String text)? onPressed;
+  /// 重写按钮回调：携带本卡片所属的段下标 + 被点击输入框的文本 +
+  /// 本段三个输入框的当前值（用户可能已编辑，需覆盖保存到服务器该段）。
+  final void Function(int segmentIndex, String text, List<String> choices)?
+      onPressed;
 
   /// 本段对应的三个选项内容（choice_1/2/3，与正文一起从服务器拉取），
   /// 预填到三个输入框显示；缺省/不足 3 个时对应框留空。
   final List<String>? initialValues;
 
-  /// 加权字数上限（汉字/日文/韩文按 2 字，英文按 1 字），与正文底部输入框一致
+  /// 加权字数上限（汉字/日文/韩文按 3 字，英文按 1 字），与正文底部输入框一致
   final int maxLength;
 
   const StoryChoiceCard({
@@ -41,8 +44,52 @@ class StoryChoiceCard extends StatelessWidget {
     required this.enabled,
     this.onPressed,
     this.initialValues,
-    this.maxLength = 200,
+    this.maxLength = 300,
   });
+
+  @override
+  State<StoryChoiceCard> createState() => _StoryChoiceCardState();
+}
+
+class _StoryChoiceCardState extends State<StoryChoiceCard> {
+  /// 三个输入框的控制器（由本卡片持有，按钮点击时能取到整段三个值）
+  late final List<TextEditingController> _controllers;
+
+  @override
+  void initState() {
+    super.initState();
+    final init = widget.initialValues ?? const <String>[];
+    _controllers = [
+      for (int i = 0; i < 3; i++)
+        TextEditingController(
+          text: (i < init.length ? init[i] : null) ?? '',
+        ),
+    ];
+  }
+
+  @override
+  void didUpdateWidget(covariant StoryChoiceCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 服务器拉取的选项变化（如重写后重新同步）时同步刷新输入框
+    if (oldWidget.initialValues != widget.initialValues) {
+      final init = widget.initialValues ?? const <String>[];
+      for (int i = 0; i < 3; i++) {
+        final v = (i < init.length ? init[i] : null) ?? '';
+        if (_controllers[i].text != v) _controllers[i].text = v;
+      }
+    }
+  }
+
+  List<String> get _currentChoices =>
+      [for (final c in _controllers) c.text.trim()];
+
+  @override
+  void dispose() {
+    for (final c in _controllers) {
+      c.dispose();
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -53,15 +100,16 @@ class StoryChoiceCard extends StatelessWidget {
         children: [
           for (int i = 0; i < 3; i++) ...[
             _StoryChoiceInputRow(
-              segmentIndex: segmentIndex,
-              placeholder: inputPlaceholder,
-              buttonText: buttonText,
-              enabled: enabled,
-              onPressed: onPressed,
-              initialValue: (initialValues != null && i < initialValues!.length)
-                  ? initialValues![i]
-                  : '',
-              maxLength: maxLength,
+              controller: _controllers[i],
+              placeholder: widget.inputPlaceholder,
+              buttonText: widget.buttonText,
+              enabled: widget.enabled,
+              onPressed: () => widget.onPressed?.call(
+                widget.segmentIndex,
+                _controllers[i].text.trim(),
+                _currentChoices,
+              ),
+              maxLength: widget.maxLength,
             ),
             if (i < 2) const SizedBox(height: 10),
           ],
@@ -73,22 +121,20 @@ class StoryChoiceCard extends StatelessWidget {
 
 /// 卡片中的一行：输入框 + 下方全宽按钮
 class _StoryChoiceInputRow extends StatefulWidget {
-  final int segmentIndex;
   final String placeholder;
   final String buttonText;
   final bool enabled;
-  final void Function(int segmentIndex, String text)? onPressed;
-  final String initialValue;
+  final VoidCallback? onPressed;
+  final TextEditingController controller;
   final int maxLength;
 
   const _StoryChoiceInputRow({
-    required this.segmentIndex,
     required this.placeholder,
     required this.buttonText,
     required this.enabled,
+    required this.controller,
     this.onPressed,
-    this.initialValue = '',
-    this.maxLength = 200,
+    this.maxLength = 300,
   });
 
   @override
@@ -96,30 +142,16 @@ class _StoryChoiceInputRow extends StatefulWidget {
 }
 
 class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
-  final TextEditingController _textController = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    // 预填本段对应的选项内容（来自服务器拉取的 choice_1/2/3）
-    _textController.text = widget.initialValue;
-  }
-
-  @override
-  void dispose() {
-    _textController.dispose();
-    super.dispose();
-  }
-
-  /// 是否超过加权字数上限（与 TextInputPanel 一致：汉字/日文/韩文按 2 字，
+  /// 是否超过加权字数上限（与 TextInputPanel 一致：汉字/日文/韩文按 3 字，
   /// 英文按 1 字；超限不截断输入，仅文字变红、按钮置灰禁用）
   bool get _isOverLimit =>
-      weightedCharCount(_textController.text) > widget.maxLength;
+      weightedCharCount(widget.controller.text) > widget.maxLength;
 
   @override
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
     final overLimit = _isOverLimit;
+    final canPress = widget.enabled && !overLimit && widget.onPressed != null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -138,7 +170,9 @@ class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
             ),
           ),
           child: CupertinoTextField(
-            controller: _textController,
+            controller: widget.controller,
+            // 生成/打字阶段（enabled=false）置灰不可输入，但输入框保持显示（不消失）
+            enabled: widget.enabled,
             maxLines: 5,
             minLines: 1,
             keyboardType: TextInputType.multiline,
@@ -167,17 +201,14 @@ class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
           ),
         ),
         const SizedBox(height: 8),
-        // 时间树占位按钮（按钮位于输入框下方；超限或打字期间按钮变灰不可点击）
+        // 时间树"从这里重新开始"按钮（按钮位于输入框下方；超限或打字期间按钮变灰不可点击）
         SizedBox(
           height: 44,
           child: CupertinoButton.filled(
-            onPressed: widget.enabled && !overLimit
+            onPressed: canPress
                 ? () {
                     SoundService.playClick();
-                    widget.onPressed?.call(
-                      widget.segmentIndex,
-                      _textController.text.trim(),
-                    );
+                    widget.onPressed!();
                   }
                 : null,
             borderRadius: BorderRadius.circular(10),
@@ -191,7 +222,7 @@ class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
-                color: widget.enabled && !overLimit
+                color: canPress
                     ? AppTheme.buttonText
                     : (isDark
                           ? AppTheme.buttonDisabledTextDark

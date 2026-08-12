@@ -493,6 +493,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     sb.writeln('Era: ${SetupDraft.instance.era}');
     sb.writeln('Player Gender: ${SetupDraft.instance.playerGender}');
     sb.writeln('Player Name: ${SetupDraft.instance.playerName}');
+    sb.writeln('Player Traits: ${SetupDraft.instance.playerTraits}');
     sb.writeln('Partner Gender: ${SetupDraft.instance.partnerGender}');
     sb.writeln('Partner Name: ${SetupDraft.instance.partnerName}');
     sb.write('Partner Traits: ${SetupDraft.instance.partnerTraits}');
@@ -612,7 +613,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
                         label: _getPlayerLabel(),
                         gender: _genderText(SetupDraft.instance.playerGender),
                         name: SetupDraft.instance.playerName,
-                        traits: null,
+                        traits: SetupDraft.instance.playerTraits,
                         onEdit: () => widget.onEdit(3),
                       ),
                       _buildCharacterCard(

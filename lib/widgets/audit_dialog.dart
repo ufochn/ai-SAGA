@@ -215,6 +215,18 @@ class _AuditDialogState extends State<AuditDialog> {
         return '偵測到多裝置同時登入';
       case 'en':
         return 'Multiple Devices Detected';
+      case 'es':
+        return 'Se detectaron varios dispositivos';
+      case 'fr':
+        return 'Plusieurs appareils détectés';
+      case 'de':
+        return 'Mehrere Geräte erkannt';
+      case 'pt':
+        return 'Vários dispositivos detectados';
+      case 'ja':
+        return '複数のデバイスを検出しました';
+      case 'ko':
+        return '여러 기기가 감지되었습니다';
       default:
         return '检测到多设备同时登入';
     }
@@ -229,6 +241,18 @@ class _AuditDialogState extends State<AuditDialog> {
         return '你似乎有兩個以上嘅裝置同時登入呢個 App。為咗保持小說同步，呢個 App 需要重新啟動。';
       case 'en':
         return 'It looks like this App is signed in on more than one device at the same time. To keep your story in sync, this App needs to restart.';
+      case 'es':
+        return 'Parece que esta App inició sesión en más de un dispositivo al mismo tiempo. Para mantener sincronizada tu historia, esta App debe reiniciarse.';
+      case 'fr':
+        return 'Il semble que cette app soit connectée sur plus d\'un appareil en même temps. Pour garder votre histoire synchronisée, cette app doit redémarrer.';
+      case 'de':
+        return 'Diese App scheint gleichzeitig auf mehr als einem Gerät angemeldet zu sein. Um Ihre Geschichte synchron zu halten, muss diese App neu gestartet werden.';
+      case 'pt':
+        return 'Parece que este app está conectado em mais de um dispositivo ao mesmo tempo. Para manter sua história sincronizada, este app precisa ser reiniciado.';
+      case 'ja':
+        return 'このアプリが複数のデバイスで同時にログインしているようです。小説の同期を保つため、このアプリを再起動する必要があります。';
+      case 'ko':
+        return '이 앱이 여러 기기에서 동시에 로그인된 것 같습니다. 이야기 동기화를 유지하려면 이 앱을 다시 시작해야 합니다.';
       default:
         return '您似乎有两个以上的设备在同时登入本 App。为保持小说同步，本 App 需要重新启动。';
     }
@@ -242,6 +266,18 @@ class _AuditDialogState extends State<AuditDialog> {
         return '同意';
       case 'en':
         return 'OK';
+      case 'es':
+        return 'OK';
+      case 'fr':
+        return 'OK';
+      case 'de':
+        return 'OK';
+      case 'pt':
+        return 'OK';
+      case 'ja':
+        return 'OK';
+      case 'ko':
+        return '확인';
       default:
         return '同意';
     }
@@ -452,6 +488,14 @@ class _AuditDialogState extends State<AuditDialog> {
         return '關閉';
       case 'en':
         return 'Close';
+      case 'es':
+        return 'Cerrar';
+      case 'fr':
+        return 'Fermer';
+      case 'de':
+        return 'Schließen';
+      case 'pt':
+        return 'Fechar';
       case 'ja':
         return '閉じる';
       case 'ko':

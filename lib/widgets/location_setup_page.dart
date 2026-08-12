@@ -37,9 +37,9 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
   String? _loadedLanguage;
 
   /// 输入字数上限（按显示宽度统计）
-  static const int _maxTextLength = 20;
+  static const int _maxTextLength = 30;
 
-  /// 当前输入是否超过字数上限（宽字符=2、窄字符=1）
+  /// 当前输入是否超过字数上限（宽字符=3、窄字符=1）
   bool get _isOverLimit =>
       weightedCharCount(_locationController.text) > _maxTextLength;
 

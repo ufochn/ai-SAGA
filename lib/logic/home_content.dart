@@ -12,7 +12,6 @@ import 'package:ai_saga/widgets/era_setup_page.dart';
 import 'package:ai_saga/widgets/player_setup_page.dart';
 import 'package:ai_saga/widgets/character_setup_page.dart';
 
-import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
@@ -95,18 +94,6 @@ class _CompensatingScrollPosition extends ScrollPositionWithSingleContext {
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
 
-/// 字符流生成器 - 用于生成重复的字符序列
-class CharacterStream {
-  final String character;
-  final int count;
-
-  const CharacterStream({required this.character, required this.count});
-
-  /// 生成字符流字符串
-  String generate() {
-    return character * count;
-  }
-}
 
 /// 正文中的用户选择节点（未来"时间树"返回功能的数据点）
 class _ChoiceRecord {
@@ -136,8 +123,6 @@ class HomeContent extends StatefulWidget {
 
 class _HomeContentState extends State<HomeContent>
     with SingleTickerProviderStateMixin {
-  /// 尚无任何正文时显示的占位文本（本地生成，不持久化）
-  String _emptyStoryText = '';
   final _CompensatingScrollController _scrollController =
       _CompensatingScrollController();
   late final PageController _pageController;
@@ -192,18 +177,11 @@ class _HomeContentState extends State<HomeContent>
   /// 冷启动同步失败原因（非空时显示错误并提供重试）
   String? _startupSyncError;
 
-  /// 违规中止原因（非空时隐藏正文并显示该提示）
-  String? _storyAbortReason;
-
-  /// 是否正在接收/生成正文（流式进行中）：期间隐藏正文下方的输入框
+  /// 是否正在接收/生成正文（流式进行中）
   bool _storyStreaming = false;
 
   /// 正文是否已由打字机彻底显示完成：完成后恢复显示下方输入框
   bool _storyTyped = true;
-
-  /// 本次流式正文是否已完整接收完成（只有收到 done 才为 true）。
-  /// 断流/出错未收到 done 时保持 false，禁止基于残缺文本续写。
-  bool _storyReceivedCompletely = true;
 
   /// 用户选择节点：正文中"用户选择：xxx" + 时间树返回占位按钮
   final List<_ChoiceRecord> _choices = [];
@@ -217,50 +195,36 @@ class _HomeContentState extends State<HomeContent>
   String _inputChoice2 = '';
   String _inputChoice3 = '';
 
-  /// 第 2、3 个输入框的外部控制器：收到服务器推荐行动（action_a/action_b）后预填
+  /// 第 2、3 个输入框的外部控制器：收到服务器推荐选择（choice_2/3，LLM② 推荐的两项行动）后预填。
+  /// 第 1 个输入框是用户自由输入：无控制器、不预填，仅显示自由输入提示占位。
   final TextEditingController _choice2Ctrl = TextEditingController();
   final TextEditingController _choice3Ctrl = TextEditingController();
 
-  /// 是否已收到本轮的推荐行动（action_a/action_b）：没收到就不显示输入框
+  /// 是否已收到本轮的推荐选择（choice_1/2/3）：没收到就不显示输入框
   bool _hasRecommendedActions = false;
+
+  /// 是否已把"下方输入区"激活显示过：一旦激活（首轮收到推荐后 / 老用户启动预填后），
+  /// 后续生成期间保持可见（仅灰化禁用），不再随流式阶段消失。
+  bool _storyInputsShown = false;
+
+  /// 本轮生成开始前的正文段数：生成期间若正文段数未超过它，说明新内容尚未到达，
+  /// 用于在末尾显示"半屏空白 + 生成提示"占位。
+  int _generationStartLen = 0;
 
   @override
   void initState() {
     super.initState();
-    // 占位文本：本地生成，不持久化
-    _emptyStoryText = const CharacterStream(
-      character: '正',
-      count: 1000,
-    ).generate();
-
-    // 恢复历史小说正文（本地只存已加载的尾部；绝对下标从存储恢复，与服务器对齐）
-    final savedTexts = StorageService.getMainTextList();
-    if (savedTexts.isNotEmpty) {
-      _storyTexts.addAll(savedTexts);
-      _storyStartIndex = StorageService.getMainTextStartIndex();
-    }
-    if (_storyTexts.isNotEmpty) {
-      // 已有小说内容：启动时只显示最后一个元素，向上滑动逐步加载前文
-      _sessionStreamStartIndex = _storyTexts.length;
-      _visibleStartIndex = _storyTexts.length - 1;
-    }
     _scrollController.addListener(_onScroll);
 
-    if (!StorageService.isInitialized()) {
-      // 未最终确认前所有设置仅存于内存草稿；每次进入设置流程先清空草稿
-      SetupDraft.instance.reset();
-      // 语言已在轻授权前选择（新用户经 LanguageFirstGate）或已有历史数据：
-      // 跳过语言页，从地点设定开始；若语言尚未选择，则仍从语言页开始。
-      _setupStep = StorageService.getLanguage().isEmpty ? 0 : 1;
-      showMenuNotifier.value = false;
-    } else {
-      // 已初始化（老用户）：直接进正式主页面，不经过确认页；
-      // 冷启动先同步服务器数据（数据库单方面刷新 App 数据），完成后才显示正文
-      _setupStep = 6;
-      showMenuNotifier.value = true;
-      _startupSyncing = true;
-      _performStartupSync();
-    }
+    // 新/老用户判定以服务器为准：所有用户冷启动都先到服务器验证身份。
+    // - 服务器上存有小说正文（story_segments 有记录）→ 老用户
+    //   （含安卓/苹果老用户换新设备：账号稳定，仍能识别出有历史正文）；
+    // - 服务器上没有存储任何小说正文 → 新用户，从头（语言页）重新开始设置。
+    // 先进入主内容分支显示"同步/验证中"页面，同步完成后按服务器数据决定去向。
+    _setupStep = 6;
+    showMenuNotifier.value = true;
+    _startupSyncing = true;
+    _performStartupSync();
     // 记录当前已选语言，用于检测后续用户是否切换语言
     _confirmedLanguage = StorageService.getLanguage();
 
@@ -371,6 +335,22 @@ class _HomeContentState extends State<HomeContent>
           _segmentChoices[earlier.startSeq + i] =
               (i < earlier.choices.length ? earlier.choices[i] : const <String>[]);
         }
+        // 恢复这批更早段的"用户本轮实际选择"节点（前插，保持按段序升序；未选择为空）
+        final newChoices = <_ChoiceRecord>[];
+        for (int i = 0; i < earlier.segments.length; i++) {
+          final uc =
+              i < earlier.userChoices.length ? earlier.userChoices[i] : '';
+          if (uc.trim().isNotEmpty) {
+            newChoices.add(
+              _ChoiceRecord(
+                text: uc,
+                segmentIndex: earlier.startSeq + i,
+                startOffset: 0,
+              ),
+            );
+          }
+        }
+        _choices.insertAll(0, newChoices);
         // 新段直接渲染（从 0 开始渲染全部已加载段），上方即刚拉取的更早内容
         _visibleStartIndex = 0;
         // 本会话流式段的本地下标随之后移
@@ -406,30 +386,81 @@ class _HomeContentState extends State<HomeContent>
     try {
       final snap = await SyncService.syncAll();
       if (!mounted) return;
+      // 服务器是否有小说正文 = 是否老用户（服务器权威判定）
+      final isOldUser = snap.segments.isNotEmpty;
+      // 老用户（含安卓/苹果换新设备）：用服务器上的金标准语言覆盖本地默认语言，并永久存储
+      if (isOldUser && snap.language.isNotEmpty) {
+        await StorageService.saveLanguage(snap.language);
+      }
       setState(() {
-        // 服务器数据已写入本地存储，据此重建内存中的小说数组（只含尾部）
-        _storyTexts
-          ..clear()
-          ..addAll(snap.segments);
-        _storyStartIndex = snap.startSeq;
-        // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
-        _segmentChoices.clear();
-        for (int i = 0; i < snap.segments.length; i++) {
-          _segmentChoices[_storyStartIndex + i] =
-              (i < snap.choices.length ? snap.choices[i] : const <String>[]);
-        }
-        if (_storyTexts.isNotEmpty) {
-          _sessionStreamStartIndex = _storyTexts.length;
-          _visibleStartIndex = _storyTexts.length - 1;
+        if (isOldUser) {
+          // 老用户（服务器存有小说正文）：用服务器数据重建正文，进入主内容
+          _storyTexts
+            ..clear()
+            ..addAll(snap.segments);
+          _storyStartIndex = snap.startSeq;
+          // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
+          _segmentChoices.clear();
+          for (int i = 0; i < snap.segments.length; i++) {
+            _segmentChoices[_storyStartIndex + i] =
+                (i < snap.choices.length ? snap.choices[i] : const <String>[]);
+          }
+          // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）
+          _choices.clear();
+          for (int i = 0; i < snap.segments.length; i++) {
+            final uc = i < snap.userChoices.length ? snap.userChoices[i] : '';
+            if (uc.trim().isNotEmpty) {
+              _choices.add(
+                _ChoiceRecord(
+                  text: uc,
+                  segmentIndex: _storyStartIndex + i,
+                  startOffset: 0,
+                ),
+              );
+            }
+          }
+          if (_storyTexts.isNotEmpty) {
+            _sessionStreamStartIndex = _storyTexts.length;
+            _visibleStartIndex = _storyTexts.length - 1;
+          }
+          // 用最新一段的推荐选择（choice_2/3）预填第 2、3 个输入框；
+          // 第 1 个输入框保持空白（自由输入，不预填）
+          if (snap.choices.isNotEmpty) {
+            final lastChoices = snap.choices.last;
+            final c2 = lastChoices.length > 1 ? lastChoices[1] : '';
+            final c3 = lastChoices.length > 2 ? lastChoices[2] : '';
+            _choice2Ctrl.text = c2;
+            _inputChoice2 = c2;
+            _choice3Ctrl.text = c3;
+            _inputChoice3 = c3;
+          }
+          // 推荐选择已就绪：标记为已有并激活输入区，最新段输入框可显示
+          _hasRecommendedActions = true;
+          _storyInputsShown = true;
+          _setupStep = 6;
+        } else {
+          // 新用户（服务器没有任何小说正文）：从语言页重新开始设置
+          SetupDraft.instance.reset();
+          _storyInputsShown = false; // 尚无输入区：等首轮生成后再激活
+          _setupStep = 0;
+          showMenuNotifier.value = false;
         }
         _startupSyncing = false;
         _startupSyncError = null;
       });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scrollController.hasClients) {
-          _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-        }
-      });
+      if (isOldUser) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollController.hasClients) {
+            // 重启回到正文页：让最后一段文本的首行顶到屏幕最上方。
+            // 有"上拉加载更早"空白区（_storyStartIndex>0）时跳过该空白区，
+            // 否则回到顶部；内容不足一屏时 maxScrollExtent 为 0，落在 0 即可。
+            final double target =
+                _storyStartIndex > 0 ? _earlierPullHeight : 0.0;
+            final double max = _scrollController.position.maxScrollExtent;
+            _scrollController.jumpTo(target > max ? max : target);
+          }
+        });
+      }
     } catch (e) {
       if (!mounted) return;
       if (e is HardwareAccountLimitException) {
@@ -450,6 +481,7 @@ class _HomeContentState extends State<HomeContent>
         _startupSyncing = false;
         _startupSyncError = e.toString();
       });
+      await _showStartupSyncErrorDialog();
     }
   }
 
@@ -468,6 +500,7 @@ class _HomeContentState extends State<HomeContent>
       setState(() {
         _startupSyncError = '登录未完成，无法同步。请重新登录后重试。';
       });
+      await _showStartupSyncErrorDialog();
     }
   }
 
@@ -493,6 +526,18 @@ class _HomeContentState extends State<HomeContent>
         return '登录未完成，無法繼續。請重新登入後再試。';
       case 'en':
         return 'Sign-in incomplete. Please sign in again and retry.';
+      case 'es':
+        return 'Inicio de sesión incompleto. Inicie sesión de nuevo e inténtelo de nuevo.';
+      case 'fr':
+        return 'Connexion incomplète. Veuillez vous reconnecter et réessayer.';
+      case 'de':
+        return 'Anmeldung unvollständig. Bitte melden Sie sich erneut an und versuchen Sie es noch einmal.';
+      case 'pt':
+        return 'Login incompleto. Faça login novamente e tente de novo.';
+      case 'ja':
+        return 'ログインが完了していません。もう一度ログインしてお試しください。';
+      case 'ko':
+        return '로그인이 완료되지 않았습니다. 다시 로그인하여 시도해 주세요.';
       default:
         return '登录未完成，无法继续。请重新登录后重试。';
     }
@@ -502,16 +547,18 @@ class _HomeContentState extends State<HomeContent>
   static void _dummyAuthComplete() {}
 
   /// 是否显示正文下方的三个输入框：
-  /// - 已有正文且生成/接收中：保持可见，但“继续”按钮置灰禁用（不消失）；
-  /// - 正文彻底显示完成（收到 done）或违规中止：可见、按钮可用；
-  /// - 尚无正文（首次生成前）：隐藏。
-  /// 断流/出错时保持隐藏，避免基于未传完的残缺文本续写。
+  /// - 已有正文且输入区已激活（_storyInputsShown）：保持可见；
+  /// - 生成/接收中：保持可见，但输入框与按钮置灰禁用（不消失、不可输入/点击）；
+  /// - 正文彻底显示完成（收到 done）或违规中止：可见、可输入；
+  /// - 尚无正文（首次生成前）或输入区尚未激活：隐藏。
   bool get _storyInputsVisible =>
       _storyTexts.isNotEmpty &&
-      ((_storyTyped &&
-              (_storyReceivedCompletely || _storyAbortReason != null) &&
-              _hasRecommendedActions) ||
-          _storyStreaming);
+      _storyInputsShown &&
+      // 新一段生成中/打字未完成：先不显示其输入框。
+      // 注意 _storyTyped 会在"首段450字打完、reveal 后半段还没来"时短暂为 true，
+      // 所以必须同时要求 _storyStreaming 已结束（收到 done）才显示，避免闪烁。
+      (_storyTexts.length <= _generationStartLen ||
+          (_storyTyped && !_storyStreaming));
 
   /// 顶部“上拉加载更早内容”空白区高度：约屏幕的 1/4，旋转图标居中。
   double get _earlierPullHeight {
@@ -525,22 +572,27 @@ class _HomeContentState extends State<HomeContent>
 
   void _onInputConfirm(String text) => _continueStory(text);
 
-  /// 收到服务器返回的后续变量后，把两个推荐行动分别填入第 2、3 个输入框，
-  /// 供用户后续选择使用（覆盖上一轮的旧推荐）；收到任一推荐即标记 _hasRecommendedActions。
+  /// 收到服务器返回的后续变量后，把两个推荐选择（choice_2/3，LLM② 推荐的两项行动）
+  /// 分别填入第 2、3 个输入框（覆盖上一轮的旧推荐）；LLM 未返回正常值时由服务器
+  /// 兜底行动填入。第 1 个输入框保持空白，仅显示"自由输入"提示，由用户自行输入。
+  /// 收到任一推荐即标记 _hasRecommendedActions。
   void _applyRecommendedActions(Map<String, dynamic> outputs) {
-    final actionA = outputs['action_a'] as String? ?? '';
-    final actionB = outputs['action_b'] as String? ?? '';
-    final got = actionA.isNotEmpty || actionB.isNotEmpty;
+    final choice2 = outputs['choice_2'] as String? ?? '';
+    final choice3 = outputs['choice_3'] as String? ?? '';
+    final got = choice2.isNotEmpty || choice3.isNotEmpty;
     if (!mounted) return;
     setState(() {
-      if (got) _hasRecommendedActions = true;
-      if (actionA.isNotEmpty && actionA != _inputChoice2) {
-        _choice2Ctrl.text = actionA;
-        _inputChoice2 = actionA;
+      if (got) {
+        _hasRecommendedActions = true;
+        _storyInputsShown = true; // 收到推荐即激活输入区（此后生成期间保持可见灰化）
       }
-      if (actionB.isNotEmpty && actionB != _inputChoice3) {
-        _choice3Ctrl.text = actionB;
-        _inputChoice3 = actionB;
+      if (choice2.isNotEmpty && choice2 != _inputChoice2) {
+        _choice2Ctrl.text = choice2;
+        _inputChoice2 = choice2;
+      }
+      if (choice3.isNotEmpty && choice3 != _inputChoice3) {
+        _choice3Ctrl.text = choice3;
+        _inputChoice3 = choice3;
       }
     });
   }
@@ -548,7 +600,11 @@ class _HomeContentState extends State<HomeContent>
   /// 任一输入框确认后：把输入作为 user_input，连同用户设定请求续写生成，
   /// 新内容在屏幕上接力显示（作为 _storyTexts 数组的新元素，由打字机继续揭示）。
   Future<void> _continueStory(String userInput,
-      {int retryDepth = 0, int? rewriteFrom}) async {
+      {int retryDepth = 0,
+      int? rewriteFrom,
+      String? choice1,
+      String? choice2,
+      String? choice3}) async {
     if (!mounted || userInput.trim().isEmpty) return;
     // 记录本次续写开始前的段数：断流出错时据此丢弃未传完的段落
     final int preStreamLen = _storyTexts.length;
@@ -558,33 +614,38 @@ class _HomeContentState extends State<HomeContent>
     bool hadContent = false;
     setState(() {
       _generating = true;
-      _storyAbortReason = null;
-      _storyStreaming = true; // 接收正文中：隐藏下方输入框
+      _storyStreaming = true;
       _storyTyped = false;
-      _storyReceivedCompletely = false; // 本次正文尚未完整接收
-      _hasRecommendedActions = false; // 本轮尚未收到推荐行动前不显示输入框
-      // 记录用户选择节点（时间树返回功能的占位数据）；重新授权重试时避免重复记录
-      final alreadyRecorded =
-          _choices.isNotEmpty &&
-          _choices.last.text == userInput.trim() &&
-          _choices.last.segmentIndex == _storyStartIndex + _storyTexts.length;
-      if (!alreadyRecorded) {
-        _choices.add(
-          _ChoiceRecord(
-            text: userInput.trim(),
-            // 新一段将被追加到末尾，其绝对下标 = _storyStartIndex + 当前数组长度
-            segmentIndex: _storyStartIndex + _storyTexts.length,
-            startOffset: 0,
-          ),
-        );
-      }
+      _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
+      _generationStartLen = _storyTexts.length; // 记录本轮生成前的段数（用于"新内容未到达"占位）
+      // 记录用户选择节点：属于"用户操作的那段"（普通续写=最新段；时间树=被重写段）。
+      // 每次点击"继续"都用本次输入覆盖该段的旧选择（时间树重写同样覆盖段 k）。
+      final int choiceSegAbs = _storyStartIndex + _storyTexts.length - 1;
+      _choices.removeWhere((c) => c.segmentIndex == choiceSegAbs);
+      _choices.add(
+        _ChoiceRecord(
+          text: userInput.trim(),
+          segmentIndex: choiceSegAbs,
+          startOffset: 0,
+        ),
+      );
+    });
+    // 点击继续后：自动下移半屏，为即将生成的新内容预留空白区（顶部提示 + 空白）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final double half = MediaQuery.of(context).size.height / 2;
+      final double max = _scrollController.position.maxScrollExtent;
+      _scrollController.jumpTo(
+        (_scrollController.offset + half).clamp(0.0, max),
+      );
     });
     try {
       await StoryService.generateStoryStream(
         userInput: userInput,
-        choice1: _inputChoice1,
-        choice2: _inputChoice2,
-        choice3: _inputChoice3,
+        // 时间树"从这里重新开始"时传入被重写段的三个输入值；否则用最新输入框的值
+        choice1: choice1 ?? _inputChoice1,
+        choice2: choice2 ?? _inputChoice2,
+        choice3: choice3 ?? _inputChoice3,
         rewriteFrom: rewriteFrom,
         onDeviceConflict: _onDeviceConflict,
         onStalled: _onStreamStalled,
@@ -620,21 +681,25 @@ class _HomeContentState extends State<HomeContent>
           });
           _applyRecommendedActions(outputs);
         },
-        onAbort: (reason) {
+        onAbort: (_) {
           if (!mounted) return;
+          // 违规中止：删掉本次可能已由打字机打出的残缺段落，恢复等待输入状态，
+          // 再弹"内容违规，请重新输入提示词"对话框（唯一"重新输入"按钮）
           setState(() {
-            _storyAbortReason = reason;
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
             _generating = false;
             _storyStreaming = false;
-            _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
+            _storyTyped = true;
           });
+          _showViolationDialog();
         },
         onError: (message, {code}) {
           if (!mounted) return;
           setState(() {
             // 流未完整结束（未收到 done）：丢弃本次未传完的段落，
-            // 避免基于残缺文本续写/误判；_storyReceivedCompletely 保持 false，
-            // 输入框保持隐藏（除非违规中止）。
+            // 避免基于残缺文本续写/误判。
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
@@ -658,14 +723,12 @@ class _HomeContentState extends State<HomeContent>
               _generating = false;
               _storyStreaming = false;
               _storyTyped = true;
-              _storyReceivedCompletely = true;
             });
             _showGenerateError(_getQuotaWarningText());
             return;
           }
           setState(() {
             _storyStreaming = false; // 正文已全部接收完成
-            _storyReceivedCompletely = true; // 已完整接收：放行继续续写
           });
           _applyRecommendedActions(outputs);
           if (!_hasRecommendedActions) {
@@ -673,8 +736,6 @@ class _HomeContentState extends State<HomeContent>
             await _onStreamStalled();
             return;
           }
-          await StorageService.saveMainTextList(List.of(_storyTexts));
-          await StorageService.saveMainTextStartIndex(_storyStartIndex);
         },
       );
     } on HardwareAccountLimitException {
@@ -708,7 +769,12 @@ class _HomeContentState extends State<HomeContent>
         return;
       }
       // 已重新授权：重试
-      await _continueStory(userInput, retryDepth: retryDepth + 1);
+      await _continueStory(userInput,
+          retryDepth: retryDepth + 1,
+          rewriteFrom: rewriteFrom,
+          choice1: choice1,
+          choice2: choice2,
+          choice3: choice3);
       return;
     } catch (e) {
       // 其它注册/鉴权异常（如 IP 限流"注册过于频繁"）：展示具体原因
@@ -723,40 +789,12 @@ class _HomeContentState extends State<HomeContent>
   }
 
   /// 构建正文区：按数组顺序逐段渲染故事文本（打字机揭示），
-  /// 并在每段内正确的位置插入用户选择节点
+  /// 逐段渲染故事正文；每段统一按"段文本 → 该段输入框按钮（历史段卡片）→
+  /// 该段之后用户所做的选择标记"排列，位置与"点击按钮生成新文本时占位区顶部"
+  /// 一致（即下一段正文之前），保证各段生成位置统一。
   List<Widget> _buildStoryBody() {
-    // 违规中止：隐藏正文，仅显示中止提示
-    if (_storyAbortReason != null && _storyTexts.isNotEmpty) {
-      final isDark = AppTheme.isDark(context);
-      return [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: isDark
-                  ? AppTheme.cardBackgroundDark
-                  : AppTheme.cardBackgroundLight,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Text(
-              _storyAbortReason!,
-              style: const TextStyle(
-                fontSize: 15,
-                color: CupertinoColors.systemRed,
-                height: 1.5,
-              ),
-            ),
-          ),
-        ),
-      ];
-    }
-    // 尚无正文：显示默认文本
-    if (_storyTexts.isEmpty) {
-      return [CharacterText(text: _emptyStoryText)];
-    }
-
+    // 违规中止改由 onAbort 弹"内容违规，请重新输入提示词"对话框处理；
+    // 正文区直接渲染已有正文（本次残缺段已被删除），输入框恢复等待用户输入。
     final List<Widget> children = [];
     // 只渲染 [ _visibleStartIndex, _storyTexts.length ) 范围内的文本段，
     // 更早的历史段等用户向上滚动到顶部时才逐个加载
@@ -768,42 +806,17 @@ class _HomeContentState extends State<HomeContent>
       final segment = _storyTexts[segIndex];
       // 本次会话流式生成的新段用打字机揭示；重启恢复的历史段直接完整显示
       final useTypewriter = segIndex >= _sessionStreamStartIndex;
-      // 该段内从段首到下一个选择标记之间的文本
-      int cursor = 0;
-      for (int i = 0; i < _choices.length; i++) {
-        final choice = _choices[i];
-        // 仅处理落在当前段内的选择节点（用绝对下标比较）
-        if (choice.segmentIndex != _storyStartIndex + segIndex) continue;
-        final offset = choice.startOffset;
-        if (offset > cursor) {
-          children.add(
-            useTypewriter
-                ? _buildStorySegment(
-                    segment.substring(cursor, offset),
-                    isLast: false,
-                  )
-                : CharacterText(text: segment.substring(cursor, offset)),
-          );
-        }
-        children.add(
-          StoryChoiceMarker(prefix: _getChoicePrefixText(), text: choice.text),
-        );
-        cursor = offset;
-      }
-      if (cursor < segment.length) {
-        children.add(
-          useTypewriter
-              ? _buildStorySegment(
-                  segment.substring(cursor),
-                  isLast: segIndex == _storyTexts.length - 1,
-                )
-              : CharacterText(text: segment.substring(cursor)),
-        );
-      }
-      // 历史段落（非最新一段）下方：三个输入框 + 三个"从这里重新开始"按钮，
-      // 三个按钮用于实现"时间树"功能（当前为占位）。
-      // 最新一段下方不插入卡片，其下方的输入框由页面底部的三个（"按照上面
-      // 输入指引继续故事选择"）承载。
+      // 1) 段文本（整段一次渲染）
+      children.add(
+        useTypewriter
+            ? _buildStorySegment(
+                segment,
+                isLast: segIndex == _storyTexts.length - 1,
+              )
+            : CharacterText(text: segment),
+      );
+      // 2) 历史段落（非最新一段）下方：三个输入框 + "从这里重新开始"按钮（时间树）。
+      //    最新一段下方不插入卡片，其下方的输入框由页面底部的三个承载。
       if (segIndex < _storyTexts.length - 1) {
         children.add(
           StoryChoiceCard(
@@ -814,13 +827,73 @@ class _HomeContentState extends State<HomeContent>
                 _segmentChoices[_storyStartIndex + segIndex] ?? const <String>[],
             buttonText: _getRestartHereButtonText(),
             inputPlaceholder: _getInputPlaceholder(),
-            enabled: _storyTyped,
+            // 历史按钮只在"流结束且整段打字完成"后可操作；
+            // 首段450字打完时 _storyTyped 会短暂为 true，须同时要求 !_storyStreaming 避免闪烁
+            enabled: _storyTyped && !_storyStreaming,
             onPressed: _onRestartHerePressed,
           ),
         );
       }
+      // 3) 该段的选择标记（用户在该段输入框选择，属于该段）：
+      //    统一显示在本段文本 + 输入框按钮之后，与生成时占位区顶部的位置一致。
+      //    生成中（新段未到）时最新段的选择由占位区顶部显示，这里跳过避免重复。
+      final int segAbs = _storyStartIndex + segIndex;
+      final bool pendingLast =
+          _storyStreaming &&
+          _storyTexts.length <= _generationStartLen &&
+          segIndex == _storyTexts.length - 1;
+      if (!pendingLast) {
+        for (int i = 0; i < _choices.length; i++) {
+          if (_choices[i].segmentIndex == segAbs) {
+            children.add(
+              StoryChoiceMarker(
+                prefix: _getChoicePrefixText(),
+                text: _choices[i].text,
+              ),
+            );
+            break;
+          }
+        }
+      }
     }
     return children;
+  }
+
+  /// 新内容生成中的占位：顶部"用户本轮选择" + "正在生成新内容"提示 + 半屏空白。
+  /// 用户一按"继续"按钮即在此显示本轮选择（用用户语言）；收到正文后由
+  /// 新段落 + 正文内的"用户选择"标记无缝承接，该行不会消失。
+  Widget _buildGeneratingPlaceholder() {
+    final double half = MediaQuery.of(context).size.height / 2;
+    final String? currentChoice =
+        _choices.isEmpty ? null : _choices.last.text;
+    final bool hasChoice =
+        currentChoice != null && currentChoice.trim().isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 本轮用户选择：按下按钮瞬间就在空白区最上方显示（用户语言）
+        if (hasChoice)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: StoryChoiceMarker(
+              prefix: _getChoicePrefixText(),
+              text: currentChoice,
+            ),
+          ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CupertinoActivityIndicator(radius: 10),
+              const SizedBox(width: 8),
+              Text(_getGeneratingNewContentText()),
+            ],
+          ),
+        ),
+        SizedBox(height: half),
+      ],
+    );
   }
 
   /// 构建单个故事文本段（打字机揭示；仅最后一段触发 onTypingDone）
@@ -972,10 +1045,8 @@ class _HomeContentState extends State<HomeContent>
                 )
               : KeyedSubtree(
                   key: const ValueKey('main_content'),
-                  child: _startupSyncing
+                  child: (_startupSyncing || _startupSyncError != null)
                       ? _buildSyncLoading()
-                      : _startupSyncError != null
-                      ? _buildSyncError()
                       : SingleChildScrollView(
                           controller: _scrollController,
                           child: Column(
@@ -1017,7 +1088,7 @@ class _HomeContentState extends State<HomeContent>
                                     ),
                                     const SizedBox(height: 12),
                                     TextInputPanel(
-                                      placeholder: _getInputPlaceholder(),
+                                      placeholder: _getRecommendedActionPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
@@ -1028,7 +1099,7 @@ class _HomeContentState extends State<HomeContent>
                                     ),
                                     const SizedBox(height: 12),
                                     TextInputPanel(
-                                      placeholder: _getInputPlaceholder(),
+                                      placeholder: _getRecommendedActionPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
@@ -1041,26 +1112,11 @@ class _HomeContentState extends State<HomeContent>
                                   ],
                                 ),
                               ),
-                              // “正在生成/续写”提示：置于按钮下方
-                              if (_generating && _storyTexts.isNotEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.only(
-                                    left: 16,
-                                    right: 16,
-                                    top: 8,
-                                    bottom: 12,
-                                  ),
-                                  child: Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      const CupertinoActivityIndicator(
-                                        radius: 10,
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Text(_getTypingIndicatorText()),
-                                    ],
-                                  ),
-                                ),
+                              // 新内容生成中（尚未收到首段）时，在页面最底部（输入框下方）
+                              // 显示"正在生成新内容"提示 + 半屏空白
+                              if (_storyStreaming &&
+                                  _storyTexts.length <= _generationStartLen)
+                                _buildGeneratingPlaceholder(),
                             ],
                           ),
                         ),
@@ -1124,24 +1180,31 @@ class _HomeContentState extends State<HomeContent>
   /// 由网关转发 Dify 生成小说正文；成功后进入正式主页面显示生成文本。
   /// 全黑过渡期间若仍在生成，则显示加载提示。
   Future<void> _onSetupConfirmed({int retryDepth = 0}) async {
-    await SetupDraft.instance.commit();
     if (!mounted) return;
 
     setState(() {
       _generating = true;
       _storyTexts.clear();
+      _generationStartLen = _storyTexts.length; // 全新生成：0
       _storyStartIndex = 0; // 全新生成：绝对下标从 0 开始（服务器同步清空旧段）
-      _storyAbortReason = null;
       // 重新生成：从数组开头展示，新内容均为本会话流式生成
       _visibleStartIndex = 0;
       _sessionStreamStartIndex = 0;
       _blackoutActive = true;
       _blackoutController.value = 0; // 覆盖层完全不透明（全黑）
-      _storyStreaming = true; // 接收正文中：隐藏下方输入框
+      _storyStreaming = true;
       _storyTyped = false;
-      _storyReceivedCompletely = false; // 本次正文尚未完整接收
-      _hasRecommendedActions = false; // 本轮尚未收到推荐行动前不显示输入框
+      _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
+      _storyInputsShown = false; // 全新生成：输入区先隐藏，待首轮收到推荐后再激活
     });
+    // 清理"漏网之鱼"：重置/设备切换后，另一设备的延迟写入可能在服务器残留旧正文。
+    // 首次生成前静默清空服务器小说正文，确保新故事从 seq 0 干净开始。
+    // 失败时静默忽略（残留最多导致起始下标不为 0，不阻塞生成流程）。
+    try {
+      await SyncService.resetStory();
+    } catch (_) {
+      // 静默失败：不阻塞生成
+    }
     // 记录本次生成开始前的段数（已清空为 0）：断流出错时据此丢弃未传完的内容
     final int preStreamLen = _storyTexts.length;
     // 本次生成是否收到过非空正文（LLM 返回空白时用于弹窗警告）
@@ -1155,6 +1218,7 @@ class _HomeContentState extends State<HomeContent>
         era: SetupDraft.instance.era,
         playerName: SetupDraft.instance.playerName,
         playerGender: SetupDraft.instance.playerGender,
+        playerTraits: SetupDraft.instance.playerTraits,
         partnerName: SetupDraft.instance.partnerName,
         partnerGender: SetupDraft.instance.partnerGender,
         partnerTraits: SetupDraft.instance.partnerTraits,
@@ -1196,18 +1260,23 @@ class _HomeContentState extends State<HomeContent>
           });
           _applyRecommendedActions(outputs);
         },
-        onAbort: (reason) {
+        onAbort: (_) {
           if (!mounted) return;
+          // 违规中止：删掉本次可能已由打字机打出的残缺段落，恢复等待输入状态，
+          // 再弹"内容违规，请重新输入提示词"对话框（唯一"重新输入"按钮）
           setState(() {
-            _storyAbortReason = reason;
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
             _generating = false;
             _setupStep = 6;
             showMenuNotifier.value = true;
             _blackoutActive = false;
             _blackoutController.value = 1;
             _storyStreaming = false;
-            _storyTyped = true; // 正文被中止：恢复显示输入框以便继续
+            _storyTyped = true;
           });
+          _showViolationDialog();
         },
         onError: (message, {code}) {
           if (!mounted) return;
@@ -1244,7 +1313,6 @@ class _HomeContentState extends State<HomeContent>
           }
           setState(() {
             _storyStreaming = false; // 正文已全部接收完成
-            _storyReceivedCompletely = true; // 已完整接收：放行继续续写
           });
           _applyRecommendedActions(outputs);
           if (!_hasRecommendedActions) {
@@ -1252,8 +1320,6 @@ class _HomeContentState extends State<HomeContent>
             await _onStreamStalled();
             return;
           }
-          await StorageService.saveMainTextList(List.of(_storyTexts));
-          await StorageService.saveMainTextStartIndex(_storyStartIndex);
         },
       );
     } on HardwareAccountLimitException {
@@ -1358,27 +1424,55 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 正在续写提示
-  String _getTypingIndicatorText() {
+  /// 第 2/3 个输入框（LLM 推荐的两项行动）的占位提示：
+  /// 正常流程里这两个框会被预填推荐/兜底行动，占位基本看不到；
+  /// 当某个框为空时，用这行提示说明"这是可修改的推荐行动"。
+  String _getRecommendedActionPlaceholder() {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
       case 'yue':
-        return '正在續寫…';
+        return '推薦行動（可修改）';
       case 'en':
-        return 'Continuing…';
+        return 'Recommended action (editable)';
       case 'es':
-      case 'pt':
-        return 'Continuando…';
+        return 'Acción recomendada (editable)';
       case 'fr':
-        return 'Suite en cours…';
+        return 'Action recommandée (modifiable)';
       case 'de':
-        return 'Wird fortgesetzt…';
+        return 'Empfohlene Aktion (bearbeitbar)';
+      case 'pt':
+        return 'Ação recomendada (editável)';
       case 'ja':
-        return '続きを書いています…';
+        return '推奨アクション（編集可）';
       case 'ko':
-        return '이어서 작성 중…';
+        return '추천 행동 (수정 가능)';
       default:
-        return '正在续写…';
+        return '推荐行动（可修改）';
+    }
+  }
+
+  /// 新内容生成中提示（位于预留空白区顶部）
+  String _getGeneratingNewContentText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '正在生成新內容…';
+      case 'en':
+        return 'Generating new content…';
+      case 'es':
+        return 'Generando nuevo contenido…';
+      case 'fr':
+        return 'Génération de nouveau contenu…';
+      case 'de':
+        return 'Neuer Inhalt wird generiert…';
+      case 'pt':
+        return 'Gerando novo conteúdo…';
+      case 'ja':
+        return '新しい内容を生成中…';
+      case 'ko':
+        return '새 콘텐츠를 생성하는 중…';
+      default:
+        return '正在生成新内容…';
     }
   }
 
@@ -1484,56 +1578,6 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 生成失败弹窗"跳过"按钮
-  String _getSkipText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-      case 'yue':
-        return '跳過';
-      case 'en':
-        return 'Skip';
-      case 'es':
-        return 'Omitir';
-      case 'fr':
-        return 'Passer';
-      case 'de':
-        return 'Überspringen';
-      case 'pt':
-        return 'Pular';
-      case 'ja':
-        return 'スキップ';
-      case 'ko':
-        return '건너뛰기';
-      default:
-        return '跳过';
-    }
-  }
-
-  /// 生成失败弹窗"重试"按钮
-  String _getRetryText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-      case 'yue':
-        return '重試';
-      case 'en':
-        return 'Retry';
-      case 'es':
-        return 'Reintentar';
-      case 'fr':
-        return 'Réessayer';
-      case 'de':
-        return 'Erneut versuchen';
-      case 'pt':
-        return 'Tentar Novamente';
-      case 'ja':
-        return '再試行';
-      case 'ko':
-        return '다시 시도';
-      default:
-        return '重试';
-    }
-  }
-
   /// "用户选择："前缀（本地化）
   String _getChoicePrefixText() {
     switch (StorageService.getLanguage()) {
@@ -1615,7 +1659,8 @@ class _HomeContentState extends State<HomeContent>
   /// 历史段落"从这里重新开始"：用客户语言弹出确认窗口，警告从该段重写会永久废弃之后内容。
   /// 用户确认后：先截断该段之后的内容（显示/本地），再走与标准生成完全一致的流程，
   /// 从该时间点续写（服务器在生成时同步截断数据库）。
-  Future<void> _onRestartHerePressed(int segmentIndex, String userInput) async {
+  Future<void> _onRestartHerePressed(
+      int segmentIndex, String userInput, List<String> choices) async {
     if (!mounted) return;
     final confirmed = await showCupertinoDialog<bool>(
       context: context,
@@ -1644,7 +1689,14 @@ class _HomeContentState extends State<HomeContent>
     //    用户未输入时给一个本地化默认续写提示
     final input =
         userInput.trim().isEmpty ? _getRewriteDefaultInputText() : userInput;
-    await _continueStory(input, rewriteFrom: segmentIndex);
+    // 把被重写段三个输入框当前值（用户可能已编辑）覆盖保存到服务器该段，并从此处续写
+    await _continueStory(
+      input,
+      rewriteFrom: segmentIndex,
+      choice1: choices.isNotEmpty ? choices[0] : '',
+      choice2: choices.length > 1 ? choices[1] : '',
+      choice3: choices.length > 2 ? choices[2] : '',
+    );
   }
 
   /// 时间树"从这里重写"：截断该段之后的所有内容（内存数组 + 本地存储），
@@ -1654,23 +1706,31 @@ class _HomeContentState extends State<HomeContent>
     if (keepLocal < 0 || keepLocal >= _storyTexts.length) return;
     setState(() {
       _storyTexts.removeRange(keepLocal + 1, _storyTexts.length);
-      // 清除该段之后的选择节点与分段选项
+      // 清除该段之后的选择节点与分段选项；
+      // 段 segmentIndex 本身的选择保留，由后续 _continueStory 用本次输入覆盖（时间树=方案B）
       _choices.removeWhere((c) => c.segmentIndex > segmentIndex);
       _segmentChoices.removeWhere((k, _) => k > segmentIndex);
       _visibleStartIndex = _storyTexts.length - 1;
       _sessionStreamStartIndex = _storyTexts.length; // 之后的新段均为会话流式段（打字机）
-      _storyReceivedCompletely = false;
-      _storyAbortReason = null;
     });
-    await StorageService.saveMainTextList(List.of(_storyTexts));
-    await StorageService.saveMainTextStartIndex(_storyStartIndex);
   }
 
   /// 重写但用户未输入内容时的默认续写提示（本地化）
   String _getRewriteDefaultInputText() {
     switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '繼續';
       case 'en':
         return 'Continue the story';
+      case 'es':
+        return 'Continúa la historia';
+      case 'fr':
+        return 'Continuer l\'histoire';
+      case 'de':
+        return 'Setze die Geschichte fort';
+      case 'pt':
+        return 'Continue a história';
       case 'ja':
         return '物語を続けて';
       case 'ko':
@@ -1791,6 +1851,18 @@ class _HomeContentState extends State<HomeContent>
         return '偵測到多裝置同時登入';
       case 'en':
         return 'Multiple Devices Detected';
+      case 'es':
+        return 'Se detectaron varios dispositivos';
+      case 'fr':
+        return 'Plusieurs appareils détectés';
+      case 'de':
+        return 'Mehrere Geräte erkannt';
+      case 'pt':
+        return 'Vários dispositivos detectados';
+      case 'ja':
+        return '複数のデバイスを検出しました';
+      case 'ko':
+        return '여러 기기가 감지되었습니다';
       default:
         return '检测到多设备同时登入';
     }
@@ -1805,6 +1877,18 @@ class _HomeContentState extends State<HomeContent>
         return '你似乎有兩個以上嘅裝置同時登入呢個 App。為咗保持小說同步，呢個 App 需要重新啟動。';
       case 'en':
         return 'It looks like this App is signed in on more than one device at the same time. To keep your story in sync, this App needs to restart.';
+      case 'es':
+        return 'Parece que esta App inició sesión en más de un dispositivo al mismo tiempo. Para mantener sincronizada tu historia, esta App debe reiniciarse.';
+      case 'fr':
+        return 'Il semble que cette app soit connectée sur plus d\'un appareil en même temps. Pour garder votre histoire synchronisée, cette app doit redémarrer.';
+      case 'de':
+        return 'Diese App scheint gleichzeitig auf mehr als einem Gerät angemeldet zu sein. Um Ihre Geschichte synchron zu halten, muss diese App neu gestartet werden.';
+      case 'pt':
+        return 'Parece que este app está conectado em mais de um dispositivo ao mesmo tempo. Para manter sua história sincronizada, este app precisa ser reiniciado.';
+      case 'ja':
+        return 'このアプリが複数のデバイスで同時にログインしているようです。小説の同期を保つため、このアプリを再起動する必要があります。';
+      case 'ko':
+        return '이 앱이 여러 기기에서 동시에 로그인된 것 같습니다. 이야기 동기화를 유지하려면 이 앱을 다시 시작해야 합니다.';
       default:
         return '您似乎有两个以上的设备在同时登入本 App。为保持小说同步，本 App 需要重新启动。';
     }
@@ -1818,6 +1902,18 @@ class _HomeContentState extends State<HomeContent>
         return '同意';
       case 'en':
         return 'OK';
+      case 'es':
+        return 'OK';
+      case 'fr':
+        return 'OK';
+      case 'de':
+        return 'OK';
+      case 'pt':
+        return 'OK';
+      case 'ja':
+        return 'OK';
+      case 'ko':
+        return '확인';
       default:
         return '同意';
     }
@@ -1839,30 +1935,26 @@ class _HomeContentState extends State<HomeContent>
     );
   }
 
-  /// 冷启动同步失败的错误界面（提供重试）
-  Widget _buildSyncError() {
-    return SizedBox.expand(
-      child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                _getSyncErrorMessageText(_startupSyncError ?? ''),
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 15, height: 1.4),
-              ),
-              const SizedBox(height: 16),
-              CupertinoButton.filled(
-                onPressed: _performStartupSync,
-                child: Text(_getRetryText()),
-              ),
-            ],
+  /// 冷启动同步失败：底层保持加载页，弹出"重启 App"弹窗。
+  /// 点击"重启 App"后重新启动，启动同步会再次从服务器拉取并对齐。
+  Future<void> _showStartupSyncErrorDialog() async {
+    if (!mounted || _startupSyncError == null) return;
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        content: Text(_getSyncErrorMessageText(_startupSyncError ?? '')),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(_getStallRestartText()),
           ),
-        ),
+        ],
       ),
     );
+    if (!mounted) return;
+    RestartWidget.restartApp(context);
   }
 
   /// "正在同步"提示文字（本地化）
@@ -1873,6 +1965,18 @@ class _HomeContentState extends State<HomeContent>
         return '正在同步…';
       case 'en':
         return 'Syncing…';
+      case 'es':
+        return 'Sincronizando…';
+      case 'fr':
+        return 'Synchronisation…';
+      case 'de':
+        return 'Wird synchronisiert…';
+      case 'pt':
+        return 'Sincronizando…';
+      case 'ja':
+        return '同期中…';
+      case 'ko':
+        return '동기화 중…';
       default:
         return '正在同步…';
     }
@@ -1883,8 +1987,22 @@ class _HomeContentState extends State<HomeContent>
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
         return '同步失敗，暫時無法開始。請檢查網路後重試。\n($detail)';
+      case 'yue':
+        return '同步失敗，暫時無法開始。請檢查網路後重試。\n($detail)';
       case 'en':
         return 'Sync failed. Please check your network and try again.\n($detail)';
+      case 'es':
+        return 'Error de sincronización. No se puede continuar por ahora. Compruebe su red e inténtelo de nuevo.\n($detail)';
+      case 'fr':
+        return 'Échec de la synchronisation. Impossible de continuer pour le moment. Vérifiez votre réseau et réessayez.\n($detail)';
+      case 'de':
+        return 'Synchronisierung fehlgeschlagen. Der Start ist vorübergehend nicht möglich. Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.\n($detail)';
+      case 'pt':
+        return 'Falha na sincronização. Não foi possível começar por enquanto. Verifique sua rede e tente novamente.\n($detail)';
+      case 'ja':
+        return '同期に失敗しました。しばらく開始できません。ネットワークを確認して、もう一度お試しください。\n($detail)';
+      case 'ko':
+        return '동기화에 실패했습니다. 지금은 시작할 수 없습니다. 네트워크를 확인하고 다시 시도해 주세요.\n($detail)';
       default:
         return '同步失败，暂时无法开始。请检查网络后重试。\n($detail)';
     }
@@ -1898,7 +2016,6 @@ class _HomeContentState extends State<HomeContent>
       _generating = false;
       _storyStreaming = false;
       _storyTyped = true;
-      // _storyReceivedCompletely 保持 false：禁止基于残缺文本续写
     });
     await showCupertinoDialog<void>(
       context: context,
@@ -1927,6 +2044,18 @@ class _HomeContentState extends State<HomeContent>
         return '網路異常';
       case 'en':
         return 'Network Issue';
+      case 'es':
+        return 'Problema de red';
+      case 'fr':
+        return 'Problème de réseau';
+      case 'de':
+        return 'Netzwerkproblem';
+      case 'pt':
+        return 'Problema de rede';
+      case 'ja':
+        return 'ネットワークエラー';
+      case 'ko':
+        return '네트워크 문제';
       default:
         return '网络异常';
     }
@@ -1941,6 +2070,18 @@ class _HomeContentState extends State<HomeContent>
         return '為咗保證小說文本完整，請檢查網路後重新啟動呢個 App。';
       case 'en':
         return 'To keep your story text complete, please check your network and restart this App.';
+      case 'es':
+        return 'Para mantener el texto de tu historia completo, comprueba tu red y reinicia esta App.';
+      case 'fr':
+        return 'Pour conserver le texte de votre histoire complet, vérifiez votre réseau et redémarrez cette app.';
+      case 'de':
+        return 'Um Ihren Geschichtentext vollständig zu erhalten, prüfen Sie Ihr Netzwerk und starten Sie diese App neu.';
+      case 'pt':
+        return 'Para manter o texto da sua história completo, verifique sua rede e reinicie este app.';
+      case 'ja':
+        return '小説のテキストを完全に保つため、ネットワークを確認してこのアプリを再起動してください。';
+      case 'ko':
+        return '이야기 텍스트를 완전하게 유지하려면 네트워크를 확인하고 이 앱을 다시 시작하세요.';
       default:
         return '为保证小说文本完整，请检查网络后重新启动本 App。';
     }
@@ -1954,51 +2095,116 @@ class _HomeContentState extends State<HomeContent>
         return '重新啟動';
       case 'en':
         return 'Restart';
+      case 'es':
+        return 'Reiniciar';
+      case 'fr':
+        return 'Redémarrer';
+      case 'de':
+        return 'Neu starten';
+      case 'pt':
+        return 'Reiniciar';
+      case 'ja':
+        return '再起動';
+      case 'ko':
+        return '다시 시작';
       default:
         return '重启';
     }
   }
 
-  /// 生成失败弹窗：重试重新走一次生成，跳过则用默认文本直接进入主页面。
-  Future<void> _showGenerateError(String detail) async {
-    final retry = await showCupertinoDialog<bool>(
+  /// 违规弹窗内容：提示当前生成内容疑似违规，需重新输入提示词（本地化）
+  String _getViolationMessageText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '目前生成內容疑似違規，請重新輸入提示詞。';
+      case 'yue':
+        return '而家生成內容疑似違規，請重新輸入提示詞。';
+      case 'en':
+        return 'The generated content may violate our guidelines. Please re-enter your prompt.';
+      case 'es':
+        return 'El contenido generado podría infringir las normas. Vuelva a introducir su indicación.';
+      case 'fr':
+        return 'Le contenu généré semble enfreindre nos règles. Veuillez ressaisir votre consigne.';
+      case 'de':
+        return 'Der generierte Inhalt verstößt möglicherweise gegen unsere Richtlinien. Bitte geben Sie Ihre Eingabe erneut ein.';
+      case 'pt':
+        return 'O conteúdo gerado pode violar nossas diretrizes. Insira novamente sua instrução.';
+      case 'ja':
+        return '生成された内容がガイドラインに違反している可能性があります。プロンプトを再入力してください。';
+      case 'ko':
+        return '생성된 콘텐츠가 가이드라인을 위반했을 수 있습니다. 프롬프트를 다시 입력하세요.';
+      default:
+        return '当前生成内容疑似违规，请重新输入提示词。';
+    }
+  }
+
+  /// 违规弹窗唯一按钮"重新输入"（本地化）
+  String _getReenterText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '重新輸入';
+      case 'en':
+        return 'Re-enter';
+      case 'es':
+        return 'Volver a introducir';
+      case 'fr':
+        return 'Ressaisir';
+      case 'de':
+        return 'Erneut eingeben';
+      case 'pt':
+        return 'Inserir novamente';
+      case 'ja':
+        return '再入力';
+      case 'ko':
+        return '다시 입력';
+      default:
+        return '重新输入';
+    }
+  }
+
+  /// 违规弹窗：无标题，提示当前生成内容疑似违规，需重新输入提示词；
+  /// 只有一个"重新输入"按钮。点击后残缺段落已在 onAbort 中删除，
+  /// 页面已恢复为等待输入状态，此处仅关闭弹窗。
+  Future<void> _showViolationDialog() async {
+    if (!mounted) return;
+    await showCupertinoDialog<void>(
       context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        content: Text(_getViolationMessageText()),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(_getReenterText()),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 生成失败弹窗：仅提供"重启 App"按钮。
+  /// 出错后不再提供"跳过/重试"（避免本地与服务器段数不一致时少显示一段、
+  /// 或基于错位状态续写）；重启后启动同步会重新拉取服务器已落库的段落并对齐。
+  Future<void> _showGenerateError(String detail) async {
+    if (!mounted) return;
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
       builder: (context) => CupertinoAlertDialog(
         title: Text(_getErrorTitleText()),
         content: Text(_getErrorMessageText(detail)),
         actions: [
           CupertinoDialogAction(
-            isDestructiveAction: true,
-            onPressed: () => Navigator.of(context).pop(false),
-            child: Text(_getSkipText()),
-          ),
-          CupertinoDialogAction(
             isDefaultAction: true,
-            onPressed: () => Navigator.of(context).pop(true),
-            child: Text(_getRetryText()),
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(_getStallRestartText()),
           ),
         ],
       ),
     );
-
     if (!mounted) return;
-    if (retry == true) {
-      await _onSetupConfirmed();
-      return;
-    }
-    // 跳过：用当前默认文本直接进入正式主页面
-    setState(() {
-      _setupStep = 6;
-      showMenuNotifier.value = true;
-      _blackoutActive = true;
-      _blackoutController.value = 0;
-    });
-    await Future<void>.delayed(const Duration(seconds: 1));
-    if (!mounted) return;
-    await _blackoutController.forward();
-    if (!mounted) return;
-    setState(() {
-      _blackoutActive = false;
-    });
+    RestartWidget.restartApp(context);
   }
 }

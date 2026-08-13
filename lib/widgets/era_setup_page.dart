@@ -338,23 +338,23 @@ class _EraSetupPageState extends State<EraSetupPage> {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
       case 'yue':
-        return '確認年代';
+        return '下一步';
       case 'en':
-        return 'Confirm Era';
+        return 'Next';
       case 'es':
-        return 'Confirmar Época';
+        return 'Siguiente';
       case 'fr':
-        return 'Confirmer l\'Époque';
+        return 'Suivant';
       case 'de':
-        return 'Epoche Bestätigen';
+        return 'Weiter';
       case 'pt':
-        return 'Confirmar Era';
+        return 'Próximo';
       case 'ja':
-        return '時代を確定';
+        return '次へ';
       case 'ko':
-        return '시대 확인';
+        return '다음';
       default:
-        return '确认年代';
+        return '下一步';
     }
   }
 
@@ -457,152 +457,179 @@ class _EraSetupPageState extends State<EraSetupPage> {
         border: null,
       ),
       child: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 20),
-              // 页面标题
-              Text(
-                _getTitleText(),
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w700,
-                  color: isDark
-                      ? AppTheme.primaryTextDark
-                      : AppTheme.primaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 12),
-              // 说明文字
-              Text(
-                _getSubtitleText(),
-                style: TextStyle(
-                  fontSize: 16,
-                  color: isDark
-                      ? AppTheme.secondaryTextDark
-                      : AppTheme.secondaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              // 合并输入框 + 下拉选择
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: CupertinoTextField(
-                  controller: _eraController,
-                  focusNode: _eraFocusNode,
-                  placeholder: _getInputPlaceholder(),
-                  placeholderStyle: TextStyle(
-                    color: isDark
-                        ? AppTheme.tertiaryTextDark
-                        : AppTheme.tertiaryTextLight,
-                  ),
-                  padding: const EdgeInsets.only(
-                    left: 16,
-                    right: 4,
-                    top: 14,
-                    bottom: 14,
-                  ),
-                  decoration: null,
-                  style: TextStyle(
-                    color: _isOverLimit
-                        ? (isDark
-                              ? AppTheme.destructiveRedDark
-                              : AppTheme.destructiveRedLight)
-                        : (isDark
-                              ? AppTheme.primaryTextDark
-                              : AppTheme.primaryTextLight),
-                    fontSize: 17,
-                  ),
-                  onChanged: (value) {
-                    setState(() {});
-                  },
-                  suffix: GestureDetector(
-                    onTap: _showEraPicker,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      child: Icon(
-                        CupertinoIcons.chevron_down_circle,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                        size: 24,
-                      ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final buttonTop = constraints.maxHeight * 0.75;
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: SingleChildScrollView(
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      24,
+                      16,
+                      constraints.maxHeight * 0.25,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const SizedBox(height: 20),
+                        // 标题 + 副标题（固定高度，保证下方输入框位置一致）
+                        SizedBox(
+                          height: 124,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                _getTitleText(),
+                                style: TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w700,
+                                  color: isDark
+                                      ? AppTheme.primaryTextDark
+                                      : AppTheme.primaryTextLight,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                _getSubtitleText(),
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  color: isDark
+                                      ? AppTheme.secondaryTextDark
+                                      : AppTheme.secondaryTextLight,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        // 合并输入框 + 下拉选择
+                        Container(
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.cardBackgroundDark
+                                : AppTheme.cardBackgroundLight,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: CupertinoTextField(
+                            controller: _eraController,
+                            focusNode: _eraFocusNode,
+                            placeholder: _getInputPlaceholder(),
+                            placeholderStyle: TextStyle(
+                              color: isDark
+                                  ? AppTheme.tertiaryTextDark
+                                  : AppTheme.tertiaryTextLight,
+                            ),
+                            padding: const EdgeInsets.only(
+                              left: 16,
+                              right: 4,
+                              top: 14,
+                              bottom: 14,
+                            ),
+                            decoration: null,
+                            style: TextStyle(
+                              color: _isOverLimit
+                                  ? (isDark
+                                        ? AppTheme.destructiveRedDark
+                                        : AppTheme.destructiveRedLight)
+                                  : (isDark
+                                        ? AppTheme.primaryTextDark
+                                        : AppTheme.primaryTextLight),
+                              fontSize: 17,
+                            ),
+                            onChanged: (value) {
+                              setState(() {});
+                            },
+                            suffix: GestureDetector(
+                              onTap: _showEraPicker,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                ),
+                                child: Icon(
+                                  CupertinoIcons.chevron_down_circle,
+                                  color: isDark
+                                      ? AppTheme.accentBlueDark
+                                      : AppTheme.accentBlueLight,
+                                  size: 24,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        // 提示 + 示例
+                        Column(
+                          children: [
+                            Text(
+                              _getEraHint(),
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: isDark
+                                    ? AppTheme.secondaryTextDark
+                                    : AppTheme.secondaryTextLight,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _getEraExamples(),
+                              style: TextStyle(
+                                fontSize: 13,
+                                height: 1.4,
+                                color: isDark
+                                    ? AppTheme.tertiaryTextDark
+                                    : AppTheme.tertiaryTextLight,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 8),
-              // 提示 + 示例
-              Column(
-                children: [
-                  Text(
-                    _getEraHint(),
-                    style: TextStyle(
-                      fontSize: 13,
+                // 确认按钮（固定于页面 3/4 高度位置）
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  top: buttonTop,
+                  child: SizedBox(
+                    height: 48,
+                    child: CupertinoButton.filled(
+                      onPressed: canSubmit ? _onSubmit : null,
+                      borderRadius: BorderRadius.circular(12),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
                       color: isDark
-                          ? AppTheme.secondaryTextDark
-                          : AppTheme.secondaryTextLight,
+                          ? AppTheme.buttonFillDark
+                          : AppTheme.buttonFillLight,
+                      disabledColor: isDark
+                          ? const Color(0xFF2C2C2E)
+                          : const Color(0xFFF2F2F7),
+                      child: Text(
+                        _getConfirmText(),
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                          color: canSubmit
+                              ? AppTheme.buttonText
+                              : (isDark
+                                    ? AppTheme.buttonDisabledTextDark
+                                    : AppTheme.buttonDisabledTextLight),
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    _getEraExamples(),
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.4,
-                      color: isDark
-                          ? AppTheme.tertiaryTextDark
-                          : AppTheme.tertiaryTextLight,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              // 确认按钮
-              SizedBox(
-                height: 48,
-                child: CupertinoButton.filled(
-                  onPressed: canSubmit ? _onSubmit : null,
-                  borderRadius: BorderRadius.circular(12),
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  color: isDark
-                      ? AppTheme.buttonFillDark
-                      : AppTheme.buttonFillLight,
-                  disabledColor: isDark
-                      ? const Color(0xFF2C2C2E)
-                      : const Color(0xFFF2F2F7),
-                  child: Text(
-                    _getConfirmText(),
-                    style: TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w600,
-                      color: canSubmit
-                          ? AppTheme.buttonText
-                          : (isDark
-                                ? AppTheme.buttonDisabledTextDark
-                                : AppTheme.buttonDisabledTextLight),
-                    ),
-                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              ),
-              const SizedBox(height: 48),
-            ],
-          ),
+              ],
+            );
+          },
         ),
       ),
     );

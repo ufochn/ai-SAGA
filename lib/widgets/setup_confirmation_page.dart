@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/cupertino.dart';
 
 import 'package:ai_saga/logic/app_theme.dart';
@@ -11,8 +9,8 @@ import 'package:ai_saga/widgets/audit_dialog.dart';
 /// 设置确认页。
 ///
 /// 主角/搭档设定审核通过后进入本页：列出全部设置项，每项带"编辑"快捷按钮
-/// 跳回对应设置页；底部"确定"按钮触发"进入全新世界"提示 + 5 秒倒计时，
-/// 倒计时结束回调 [onConfirmed] 进入正式主页面。
+/// 跳回对应设置页；底部"确定"按钮先进行服务器审核，审核通过后
+/// 立即调用 [onConfirmed] 进入正式主页面。
 class SetupConfirmationPage extends StatefulWidget {
   /// 各设置的"编辑"跳转回调：index 对应 0=语言,1=地点,2=年代,3=主角,4=搭档
   final void Function(int index) onEdit;
@@ -33,18 +31,7 @@ class SetupConfirmationPage extends StatefulWidget {
 }
 
 class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
-  /// 确定后是否进入倒计时状态
-  bool _counting = false;
-  int _countdown = 5;
-  Timer? _timer;
-
   String get _language => StorageService.getLanguage();
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
 
   String _languageName(String code) {
     switch (code) {
@@ -365,23 +352,23 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return _counting ? '準備就緒' : '確認您的設定';
+        return '確認您的設定';
       case 'en':
-        return _counting ? 'Ready' : 'Confirm Your Settings';
+        return 'Confirm Your Settings';
       case 'es':
-        return _counting ? 'Listo' : 'Confirma tu configuración';
+        return 'Confirma tu configuración';
       case 'fr':
-        return _counting ? 'Prêt' : 'Confirmez vos paramètres';
+        return 'Confirmez vos paramètres';
       case 'de':
-        return _counting ? 'Bereit' : 'Bestätige deine Einstellungen';
+        return 'Bestätige deine Einstellungen';
       case 'pt':
-        return _counting ? 'Pronto' : 'Confirme suas configurações';
+        return 'Confirme suas configurações';
       case 'ja':
-        return _counting ? '準備完了' : '設定を確認してください';
+        return '設定を確認してください';
       case 'ko':
-        return _counting ? '준비 완료' : '설정을 확인하세요';
+        return '설정을 확인하세요';
       default:
-        return _counting ? '准备就绪' : '确认你的设定';
+        return '确认你的设定';
     }
   }
 
@@ -390,37 +377,23 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return _counting ? '現在開始進入全新的世界，敬請期待' : '以下是您本次冒險的設定，可點擊「編輯」隨時修改';
+        return '以下是您本次冒險的設定，可點擊「編輯」隨時修改';
       case 'en':
-        return _counting
-            ? 'A brand-new world awaits you. Get ready!'
-            : 'These are your adventure settings. Tap "Edit" to change them anytime.';
+        return 'These are your adventure settings. Tap "Edit" to change them anytime.';
       case 'es':
-        return _counting
-            ? 'Un mundo nuevo te espera. ¡Prepárate!'
-            : 'Estas son tus configuraciones de aventura. Toca "Editar" para cambiarlas cuando quieras.';
+        return 'Estas son tus configuraciones de aventura. Toca "Editar" para cambiarlas cuando quieras.';
       case 'fr':
-        return _counting
-            ? 'Un tout nouveau monde vous attend. Préparez-vous !'
-            : 'Voici les paramètres de votre aventure. Touchez « Modifier » pour les changer à tout moment.';
+        return 'Voici les paramètres de votre aventure. Touchez « Modifier » pour les changer à tout moment.';
       case 'de':
-        return _counting
-            ? 'Eine brandneue Welt erwartet dich. Mach dich bereit!'
-            : 'Dies sind deine Abenteuer-Einstellungen. Tippe auf „Bearbeiten“, um sie jederzeit zu ändern.';
+        return 'Dies sind deine Abenteuer-Einstellungen. Tippe auf „Bearbeiten“, um sie jederzeit zu ändern.';
       case 'pt':
-        return _counting
-            ? 'Um mundo totalmente novo espera por você. Prepare-se!'
-            : 'Estas são as configurações da sua aventura. Toque em "Editar" para alterá-las a qualquer momento.';
+        return 'Estas são as configurações da sua aventura. Toque em "Editar" para alterá-las a qualquer momento.';
       case 'ja':
-        return _counting
-            ? '新しい世界へようこそ。お楽しみに！'
-            : 'これがあなたの冒険の設定です。「編集」をタップしていつでも変更できます。';
+        return 'これがあなたの冒険の設定です。「編集」をタップしていつでも変更できます。';
       case 'ko':
-        return _counting
-            ? '새로운 세계가 당신을 기다립니다. 기대하세요!'
-            : '이것은 당신의 모험 설정입니다. 언제든지 "편집"을 눌러 변경할 수 있습니다.';
+        return '이것은 당신의 모험 설정입니다. 언제든지 "편집"을 눌러 변경할 수 있습니다.';
       default:
-        return _counting ? '现在开始进入全新的世界，请期待' : '以下是你本次冒险的设定，可点击"编辑"随时修改';
+        return '以下是你本次冒险的设定，可点击"编辑"随时修改';
     }
   }
 
@@ -449,40 +422,15 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     }
   }
 
-  /// 根据语言返回本地化的"正在进入全新的世界"文字
-  String _getEnteringText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '正在進入全新的世界…';
-      case 'en':
-        return 'Entering a brand-new world…';
-      case 'es':
-        return 'Entrando a un mundo nuevo…';
-      case 'fr':
-        return 'Entrée dans un tout nouveau monde…';
-      case 'de':
-        return 'Betreten einer brandneuen Welt…';
-      case 'pt':
-        return 'Entrando em um mundo novo…';
-      case 'ja':
-        return '新しい世界に入っています…';
-      case 'ko':
-        return '새로운 세계로 들어가는 중…';
-      default:
-        return '正在进入全新的世界…';
-    }
-  }
-
   /// 点击"确定"：先对用户已设定的全部内容进行服务器审核，
-  /// 审核通过（服务端判定 action == "none"）后再进入倒计时，否则弹窗提示修改。
+  /// 审核通过（服务端判定 action == "none"）后立即继续执行，否则弹窗提示修改。
   void _onConfirmPressed() {
     SoundService.playConfirm();
     showCupertinoDialog(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) =>
-          AuditDialog(text: _buildAuditText(), onApproved: _startCountdown),
+          AuditDialog(text: _buildAuditText(), onApproved: _onAuditApproved),
     );
   }
 
@@ -500,30 +448,13 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     return sb.toString();
   }
 
-  void _startCountdown() {
-    setState(() {
-      _counting = true;
-      _countdown = 5;
-    });
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-      if (_countdown <= 1) {
-        timer.cancel();
-        widget.onConfirmed();
-      } else {
-        setState(() {
-          _countdown--;
-        });
-      }
-    });
+  /// 审核通过后立即继续执行（原倒计时结束后才执行的 onConfirmed 改为即时执行）
+  void _onAuditApproved() {
+    widget.onConfirmed();
   }
 
-  /// 左上角"返回"：取消倒计时并跳回上一页（搭档设定）
+  /// 左上角"返回"：跳回上一页（搭档设定）
   void _onBackPressed() {
-    _timer?.cancel();
     widget.onBack();
   }
 
@@ -560,80 +491,68 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
         border: null,
       ),
       child: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const SizedBox(height: 12),
-                    Icon(
-                      CupertinoIcons.checkmark_seal_fill,
-                      size: 56,
-                      color: isDark
-                          ? AppTheme.accentBlueDark
-                          : AppTheme.accentBlueLight,
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      _getTitleText(),
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.w700,
-                        color: isDark
-                            ? AppTheme.primaryTextDark
-                            : AppTheme.primaryTextLight,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      _getSubtitleText(),
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 15,
-                        color: isDark
-                            ? AppTheme.secondaryTextDark
-                            : AppTheme.secondaryTextLight,
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-                    if (!_counting) ...[
-                      for (final item in items)
-                        _buildItemCard(
-                          isDark,
-                          label: item.label,
-                          value: item.value,
-                          onEdit: () => widget.onEdit(item.index),
-                        ),
-                      _buildCharacterCard(
-                        isDark,
-                        label: _getPlayerLabel(),
-                        gender: _genderText(SetupDraft.instance.playerGender),
-                        name: SetupDraft.instance.playerName,
-                        traits: SetupDraft.instance.playerTraits,
-                        onEdit: () => widget.onEdit(3),
-                      ),
-                      _buildCharacterCard(
-                        isDark,
-                        label: _getPartnerLabel(),
-                        gender: _genderText(SetupDraft.instance.partnerGender),
-                        name: SetupDraft.instance.partnerName,
-                        traits: SetupDraft.instance.partnerTraits,
-                        onEdit: () => widget.onEdit(4),
-                      ),
-                    ] else ...[
-                      _buildCountdown(isDark),
-                    ],
-                  ],
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 12),
+              Icon(
+                CupertinoIcons.checkmark_seal_fill,
+                size: 56,
+                color: isDark
+                    ? AppTheme.accentBlueDark
+                    : AppTheme.accentBlueLight,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                _getTitleText(),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w700,
+                  color: isDark
+                      ? AppTheme.primaryTextDark
+                      : AppTheme.primaryTextLight,
                 ),
               ),
-            ),
-            if (!_counting)
+              const SizedBox(height: 8),
+              Text(
+                _getSubtitleText(),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 15,
+                  color: isDark
+                      ? AppTheme.secondaryTextDark
+                      : AppTheme.secondaryTextLight,
+                ),
+              ),
+              const SizedBox(height: 24),
+              for (final item in items)
+                _buildItemCard(
+                  isDark,
+                  label: item.label,
+                  value: item.value,
+                  onEdit: () => widget.onEdit(item.index),
+                ),
+              _buildCharacterCard(
+                isDark,
+                label: _getPlayerLabel(),
+                gender: _genderText(SetupDraft.instance.playerGender),
+                name: SetupDraft.instance.playerName,
+                traits: SetupDraft.instance.playerTraits,
+                onEdit: () => widget.onEdit(3),
+              ),
+              _buildCharacterCard(
+                isDark,
+                label: _getPartnerLabel(),
+                gender: _genderText(SetupDraft.instance.partnerGender),
+                name: SetupDraft.instance.partnerName,
+                traits: SetupDraft.instance.partnerTraits,
+                onEdit: () => widget.onEdit(4),
+              ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                padding: const EdgeInsets.only(top: 24),
                 child: CupertinoButton.filled(
                   onPressed: _onConfirmPressed,
                   padding: const EdgeInsets.symmetric(vertical: 14),
@@ -646,7 +565,8 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
                   ),
                 ),
               ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -804,48 +724,6 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildCountdown(bool isDark) {
-    return Column(
-      children: [
-        const SizedBox(height: 40),
-        Container(
-          width: 120,
-          height: 120,
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(
-              color: isDark
-                  ? AppTheme.accentBlueDark
-                  : AppTheme.accentBlueLight,
-              width: 3,
-            ),
-          ),
-          child: Text(
-            '$_countdown',
-            style: TextStyle(
-              fontSize: 48,
-              fontWeight: FontWeight.w700,
-              color: isDark
-                  ? AppTheme.accentBlueDark
-                  : AppTheme.accentBlueLight,
-            ),
-          ),
-        ),
-        const SizedBox(height: 16),
-        Text(
-          _getEnteringText(),
-          style: TextStyle(
-            fontSize: 16,
-            color: isDark
-                ? AppTheme.secondaryTextDark
-                : AppTheme.secondaryTextLight,
-          ),
-        ),
-      ],
     );
   }
 }

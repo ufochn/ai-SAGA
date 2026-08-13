@@ -99,10 +99,40 @@ class StorageService {
     return 'zh';
   }
 
-  /// 清除所有持久化数据（将所有内容设为空字符串）
-  /// 注意：不删除用户唯一标识
+  /// 语言选择页默认齿轮位置对应的语言代码：
+  /// - 已有已选语言 → 返回该语言；
+  /// - 未选语言 → 返回系统语言（简体/繁体正确区分）；
+  /// - 系统语言不受 App 支持 → 返回 ''（语言页默认对准 English）。
+  static String getDefaultLanguageForPicker() {
+    final stored = _prefs.getString(_keyLanguage);
+    if (stored != null && stored.isNotEmpty) return stored;
+    try {
+      final locale = PlatformDispatcher.instance.locale;
+      final code = locale.languageCode.toLowerCase();
+      final script = (locale.scriptCode ?? '').toLowerCase();
+      final country = (locale.countryCode ?? '').toUpperCase();
+      if (code == 'zh') {
+        return (script == 'hant' ||
+                country == 'TW' ||
+                country == 'HK' ||
+                country == 'MO')
+            ? 'zh-TW'
+            : 'zh';
+      }
+      const supported = {'en', 'es', 'fr', 'de', 'pt', 'ja', 'ko'};
+      return supported.contains(code) ? code : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// 清除重置流程需要清空的本地数据。
+  /// 注意：不删除用户唯一标识，也不清空语言偏好 ——
+  /// 用户曾选语言优先于系统语言，因此"重新开始/重置"后仍沿用之前选择的语言，
+  /// 语言页默认齿轮也会对准用户曾选语言而非系统语言。
   static Future<void> clearAll() async {
-    await _prefs.setString(_keyLanguage, '');
+    // 语言偏好予以保留（曾用语言优先于系统语言）；
+    // 当前无其它需要在本地清空的键（小说正文存储在服务器，由 resetStory 清空）。
   }
 
   // ---- 安全存储（iOS Keychain / Android Keystore）----
@@ -126,5 +156,44 @@ class StorageService {
   /// 从系统安全存储删除敏感信息。
   static Future<void> deleteSecure(String key) async {
     await _secureStorage.delete(key: key);
+  }
+
+  /// 按当前语言返回本地化文本：弹窗/错误信息等必须与 App 当前语言一致，
+  /// 避免出现"葡语标题 + 中文详情"这类语言混用。
+  /// [zhCN] 为简体中文（最终回退）；未提供的语言回退英文。
+  static String localizedText({
+    required String zhCN,
+    required String zhTW,
+    required String en,
+    String? yue,
+    String? es,
+    String? fr,
+    String? de,
+    String? pt,
+    String? ja,
+    String? ko,
+  }) {
+    switch (getLanguage()) {
+      case 'zh-TW':
+        return zhTW;
+      case 'yue':
+        return yue ?? zhTW;
+      case 'en':
+        return en;
+      case 'es':
+        return es ?? en;
+      case 'fr':
+        return fr ?? en;
+      case 'de':
+        return de ?? en;
+      case 'pt':
+        return pt ?? en;
+      case 'ja':
+        return ja ?? en;
+      case 'ko':
+        return ko ?? en;
+      default:
+        return zhCN;
+    }
   }
 }

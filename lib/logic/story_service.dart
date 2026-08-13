@@ -4,6 +4,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 
 import 'package:ai_saga/logic/auth_service.dart';
+import 'package:ai_saga/logic/storage_service.dart';
 
 /// 小说生成服务（流式）：把用户设定发送到 FastAPI 网关，网关先审首段、
 /// 通过后以 SSE 流式返回正文（chunk → reveal），用于打字机效果显示。
@@ -56,7 +57,18 @@ class StoryService {
   }) async {
     final url = _storyApiUrl;
     if (url.isEmpty) {
-      onError('小说生成地址未配置：请检查 .env 中的 STORY_API_URL 或 AUDIT_API_URL');
+      onError(StorageService.localizedText(
+        zhCN: '小说生成地址未配置：请检查 .env 中的 STORY_API_URL 或 AUDIT_API_URL',
+        zhTW: '小說生成位址未配置：請檢查 .env 中的 STORY_API_URL 或 AUDIT_API_URL',
+        en: 'Story generation URL is not configured. Please check STORY_API_URL or AUDIT_API_URL in your .env file.',
+        yue: '小說生成位址未配置：請檢查 .env 入面嘅 STORY_API_URL 或 AUDIT_API_URL',
+        es: 'La URL de generación de historias no está configurada. Compruebe STORY_API_URL o AUDIT_API_URL en su archivo .env.',
+        fr: "L'URL de génération d'histoire n'est pas configurée. Vérifiez STORY_API_URL ou AUDIT_API_URL dans votre fichier .env.",
+        de: 'Die URL zur Story-Generierung ist nicht konfiguriert. Bitte prüfen Sie STORY_API_URL oder AUDIT_API_URL in Ihrer .env-Datei.',
+        pt: 'A URL de geração de histórias não está configurada. Verifique STORY_API_URL ou AUDIT_API_URL no seu arquivo .env.',
+        ja: 'ストーリー生成URLが設定されていません。.envファイルのSTORY_API_URLまたはAUDIT_API_URLを確認してください。',
+        ko: '스토리 생성 URL이 구성되지 않았습니다. .env 파일에서 STORY_API_URL 또는 AUDIT_API_URL을 확인하세요.',
+      ));
       return;
     }
     final token = await AuthService.ensureToken();
@@ -150,11 +162,35 @@ class StoryService {
             );
             break;
           case 'abort':
-            onAbort(evt['reason'] as String? ?? '生成内容包含违规信息');
+            onAbort(evt['reason'] as String? ??
+                StorageService.localizedText(
+                  zhCN: '生成内容包含违规信息',
+                  zhTW: '生成內容包含違規資訊',
+                  en: 'The generated content contains violating information',
+                  yue: '生成內容包含違規資訊',
+                  es: 'El contenido generado contiene información que infringe las normas',
+                  fr: 'Le contenu généré contient des informations non conformes',
+                  de: 'Der generierte Inhalt enthält regelwidrige Informationen',
+                  pt: 'O conteúdo gerado contém informações que violam as diretrizes',
+                  ja: '生成された内容に違反情報が含まれています',
+                  ko: '생성된 콘텐츠에 위반 정보가 포함되어 있습니다',
+                ));
             break;
           case 'error':
             onError(
-              evt['message'] as String? ?? '生成失败',
+              evt['message'] as String? ??
+                  StorageService.localizedText(
+                    zhCN: '生成失败',
+                    zhTW: '生成失敗',
+                    en: 'Generation failed',
+                    yue: '生成失敗',
+                    es: 'Error de generación',
+                    fr: 'Échec de la génération',
+                    de: 'Generierung fehlgeschlagen',
+                    pt: 'Falha na geração',
+                    ja: '生成に失敗しました',
+                    ko: '생성에 실패했습니다',
+                  ),
               code: evt['code'] as String?,
             );
             break;
@@ -172,12 +208,47 @@ class StoryService {
       // - 若已判定卡死（stalled），已由 onStalled 处理，不再重复处理；
       // - 否则视为"未完整接收"，按错误处理（禁止基于残缺文本续写）
       if (!doneCalled && !stalled) {
-        onError('生成未完整接收（未收到服务器结束信号），请检查网络后重试');
+        onError(StorageService.localizedText(
+          zhCN: '生成未完整接收（未收到服务器结束信号），请检查网络后重试',
+          zhTW: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後重試',
+          en: 'Generation was incomplete (no server completion signal). Please check your network and try again.',
+          yue: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後再試',
+          es: 'La generación fue incompleta (no se recibió la señal de finalización del servidor). Compruebe su red e inténtelo de nuevo.',
+          fr: 'La génération est incomplète (aucun signal de fin du serveur). Vérifiez votre réseau et réessayez.',
+          de: 'Die Generierung war unvollständig (kein Abschlusssignal vom Server). Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.',
+          pt: 'A geração ficou incompleta (nenhum sinal de conclusão do servidor). Verifique sua rede e tente novamente.',
+          ja: '生成が不完全でした（サーバーからの終了信号がありません）。ネットワークを確認して、もう一度お試しください。',
+          ko: '생성이 불완전했습니다(서버 종료 신호 없음). 네트워크를 확인하고 다시 시도해 주세요.',
+        ));
       }
     } catch (e) {
       if (stalled) return; // 卡死已由 onStalled 处理，不再重复报错
       if (e.toString().contains('TimeoutException')) {
-        onError('生成超时，请稍后重试');
+        onError(StorageService.localizedText(
+          zhCN: '生成超时，请稍后重试',
+          zhTW: '生成逾時，請稍後重試',
+          en: 'Generation timed out. Please try again later.',
+          yue: '生成逾時，請稍後再試',
+          es: 'La generación agotó el tiempo. Inténtelo de nuevo más tarde.',
+          fr: 'La génération a expiré. Veuillez réessayer plus tard.',
+          de: 'Die Generierung ist abgelaufen. Bitte versuchen Sie es später erneut.',
+          pt: 'A geração expirou. Tente novamente mais tarde.',
+          ja: '生成がタイムアウトしました。後でもう一度お試しください。',
+          ko: '생성 시간이 초과되었습니다. 나중에 다시 시도해 주세요.',
+        ));
+      } else if (e is http.ClientException) {
+        onError(StorageService.localizedText(
+          zhCN: '无法连接服务器，请检查网络后重试',
+          zhTW: '無法連接伺服器，請檢查網路後重試',
+          en: 'Unable to connect to the server. Please check your network and try again.',
+          yue: '無法連接伺服器，請檢查網路後再試',
+          es: 'No se pudo conectar con el servidor. Compruebe su red e inténtelo de nuevo.',
+          fr: 'Impossible de se connecter au serveur. Vérifiez votre réseau et réessayez.',
+          de: 'Keine Verbindung zum Server möglich. Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.',
+          pt: 'Não foi possível conectar ao servidor. Verifique sua rede e tente novamente.',
+          ja: 'サーバーに接続できません。ネットワークを確認して、もう一度お試しください。',
+          ko: '서버에 연결할 수 없습니다. 네트워크를 확인하고 다시 시도해 주세요.',
+        ));
       } else {
         onError(e.toString());
       }

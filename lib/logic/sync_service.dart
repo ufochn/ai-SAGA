@@ -71,7 +71,18 @@ class SyncService {
     final token = await AuthService.ensureToken();
     final url = _storyApiUrl;
     if (url.isEmpty) {
-      throw Exception('小说存储地址未配置，无法清空服务器数据');
+      throw Exception(StorageService.localizedText(
+        zhCN: '小说存储地址未配置，无法清空服务器数据',
+        zhTW: '小說儲存位址未配置，無法清空伺服器資料',
+        en: 'Story storage URL is not configured. Unable to clear server data.',
+        yue: '小說儲存位址未配置，無法清空伺服器資料',
+        es: 'La URL de almacenamiento de historias no está configurada. No se pueden borrar los datos del servidor.',
+        fr: "L'URL de stockage des histoires n'est pas configurée. Impossible d'effacer les données du serveur.",
+        de: 'Die URL für die Story-Speicherung ist nicht konfiguriert. Serverdaten können nicht gelöscht werden.',
+        pt: 'A URL de armazenamento de histórias não está configurada. Não foi possível limpar os dados do servidor.',
+        ja: 'ストーリー保存URLが設定されていません。サーバーデータをクリアできません。',
+        ko: '스토리 저장 URL이 구성되지 않았습니다. 서버 데이터를 지울 수 없습니다.',
+      ));
     }
     final base = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
     final resp = await http
@@ -85,7 +96,20 @@ class SyncService {
         )
         .timeout(const Duration(seconds: 30));
     if (resp.statusCode != 200) {
-      throw Exception('清空服务器数据失败：HTTP ${resp.statusCode} ${resp.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '清空服务器数据失败',
+          zhTW: '清空伺服器資料失敗',
+          en: 'Failed to clear server data',
+          yue: '清空伺服器資料失敗',
+          es: 'Error al borrar los datos del servidor',
+          fr: 'Échec de l\'effacement des données du serveur',
+          de: 'Fehler beim Löschen der Serverdaten',
+          pt: 'Falha ao limpar os dados do servidor',
+          ja: 'サーバーデータのクリアに失敗しました',
+          ko: '서버 데이터를 지우지 못했습니다',
+        )}: HTTP ${resp.statusCode} ${resp.body}',
+      );
     }
   }
 
@@ -121,7 +145,20 @@ class SyncService {
         )
         .timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) {
-      throw Exception('加载更早章节失败：HTTP ${resp.statusCode} ${resp.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '加载更早章节失败',
+          zhTW: '載入更早章節失敗',
+          en: 'Failed to load earlier chapters',
+          yue: '載入更早章節失敗',
+          es: 'Error al cargar capítulos anteriores',
+          fr: 'Échec du chargement des chapitres précédents',
+          de: 'Fehler beim Laden früherer Kapitel',
+          pt: 'Falha ao carregar capítulos anteriores',
+          ja: '以前の章の読み込みに失敗しました',
+          ko: '이전 장을 불러오지 못했습니다',
+        )}: HTTP ${resp.statusCode} ${resp.body}',
+      );
     }
     return _parseStory(resp.body);
   }
@@ -145,7 +182,20 @@ class SyncService {
         )
         .timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) {
-      throw Exception('设备激活失败：HTTP ${resp.statusCode} ${resp.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '设备激活失败',
+          zhTW: '裝置啟用失敗',
+          en: 'Device activation failed',
+          yue: '裝置啟用失敗',
+          es: 'Error al activar el dispositivo',
+          fr: 'Échec de l\'activation de l\'appareil',
+          de: 'Geräteaktivierung fehlgeschlagen',
+          pt: 'Falha na ativação do dispositivo',
+          ja: 'デバイスのアクティベーションに失敗しました',
+          ko: '기기 활성화에 실패했습니다',
+        )}: HTTP ${resp.statusCode} ${resp.body}',
+      );
     }
   }
 
@@ -178,7 +228,20 @@ class SyncService {
         )
         .timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) {
-      throw Exception('数据同步失败：HTTP ${resp.statusCode} ${resp.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '数据同步失败',
+          zhTW: '資料同步失敗',
+          en: 'Data sync failed',
+          yue: '資料同步失敗',
+          es: 'Error de sincronización de datos',
+          fr: 'Échec de la synchronisation des données',
+          de: 'Datensynchronisierung fehlgeschlagen',
+          pt: 'Falha na sincronização de dados',
+          ja: 'データ同期に失敗しました',
+          ko: '데이터 동기화에 실패했습니다',
+        )}: HTTP ${resp.statusCode} ${resp.body}',
+      );
     }
     return _parseStory(resp.body);
   }

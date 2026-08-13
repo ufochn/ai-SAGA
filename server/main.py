@@ -1613,6 +1613,20 @@ async def generate_story(data: StoryInputData, request: Request):
     device_id = claims["device_id"]
     _enforce_active_device(user_id, device_id)
 
+    # 防御性校验：续写必须有用户指引，禁止无指引生成新小说内容。
+    # 第一轮全新生成（库中无任何段落）允许空白 user_input；其余情况
+    # （时间树"从这里重写" rewrite_from>=0 / 已有正文的续写）一律要求
+    # user_input 非空白。必须放在任何数据库写入/截断【之前】，空白输入
+    # 不得破坏已有故事，也不得调用 Dify 无指引续写。
+    if not (data.user_input or "").strip():
+        _prev, _cnt = _get_story_tail(user_id)
+        _is_rewrite = data.rewrite_from is not None and data.rewrite_from >= 0
+        if _cnt > 0 or _is_rewrite:
+            raise HTTPException(
+                status_code=400,
+                detail="续写需要用户输入指引，请先填写内容再继续",
+            )
+
     # 用户最新选择持久化：无论最新一段，还是时间树"从这里重新开始"的历史段
     # （rewrite_from），用户点击确定/继续时，把三个输入框当前值覆盖到对应段的
     # choice_1/2/3，永远保持服务器保存的是用户的最新选择。

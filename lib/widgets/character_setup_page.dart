@@ -400,28 +400,28 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
     }
   }
 
-  /// 根据语言返回本地化的"完成設定"文字
+  /// 根据语言返回本地化的"下一步"文字
   String _getSubmitText() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '完成設定';
+        return '下一步';
       case 'en':
-        return 'Done';
+        return 'Next';
       case 'es':
-        return 'Hecho';
+        return 'Siguiente';
       case 'fr':
-        return 'Terminé';
+        return 'Suivant';
       case 'de':
-        return 'Fertig';
+        return 'Weiter';
       case 'pt':
-        return 'Concluído';
+        return 'Próximo';
       case 'ja':
-        return '設定完了';
+        return '次へ';
       case 'ko':
-        return '설정 완료';
+        return '다음';
       default:
-        return '完成设定';
+        return '下一步';
     }
   }
 
@@ -553,269 +553,291 @@ class _CharacterSetupPageState extends State<CharacterSetupPage> {
         border: null,
       ),
       child: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                _getTitleText(),
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                  color: isDark
-                      ? AppTheme.primaryTextDark
-                      : AppTheme.primaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                _getSubtitleText(),
-                style: TextStyle(
-                  fontSize: 16,
-                  color: isDark
-                      ? AppTheme.secondaryTextDark
-                      : AppTheme.secondaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              // 性别选择卡片
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    _buildFormRow(
-                      context,
-                      label: _getGenderLabel(),
-                      child: CupertinoSlidingSegmentedControl<int>(
-                        groupValue: _partnerGenderIndex,
-                        children: {
-                          0: Text(
-                            _getMaleText(),
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: _partnerGenderIndex == 0
-                                  ? (isDark
-                                        ? AppTheme.primaryTextDark
-                                        : AppTheme.primaryTextLight)
-                                  : (isDark
-                                        ? AppTheme.secondaryTextDark
-                                        : AppTheme.secondaryTextLight),
-                            ),
-                          ),
-                          1: Text(
-                            _getFemaleText(),
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: _partnerGenderIndex == 1
-                                  ? (isDark
-                                        ? AppTheme.primaryTextDark
-                                        : AppTheme.primaryTextLight)
-                                  : (isDark
-                                        ? AppTheme.secondaryTextDark
-                                        : AppTheme.secondaryTextLight),
-                            ),
-                          ),
-                        },
-                        onValueChanged: _onPartnerGenderChanged,
-                      ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final buttonTop = constraints.maxHeight * 0.75;
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: SingleChildScrollView(
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      24,
+                      16,
+                      constraints.maxHeight * 0.25,
                     ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              // 姓名输入卡片
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    _buildFormRow(
-                      context,
-                      label: _getNameLabel(),
-                      child: CupertinoTextField(
-                        controller: _partnerNameController,
-                        focusNode: _partnerNameFocusNode,
-                        placeholder: _getNamePlaceholder(),
-                        placeholderStyle: TextStyle(
-                          color: isDark
-                              ? AppTheme.tertiaryTextDark
-                              : AppTheme.tertiaryTextLight,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Text(
+                          _getTitleText(),
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w700,
+                            color: isDark
+                                ? AppTheme.primaryTextDark
+                                : AppTheme.primaryTextLight,
+                          ),
+                          textAlign: TextAlign.center,
                         ),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 10,
-                        ),
-                        decoration: null,
-                        style: TextStyle(
-                          color: _isNameOverLimit
-                              ? (isDark
-                                    ? AppTheme.destructiveRedDark
-                                    : AppTheme.destructiveRedLight)
-                              : (isDark
-                                    ? AppTheme.primaryTextDark
-                                    : AppTheme.primaryTextLight),
-                          fontSize: 17,
-                        ),
-                        onChanged: (value) {
-                          setState(() {});
-                        },
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.only(
-                        left: 16,
-                        right: 12,
-                        bottom: 10,
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            CupertinoIcons.pencil,
-                            size: 14,
+                        const SizedBox(height: 8),
+                        Text(
+                          _getSubtitleText(),
+                          style: TextStyle(
+                            fontSize: 16,
                             color: isDark
                                 ? AppTheme.secondaryTextDark
                                 : AppTheme.secondaryTextLight,
                           ),
-                          const SizedBox(width: 6),
-                          Text(
-                            _getEditHint().replaceAll('✏️ ', ''),
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: isDark
-                                  ? AppTheme.secondaryTextDark
-                                  : AppTheme.secondaryTextLight,
-                            ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 32),
+                        // 性别选择卡片
+                        Container(
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.cardBackgroundDark
+                                : AppTheme.cardBackgroundLight,
+                            borderRadius: BorderRadius.circular(12),
                           ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              // 个人特质卡片
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _getTraitsLabel(),
-                            style: TextStyle(
-                              fontSize: 15,
-                              color: isDark
-                                  ? AppTheme.primaryTextDark
-                                  : AppTheme.primaryTextLight,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _getTraitsHint(),
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: isDark
-                                  ? AppTheme.secondaryTextDark
-                                  : AppTheme.secondaryTextLight,
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          CupertinoTextField(
-                            controller: _partnerTraitsController,
-                            placeholder: _getTraitsPlaceholder(),
-                            placeholderStyle: TextStyle(
-                              color: isDark
-                                  ? AppTheme.tertiaryTextDark
-                                  : AppTheme.tertiaryTextLight,
-                            ),
-                            maxLines: 3,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: isDark
-                                  ? AppTheme.fieldBackgroundDark
-                                  : AppTheme.fieldBackgroundLight,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: isDark
-                                    ? AppTheme.inputBorderDark
-                                    : AppTheme.inputBorderLight,
-                                width: 0.5,
+                          child: Column(
+                            children: [
+                              _buildFormRow(
+                                context,
+                                label: _getGenderLabel(),
+                                child: CupertinoSlidingSegmentedControl<int>(
+                                  groupValue: _partnerGenderIndex,
+                                  children: {
+                                    0: Text(
+                                      _getMaleText(),
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color: _partnerGenderIndex == 0
+                                            ? (isDark
+                                                  ? AppTheme.primaryTextDark
+                                                  : AppTheme.primaryTextLight)
+                                            : (isDark
+                                                  ? AppTheme.secondaryTextDark
+                                                  : AppTheme
+                                                        .secondaryTextLight),
+                                      ),
+                                    ),
+                                    1: Text(
+                                      _getFemaleText(),
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color: _partnerGenderIndex == 1
+                                            ? (isDark
+                                                  ? AppTheme.primaryTextDark
+                                                  : AppTheme.primaryTextLight)
+                                            : (isDark
+                                                  ? AppTheme.secondaryTextDark
+                                                  : AppTheme
+                                                        .secondaryTextLight),
+                                      ),
+                                    ),
+                                  },
+                                  onValueChanged: _onPartnerGenderChanged,
+                                ),
                               ),
-                            ),
-                            style: TextStyle(
-                              color: _isTraitsOverLimit
-                                  ? (isDark
-                                        ? AppTheme.destructiveRedDark
-                                        : AppTheme.destructiveRedLight)
-                                  : (isDark
-                                        ? AppTheme.primaryTextDark
-                                        : AppTheme.primaryTextLight),
-                              fontSize: 17,
-                            ),
-                            onChanged: (value) {
-                              // 用户手动输入后，性别切换不再覆盖其自定义内容
-                              _partnerTraitsEdited = true;
-                              setState(() {});
-                            },
+                            ],
                           ),
-                        ],
-                      ),
+                        ),
+                        const SizedBox(height: 16),
+                        // 姓名输入卡片
+                        Container(
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.cardBackgroundDark
+                                : AppTheme.cardBackgroundLight,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Column(
+                            children: [
+                              _buildFormRow(
+                                context,
+                                label: _getNameLabel(),
+                                child: CupertinoTextField(
+                                  controller: _partnerNameController,
+                                  focusNode: _partnerNameFocusNode,
+                                  placeholder: _getNamePlaceholder(),
+                                  placeholderStyle: TextStyle(
+                                    color: isDark
+                                        ? AppTheme.tertiaryTextDark
+                                        : AppTheme.tertiaryTextLight,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 10,
+                                  ),
+                                  decoration: null,
+                                  style: TextStyle(
+                                    color: _isNameOverLimit
+                                        ? (isDark
+                                              ? AppTheme.destructiveRedDark
+                                              : AppTheme.destructiveRedLight)
+                                        : (isDark
+                                              ? AppTheme.primaryTextDark
+                                              : AppTheme.primaryTextLight),
+                                    fontSize: 17,
+                                  ),
+                                  onChanged: (value) {
+                                    setState(() {});
+                                  },
+                                ),
+                              ),
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  left: 16,
+                                  right: 12,
+                                  bottom: 10,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      CupertinoIcons.pencil,
+                                      size: 14,
+                                      color: isDark
+                                          ? AppTheme.secondaryTextDark
+                                          : AppTheme.secondaryTextLight,
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      _getEditHint().replaceAll('✏️ ', ''),
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: isDark
+                                            ? AppTheme.secondaryTextDark
+                                            : AppTheme.secondaryTextLight,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        // 个人特质卡片
+                        Container(
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.cardBackgroundDark
+                                : AppTheme.cardBackgroundLight,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Column(
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.all(16),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _getTraitsLabel(),
+                                      style: TextStyle(
+                                        fontSize: 15,
+                                        color: isDark
+                                            ? AppTheme.primaryTextDark
+                                            : AppTheme.primaryTextLight,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      _getTraitsHint(),
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: isDark
+                                            ? AppTheme.secondaryTextDark
+                                            : AppTheme.secondaryTextLight,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 12),
+                                    CupertinoTextField(
+                                      controller: _partnerTraitsController,
+                                      placeholder: _getTraitsPlaceholder(),
+                                      placeholderStyle: TextStyle(
+                                        color: isDark
+                                            ? AppTheme.tertiaryTextDark
+                                            : AppTheme.tertiaryTextLight,
+                                      ),
+                                      maxLines: 3,
+                                      padding: const EdgeInsets.all(12),
+                                      decoration: BoxDecoration(
+                                        color: isDark
+                                            ? AppTheme.fieldBackgroundDark
+                                            : AppTheme.fieldBackgroundLight,
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                          color: isDark
+                                              ? AppTheme.inputBorderDark
+                                              : AppTheme.inputBorderLight,
+                                          width: 0.5,
+                                        ),
+                                      ),
+                                      style: TextStyle(
+                                        color: _isTraitsOverLimit
+                                            ? (isDark
+                                                  ? AppTheme.destructiveRedDark
+                                                  : AppTheme
+                                                        .destructiveRedLight)
+                                            : (isDark
+                                                  ? AppTheme.primaryTextDark
+                                                  : AppTheme.primaryTextLight),
+                                        fontSize: 17,
+                                      ),
+                                      onChanged: (value) {
+                                        // 用户手动输入后，性别切换不再覆盖其自定义内容
+                                        _partnerTraitsEdited = true;
+                                        setState(() {});
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 24),
-              // iOS风格完成按钮
-              SizedBox(
-                height: 48,
-                child: CupertinoButton.filled(
-                  onPressed: canSubmit ? _onSubmit : null,
-                  borderRadius: BorderRadius.circular(12),
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  color: isDark
-                      ? AppTheme.buttonFillDark
-                      : AppTheme.buttonFillLight,
-                  disabledColor: isDark
-                      ? const Color(0xFF2C2C2E)
-                      : const Color(0xFFF2F2F7),
-                  child: Text(
-                    _getSubmitText(),
-                    style: TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w600,
-                      color: canSubmit
-                          ? AppTheme.buttonText
-                          : (isDark
-                                ? AppTheme.buttonDisabledTextDark
-                                : AppTheme.buttonDisabledTextLight),
-                    ),
-                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              ),
-              const SizedBox(height: 48),
-            ],
-          ),
+                // iOS风格完成按钮（固定于页面 3/4 高度位置）
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  top: buttonTop,
+                  child: SizedBox(
+                    height: 48,
+                    child: CupertinoButton.filled(
+                      onPressed: canSubmit ? _onSubmit : null,
+                      borderRadius: BorderRadius.circular(12),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      color: isDark
+                          ? AppTheme.buttonFillDark
+                          : AppTheme.buttonFillLight,
+                      disabledColor: isDark
+                          ? const Color(0xFF2C2C2E)
+                          : const Color(0xFFF2F2F7),
+                      child: Text(
+                        _getSubmitText(),
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                          color: canSubmit
+                              ? AppTheme.buttonText
+                              : (isDark
+                                    ? AppTheme.buttonDisabledTextDark
+                                    : AppTheme.buttonDisabledTextLight),
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );

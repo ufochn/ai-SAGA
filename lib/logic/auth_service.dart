@@ -57,7 +57,18 @@ class AuthService {
   static Future<String> _register() async {
     final url = _registerApiUrl;
     if (url.isEmpty) {
-      throw Exception('服务器注册地址未配置：请检查 .env 中的 REGISTER_API_URL');
+      throw Exception(StorageService.localizedText(
+        zhCN: '服务器注册地址未配置：请检查 .env 中的 REGISTER_API_URL',
+        zhTW: '伺服器註冊位址未配置：請檢查 .env 中的 REGISTER_API_URL',
+        en: 'Server registration URL is not configured. Please check REGISTER_API_URL in your .env file.',
+        yue: '伺服器註冊位址未配置：請檢查 .env 入面嘅 REGISTER_API_URL',
+        es: 'La URL de registro del servidor no está configurada. Compruebe REGISTER_API_URL en su archivo .env.',
+        fr: "L'URL d'enregistrement du serveur n'est pas configurée. Vérifiez REGISTER_API_URL dans votre fichier .env.",
+        de: 'Die Server-Registrierungs-URL ist nicht konfiguriert. Bitte prüfen Sie REGISTER_API_URL in Ihrer .env-Datei.',
+        pt: 'A URL de registro do servidor não está configurada. Verifique REGISTER_API_URL no seu arquivo .env.',
+        ja: 'サーバー登録URLが設定されていません。.envファイルのREGISTER_API_URLを確認してください。',
+        ko: '서버 등록 URL이 구성되지 않았습니다. .env 파일에서 REGISTER_API_URL을 확인하세요.',
+      ));
     }
 
     // 1) 轻授权账号（若未授权则抛错，由上层引导到 LightAuthPage）
@@ -69,7 +80,18 @@ class AuthService {
     // 2) 设备标识（稳定、持久）
     final deviceId = StorageService.getUserUniqueId();
     if (deviceId.isEmpty) {
-      throw Exception('设备唯一 ID 缺失，无法注册');
+      throw Exception(StorageService.localizedText(
+        zhCN: '设备唯一 ID 缺失，无法注册',
+        zhTW: '裝置唯一 ID 缺失，無法註冊',
+        en: 'Device unique ID is missing. Unable to register.',
+        yue: '裝置唯一 ID 缺失，無法註冊',
+        es: 'Falta el ID único del dispositivo. No se puede registrar.',
+        fr: 'L\'identifiant unique de l\'appareil est manquant. Impossible de s\'enregistrer.',
+        de: 'Eindeutige Geräte-ID fehlt. Registrierung nicht möglich.',
+        pt: 'Falta o ID exclusivo do dispositivo. Não é possível registrar.',
+        ja: 'デバイスの一意なIDがありません。登録できません。',
+        ko: '기기 고유 ID가 없습니다. 등록할 수 없습니다.',
+      ));
     }
 
     // 3) 硬件公钥（私钥永不出安全硬件）
@@ -118,14 +140,38 @@ class AuthService {
           response.body.contains('hardware_account_limit')) {
         throw const HardwareAccountLimitException();
       }
-      throw Exception('设备注册失败：HTTP ${response.statusCode} ${response.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '设备注册失败',
+          zhTW: '裝置註冊失敗',
+          en: 'Device registration failed',
+          yue: '裝置註冊失敗',
+          es: 'Error al registrar el dispositivo',
+          fr: 'Échec de l\'enregistrement de l\'appareil',
+          de: 'Geräteregistrierung fehlgeschlagen',
+          pt: 'Falha no registro do dispositivo',
+          ja: 'デバイスの登録に失敗しました',
+          ko: '기기 등록에 실패했습니다',
+        )}: HTTP ${response.statusCode} ${response.body}',
+      );
     }
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     final token = data['token'] as String?;
     final expiresAt = (data['expires_at'] as num?)?.toInt();
     if (token == null || token.isEmpty || expiresAt == null) {
-      throw Exception('服务器返回的令牌无效');
+      throw Exception(StorageService.localizedText(
+        zhCN: '服务器返回的令牌无效',
+        zhTW: '伺服器回傳的令牌無效',
+        en: 'The token returned by the server is invalid.',
+        yue: '伺服器回傳嘅令牌無效',
+        es: 'El token devuelto por el servidor no es válido.',
+        fr: 'Le jeton renvoyé par le serveur est invalide.',
+        de: 'Das vom Server zurückgegebene Token ist ungültig.',
+        pt: 'O token retornado pelo servidor é inválido.',
+        ja: 'サーバーが返したトークンが無効です。',
+        ko: '서버가 반환한 토큰이 유효하지 않습니다.',
+      ));
     }
 
     await _storage.write(key: _tokenKey, value: token);
@@ -147,7 +193,20 @@ class AuthService {
         )
         .timeout(const Duration(seconds: 20));
     if (response.statusCode != 200) {
-      throw Exception('获取挑战失败：HTTP ${response.statusCode} ${response.body}');
+      throw Exception(
+        '${StorageService.localizedText(
+          zhCN: '获取挑战失败',
+          zhTW: '取得挑戰失敗',
+          en: 'Failed to obtain challenge',
+          yue: '取得挑戰失敗',
+          es: 'Error al obtener el desafío',
+          fr: 'Échec de l\'obtention du défi',
+          de: 'Fehler beim Abrufen der Challenge',
+          pt: 'Falha ao obter o desafio',
+          ja: 'チャレンジの取得に失敗しました',
+          ko: '챌린지를 가져오지 못했습니다',
+        )}: HTTP ${response.statusCode} ${response.body}',
+      );
     }
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     final challenge = data['challenge'] as String?;
@@ -156,7 +215,18 @@ class AuthService {
         challenge.isEmpty ||
         challengeId == null ||
         challengeId.isEmpty) {
-      throw Exception('服务器未返回有效的挑战');
+      throw Exception(StorageService.localizedText(
+        zhCN: '服务器未返回有效的挑战',
+        zhTW: '伺服器未回傳有效的挑戰',
+        en: 'The server did not return a valid challenge.',
+        yue: '伺服器未回傳有效嘅挑戰',
+        es: 'El servidor no devolvió un desafío válido.',
+        fr: 'Le serveur n\'a pas renvoyé de défi valide.',
+        de: 'Der Server hat keine gültige Challenge zurückgegeben.',
+        pt: 'O servidor não retornou um desafio válido.',
+        ja: 'サーバーが有効なチャレンジを返しませんでした。',
+        ko: '서버가 유효한 챌린지를 반환하지 않았습니다.',
+      ));
     }
     return {'challenge_id': challengeId, 'challenge': challenge};
   }

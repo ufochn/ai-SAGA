@@ -1,4 +1,5 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:ai_saga/widgets/account_limit_warning.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
 import 'package:ai_saga/widgets/character_text.dart';
@@ -91,9 +92,49 @@ class _CompensatingScrollPosition extends ScrollPositionWithSingleContext {
   }
 }
 
+/// 包裹子组件并在其尺寸变化（含首次布局）时回调报告当前尺寸。
+///
+/// 与 `SizeChangedLayoutNotifier` 不同：直接通过回调回传尺寸，无需 GlobalKey。
+/// 它**恒定**包裹每个打字机段落（不随"是否最新段"增删），因此段落交接时不会
+/// 改变打字机所在位置的组件类型，不会重建/打断打字机状态，避免打字机从错误
+/// 位置重新开始打字；同时打字机逐字长高时能实时上报高度，用于同步缩小预留空白。
+class _SizeReporting extends SingleChildRenderObjectWidget {
+  const _SizeReporting({required this.onSizeChanged, required super.child});
+
+  final ValueChanged<Size> onSizeChanged;
+
+  @override
+  _RenderSizeReporting createRenderObject(BuildContext context) {
+    return _RenderSizeReporting(onSizeChanged);
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderSizeReporting renderObject,
+  ) {
+    renderObject.onSizeChanged = onSizeChanged;
+  }
+}
+
+class _RenderSizeReporting extends RenderProxyBox {
+  _RenderSizeReporting(this.onSizeChanged);
+
+  ValueChanged<Size> onSizeChanged;
+  Size? _lastSize;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    if (_lastSize != size) {
+      _lastSize = size;
+      onSizeChanged(size);
+    }
+  }
+}
+
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
-
 
 /// 正文中的用户选择节点（未来"时间树"返回功能的数据点）
 class _ChoiceRecord {
@@ -211,6 +252,21 @@ class _HomeContentState extends State<HomeContent>
   /// 用于在末尾显示"半屏空白 + 生成提示"占位。
   int _generationStartLen = 0;
 
+  /// 当前流式新段（打字机正在打、仍在增长）的实测高度：用于把"生成区预留空白"
+  /// 同步缩小，使"新正文增长 ↔ 预留空白缩小"的总高度保持不变，
+  /// 彻底消除开始打字时的一次显示跳动。
+  final ValueNotifier<double> _streamedSegmentHeight = ValueNotifier<double>(0);
+
+  /// 生成区"正在生成"提示行的实测高度：开始打字后提示行消失，其高度并入预留
+  /// 空白，使提示消失的同时总高度保持不变（不会因此再产生一次跳动）。
+  final GlobalKey _streamingPromptKey = GlobalKey();
+  double _streamingPromptHeight = 0;
+
+  /// 续写起点段"时间树"卡片的实测高度：开始打字时该卡片在正文中正常出现，其高度
+  /// 并入预留空白，使卡片出现的同时总高度保持不变（不会引起跳动，正文中也不留空白）。
+  final GlobalKey _cardMeasureKey = GlobalKey();
+  double _cardMeasureHeight = 0;
+
   @override
   void initState() {
     super.initState();
@@ -258,6 +314,7 @@ class _HomeContentState extends State<HomeContent>
     _blackoutController.dispose();
     _choice2Ctrl.dispose();
     _choice3Ctrl.dispose();
+    _streamedSegmentHeight.dispose();
     super.dispose();
   }
 
@@ -266,7 +323,17 @@ class _HomeContentState extends State<HomeContent>
     if (!_scrollController.hasClients || _loadingPrevious) return;
     // 已在最顶部且还有更早内容（内存未揭示完或服务器还有更早段）时才加载
     if (_visibleStartIndex <= 0 && _storyStartIndex <= 0) return;
-    if (_scrollController.position.pixels <= 0) {
+    final double pixels = _scrollController.position.pixels;
+    // 内存中还有更早段：用户一上滑（进入顶部预留区、还没到顶）就一次性揭示全部，
+    // 让更早内容立即出现，避免"上滑→空等→到顶才出内容"的卡顿感。
+    if (_visibleStartIndex > 0) {
+      if (pixels < _earlierPullHeight) {
+        _loadPreviousSegment();
+      }
+      return;
+    }
+    // 内存已揭示完：需上滑到最顶部（预留区顶部）才从服务器拉取更早内容
+    if (pixels <= 0) {
       // 防止一次上滑/上移动画触发连发多批拉取：短时间内不重复请求服务器
       if (DateTime.now().difference(_lastServerLoad).inMilliseconds < 800) {
         return;
@@ -275,19 +342,21 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 把更早的一段文本加载到当前内容上方，并补偿滚动偏移，
+  /// 把更早的文本段加载到当前内容上方，并补偿滚动偏移，
   /// 使当前视野内容保持不动（"平滑"衔接不跳动）。
   Future<void> _loadPreviousSegment() async {
     if (_loadingPrevious) return;
 
-    // 1) 内存中仍有更早的段：直接揭示一个（不请求服务器）
+    // 1) 内存中仍有更早的段：一次性全部揭示（不请求服务器）。
+    //    与服务器批量拉取后"整批渲染"一致，避免一段一段揭示造成
+    //    "上滑到顶 → 停一下 → 再上滑"的卡顿感。
     if (_visibleStartIndex > 0) {
       _loadingPrevious = true;
       // 上插前先武装同帧补偿：布局阶段按实际新增高度同步修正滚动偏移，
       // 使当前视野内的正文保持静止（"下方静止、上方长出内容"，无闪帧）。
       _scrollController.armCompensation();
       setState(() {
-        _visibleStartIndex--;
+        _visibleStartIndex = 0; // 一次性揭示全部内存中的更早段
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
@@ -332,14 +401,16 @@ class _HomeContentState extends State<HomeContent>
         _storyStartIndex = earlier.startSeq;
         // 记录新加载段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
         for (int i = 0; i < earlier.segments.length; i++) {
-          _segmentChoices[earlier.startSeq + i] =
-              (i < earlier.choices.length ? earlier.choices[i] : const <String>[]);
+          _segmentChoices[earlier.startSeq + i] = (i < earlier.choices.length
+              ? earlier.choices[i]
+              : const <String>[]);
         }
         // 恢复这批更早段的"用户本轮实际选择"节点（前插，保持按段序升序；未选择为空）
         final newChoices = <_ChoiceRecord>[];
         for (int i = 0; i < earlier.segments.length; i++) {
-          final uc =
-              i < earlier.userChoices.length ? earlier.userChoices[i] : '';
+          final uc = i < earlier.userChoices.length
+              ? earlier.userChoices[i]
+              : '';
           if (uc.trim().isNotEmpty) {
             newChoices.add(
               _ChoiceRecord(
@@ -402,8 +473,9 @@ class _HomeContentState extends State<HomeContent>
           // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
           _segmentChoices.clear();
           for (int i = 0; i < snap.segments.length; i++) {
-            _segmentChoices[_storyStartIndex + i] =
-                (i < snap.choices.length ? snap.choices[i] : const <String>[]);
+            _segmentChoices[_storyStartIndex + i] = (i < snap.choices.length
+                ? snap.choices[i]
+                : const <String>[]);
           }
           // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）
           _choices.clear();
@@ -454,8 +526,9 @@ class _HomeContentState extends State<HomeContent>
             // 重启回到正文页：让最后一段文本的首行顶到屏幕最上方。
             // 有"上拉加载更早"空白区（_storyStartIndex>0）时跳过该空白区，
             // 否则回到顶部；内容不足一屏时 maxScrollExtent 为 0，落在 0 即可。
-            final double target =
-                _storyStartIndex > 0 ? _earlierPullHeight : 0.0;
+            final double target = _storyStartIndex > 0
+                ? _earlierPullHeight
+                : 0.0;
             final double max = _scrollController.position.maxScrollExtent;
             _scrollController.jumpTo(target > max ? max : target);
           }
@@ -479,7 +552,7 @@ class _HomeContentState extends State<HomeContent>
       }
       setState(() {
         _startupSyncing = false;
-        _startupSyncError = e.toString();
+        _startupSyncError = _localizeNetworkError(e);
       });
       await _showStartupSyncErrorDialog();
     }
@@ -543,6 +616,29 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 把常见的网络异常（Socket/Client/Timeout）转成当前语言的提示，
+  /// 避免弹窗里出现"葡语标题 + 英文异常"这类语言混用。
+  String _localizeNetworkError(Object e) {
+    final s = e.toString();
+    if (s.contains('SocketException') ||
+        s.contains('ClientException') ||
+        s.contains('TimeoutException')) {
+      return StorageService.localizedText(
+        zhCN: '无法连接服务器，请检查网络后重试',
+        zhTW: '無法連接伺服器，請檢查網路後重試',
+        en: 'Unable to connect to the server. Please check your network and try again.',
+        yue: '無法連接伺服器，請檢查網路後再試',
+        es: 'No se pudo conectar con el servidor. Compruebe su red e inténtelo de nuevo.',
+        fr: 'Impossible de se connecter au serveur. Vérifiez votre réseau et réessayez.',
+        de: 'Keine Verbindung zum Server möglich. Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.',
+        pt: 'Não foi possível conectar ao servidor. Verifique sua rede e tente novamente.',
+        ja: 'サーバーに接続できません。ネットワークを確認して、もう一度お試しください。',
+        ko: '서버에 연결할 수 없습니다. 네트워크를 확인하고 다시 시도해 주세요.',
+      );
+    }
+    return e.toString();
+  }
+
   /// 占位回调（LightAuthPage 授权完成后由 push 返回值触发重试）。
   static void _dummyAuthComplete() {}
 
@@ -577,6 +673,7 @@ class _HomeContentState extends State<HomeContent>
   /// 兜底行动填入。第 1 个输入框保持空白，仅显示"自由输入"提示，由用户自行输入。
   /// 收到任一推荐即标记 _hasRecommendedActions。
   void _applyRecommendedActions(Map<String, dynamic> outputs) {
+    final choice1 = outputs['choice_1'] as String? ?? '';
     final choice2 = outputs['choice_2'] as String? ?? '';
     final choice3 = outputs['choice_3'] as String? ?? '';
     final got = choice2.isNotEmpty || choice3.isNotEmpty;
@@ -594,17 +691,25 @@ class _HomeContentState extends State<HomeContent>
         _choice3Ctrl.text = choice3;
         _inputChoice3 = choice3;
       }
+      // 保存最新一段的 choice_1/2/3 快照（与服务器保存一致），
+      // 使该段成为历史段后其输入框能显示"生成那一刻"的推荐/选项文本。
+      if (_storyTexts.isNotEmpty) {
+        final int lastAbs = _storyStartIndex + _storyTexts.length - 1;
+        _segmentChoices[lastAbs] = [choice1, choice2, choice3];
+      }
     });
   }
 
   /// 任一输入框确认后：把输入作为 user_input，连同用户设定请求续写生成，
   /// 新内容在屏幕上接力显示（作为 _storyTexts 数组的新元素，由打字机继续揭示）。
-  Future<void> _continueStory(String userInput,
-      {int retryDepth = 0,
-      int? rewriteFrom,
-      String? choice1,
-      String? choice2,
-      String? choice3}) async {
+  Future<void> _continueStory(
+    String userInput, {
+    int retryDepth = 0,
+    int? rewriteFrom,
+    String? choice1,
+    String? choice2,
+    String? choice3,
+  }) async {
     if (!mounted || userInput.trim().isEmpty) return;
     // 记录本次续写开始前的段数：断流出错时据此丢弃未传完的段落
     final int preStreamLen = _storyTexts.length;
@@ -618,6 +723,9 @@ class _HomeContentState extends State<HomeContent>
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
       _generationStartLen = _storyTexts.length; // 记录本轮生成前的段数（用于"新内容未到达"占位）
+      _streamedSegmentHeight.value = 0; // 新一段流式正文从 0 高度开始重新测量
+      _streamingPromptHeight = 0; // 提示行高度重新测量（开始打字后并入预留空白）
+      _cardMeasureHeight = 0; // 续写起点段卡片高度重新测量（打字开始后并入预留空白）
       // 记录用户选择节点：属于"用户操作的那段"（普通续写=最新段；时间树=被重写段）。
       // 每次点击"继续"都用本次输入覆盖该段的旧选择（时间树重写同样覆盖段 k）。
       final int choiceSegAbs = _storyStartIndex + _storyTexts.length - 1;
@@ -629,14 +737,27 @@ class _HomeContentState extends State<HomeContent>
           startOffset: 0,
         ),
       );
+      // 保存本轮三个输入框当前值到该段（与服务器 choice_1/2/3 覆盖一致），
+      // 使该段成为历史段后其输入框显示"用户选择那一瞬间"的文本。
+      _segmentChoices[choiceSegAbs] = [
+        _inputChoice1,
+        _inputChoice2,
+        _inputChoice3,
+      ];
     });
-    // 点击继续后：自动下移半屏，为即将生成的新内容预留空白区（顶部提示 + 空白）
+    // 点击继续后：平滑下移半屏，为即将生成的新内容预留空白区（顶部提示 + 空白）。
+    // 用 animateTo 平滑滚动（不用 jumpTo 的瞬间跳转），让上方正文与输入按钮平滑上拉、
+    // 下方空白区域逐渐打开，避免"屏幕一下子跳上去"的跳跃感。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
       final double half = MediaQuery.of(context).size.height / 2;
       final double max = _scrollController.position.maxScrollExtent;
-      _scrollController.jumpTo(
-        (_scrollController.offset + half).clamp(0.0, max),
+      final double target = (_scrollController.offset + half).clamp(0.0, max);
+      if ((target - _scrollController.offset).abs() < 1.0) return;
+      _scrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeInOutCubic,
       );
     });
     try {
@@ -657,6 +778,9 @@ class _HomeContentState extends State<HomeContent>
               // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
               _storyTexts.add(text);
               segmentStarted = true;
+              // 新段从 0 高度重新测量（尺寸上报组件会在其首次布局后自动上报实际
+              // 高度，使底部预留空白立即按新段高度同步缩小，消除打字开始时的跳动）
+              _streamedSegmentHeight.value = 0;
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
@@ -673,6 +797,9 @@ class _HomeContentState extends State<HomeContent>
               // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
               _storyTexts.add(text);
               segmentStarted = true;
+              // 新段从 0 高度重新测量（尺寸上报组件会在其首次布局后自动上报实际
+              // 高度，使底部预留空白立即按新段高度同步缩小，消除打字开始时的跳动）
+              _streamedSegmentHeight.value = 0;
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
@@ -683,17 +810,22 @@ class _HomeContentState extends State<HomeContent>
         },
         onAbort: (_) {
           if (!mounted) return;
-          // 违规中止：删掉本次可能已由打字机打出的残缺段落，恢复等待输入状态，
-          // 再弹"内容违规，请重新输入提示词"对话框（唯一"重新输入"按钮）
+          // 违规中止：删掉本次可能已由打字机打出的残缺段落，弹"内容违规，请重新输入
+          // 提示词"对话框（唯一"重新输入"按钮）。弹窗期间保持流式布局（用户选择 +
+          // 预留空白）不变，弹窗关闭后再恢复等待输入状态，避免弹窗背后的页面跳动。
           setState(() {
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
             _generating = false;
-            _storyStreaming = false;
             _storyTyped = true;
           });
-          _showViolationDialog();
+          _showViolationDialog().then((_) {
+            if (!mounted) return;
+            setState(() {
+              _storyStreaming = false; // 弹窗关闭后恢复等待输入状态
+            });
+          });
         },
         onError: (message, {code}) {
           if (!mounted) return;
@@ -704,7 +836,8 @@ class _HomeContentState extends State<HomeContent>
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
             _generating = false;
-            _storyStreaming = false;
+            // 保持 _storyStreaming=true：弹窗期间正文布局（选择+预留空白）不变，
+            // 弹窗（重启 App）关闭后由重启重置状态，避免弹窗背后的页面跳动。
             _storyTyped = true;
           });
           // 服务器未返回有效正文（如额度用尽）：按当前语言提示检查额度
@@ -721,7 +854,7 @@ class _HomeContentState extends State<HomeContent>
                 _storyTexts.removeRange(preStreamLen, _storyTexts.length);
               }
               _generating = false;
-              _storyStreaming = false;
+              // 保持 _storyStreaming=true：弹窗期间正文布局不变（见 onError 说明）
               _storyTyped = true;
             });
             _showGenerateError(_getQuotaWarningText());
@@ -743,7 +876,7 @@ class _HomeContentState extends State<HomeContent>
       if (!mounted) return;
       setState(() {
         _generating = false;
-        _storyStreaming = false;
+        // 保持 _storyStreaming=true：弹窗期间正文布局不变，弹窗确认后退出 App
         _storyTyped = true;
       });
       await showAccountLimitWarning(context);
@@ -752,7 +885,7 @@ class _HomeContentState extends State<HomeContent>
       if (!mounted || retryDepth >= 2) {
         setState(() {
           _generating = false;
-          _storyStreaming = false;
+          // 保持 _storyStreaming=true：弹窗期间正文布局不变
           _storyTyped = true;
         });
         _showGenerateError(_getReauthRequiredText());
@@ -762,29 +895,33 @@ class _HomeContentState extends State<HomeContent>
       if (!reauthed || !mounted) {
         setState(() {
           _generating = false;
-          _storyStreaming = false;
+          // 保持 _storyStreaming=true：弹窗期间正文布局不变
           _storyTyped = true;
         });
         _showGenerateError(_getReauthRequiredText());
         return;
       }
       // 已重新授权：重试
-      await _continueStory(userInput,
-          retryDepth: retryDepth + 1,
-          rewriteFrom: rewriteFrom,
-          choice1: choice1,
-          choice2: choice2,
-          choice3: choice3);
+      await _continueStory(
+        userInput,
+        retryDepth: retryDepth + 1,
+        rewriteFrom: rewriteFrom,
+        choice1: choice1,
+        choice2: choice2,
+        choice3: choice3,
+      );
       return;
     } catch (e) {
       // 其它注册/鉴权异常（如 IP 限流"注册过于频繁"）：展示具体原因
       if (!mounted) return;
       setState(() {
         _generating = false;
-        _storyStreaming = false;
+        // 保持 _storyStreaming=true：弹窗期间正文布局不变，弹窗关闭后重启重置状态
         _storyTyped = true;
       });
-      _showGenerateError(e.toString().replaceFirst('Exception: ', ''));
+      _showGenerateError(
+        _localizeNetworkError(e).replaceFirst('Exception: ', ''),
+      );
     }
   }
 
@@ -796,6 +933,10 @@ class _HomeContentState extends State<HomeContent>
     // 违规中止改由 onAbort 弹"内容违规，请重新输入提示词"对话框处理；
     // 正文区直接渲染已有正文（本次残缺段已被删除），输入框恢复等待用户输入。
     final List<Widget> children = [];
+    final bool streaming = _storyStreaming;
+    // 本次流式是否已创建出"正在打字的流式新段"（位于数组末尾）
+    final bool hasStreamingSegment =
+        streaming && _storyTexts.length > _generationStartLen;
     // 只渲染 [ _visibleStartIndex, _storyTexts.length ) 范围内的文本段，
     // 更早的历史段等用户向上滚动到顶部时才逐个加载
     for (
@@ -804,29 +945,42 @@ class _HomeContentState extends State<HomeContent>
       segIndex++
     ) {
       final segment = _storyTexts[segIndex];
+      final bool isLast = segIndex == _storyTexts.length - 1;
+      // 流式新段（数组末尾、尚未定稿的正在生成段）：其卡片与选择标记都交给
+      // 底部"生成区"承接，正文内不渲染，避免打字开始时突然增删造成跳动。
+      final bool isStreamingSegment =
+          hasStreamingSegment && segIndex == _storyTexts.length - 1;
       // 本次会话流式生成的新段用打字机揭示；重启恢复的历史段直接完整显示
       final useTypewriter = segIndex >= _sessionStreamStartIndex;
       // 1) 段文本（整段一次渲染）
       children.add(
         useTypewriter
-            ? _buildStorySegment(
-                segment,
-                isLast: segIndex == _storyTexts.length - 1,
-              )
+            ? _buildStorySegment(segment, isLast: isLast, segIndex: segIndex)
             : CharacterText(text: segment),
       );
       // 2) 历史段落（非最新一段）下方：三个输入框 + "从这里重新开始"按钮（时间树）。
-      //    最新一段下方不插入卡片，其下方的输入框由页面底部的三个承载。
-      if (segIndex < _storyTexts.length - 1) {
+      //    与原始逻辑一致：最新一段下方不插入卡片，其下方的输入框由页面底部的三个承载。
+      //    流式新段（数组末尾）即"最新一段"，故自动不渲染卡片；打字开始时它出现
+      //    造成的高度变化由底部"生成区"的预留空白吸收，正文中不会留下空白。
+      final bool renderCard =
+          !isStreamingSegment && segIndex < _storyTexts.length - 1;
+      if (renderCard) {
         children.add(
           StoryChoiceCard(
             // 绝对下标 = 服务器 seq：让本段按钮 ↔ 文本 ↔ 数据库行一一对应
             segmentIndex: _storyStartIndex + segIndex,
-            // 显示本段对应的三个选项（从服务器拉取的 choice_1/2/3）
+            // 显示本段对应的三个选项（choice_1/2/3，即用户选择那一瞬间保存的文本）
             initialValues:
-                _segmentChoices[_storyStartIndex + segIndex] ?? const <String>[],
+                _segmentChoices[_storyStartIndex + segIndex] ??
+                const <String>[],
             buttonText: _getRestartHereButtonText(),
             inputPlaceholder: _getInputPlaceholder(),
+            // 三个输入框的占位提示与正文底部一致（第 1 个=自由输入，第 2/3 个=推荐行动）
+            placeholders: [
+              _getFirstInputPlaceholder(),
+              _getRecommendedActionPlaceholder(),
+              _getRecommendedActionPlaceholder(),
+            ],
             // 历史按钮只在"流结束且整段打字完成"后可操作；
             // 首段450字打完时 _storyTyped 会短暂为 true，须同时要求 !_storyStreaming 避免闪烁
             enabled: _storyTyped && !_storyStreaming,
@@ -835,16 +989,21 @@ class _HomeContentState extends State<HomeContent>
         );
       }
       // 3) 该段的选择标记（用户在该段输入框选择，属于该段）：
-      //    统一显示在本段文本 + 输入框按钮之后，与生成时占位区顶部的位置一致。
-      //    生成中（新段未到）时最新段的选择由占位区顶部显示，这里跳过避免重复。
-      final int segAbs = _storyStartIndex + segIndex;
-      final bool pendingLast =
-          _storyStreaming &&
-          _storyTexts.length <= _generationStartLen &&
-          segIndex == _storyTexts.length - 1;
-      if (!pendingLast) {
+      //    统一显示在本段文本 + 输入框按钮（历史段卡片）下方，与最终布局一致。
+      //    流式新段的选择不在此显示；等待期（新段未到）最新一段的选择改由底部
+      //    "生成区"在输入框与按钮下方显示（原始布局位置），此处不重复。
+      final bool skipChoice =
+          isStreamingSegment ||
+          (_storyStreaming &&
+              _storyTexts.length <= _generationStartLen &&
+              segIndex == _storyTexts.length - 1);
+      if (!skipChoice) {
+        final int segAbs = _storyStartIndex + segIndex;
         for (int i = 0; i < _choices.length; i++) {
           if (_choices[i].segmentIndex == segAbs) {
+            // 在输入框/按钮卡片与"用户选择"文本之间恒留一行空行（与生成等待期的
+            // 间距一致），避免打字开始时空行突然消失造成屏幕跳动。
+            children.add(const SizedBox(height: 24));
             children.add(
               StoryChoiceMarker(
                 prefix: _getChoicePrefixText(),
@@ -859,46 +1018,103 @@ class _HomeContentState extends State<HomeContent>
     return children;
   }
 
-  /// 新内容生成中的占位：顶部"用户本轮选择" + "正在生成新内容"提示 + 半屏空白。
-  /// 用户一按"继续"按钮即在此显示本轮选择（用用户语言）；收到正文后由
-  /// 新段落 + 正文内的"用户选择"标记无缝承接，该行不会消失。
-  Widget _buildGeneratingPlaceholder() {
+  /// 流式生成期的底部"生成区"（位于输入区下方）：
+  /// - 新内容未到达时：显示"正在生成新内容"提示 + 半屏预留空白，并离屏测量
+  ///   提示行与续写起点段卡片的高度（供打字开始后并入预留空白）；
+  /// - 收到正文后（开始打字）：提示行消失、续写起点段卡片在正文中出现，两者的
+  ///   高度都并入预留空白，预留空白再随流式新段实测高度同步缩小（新段每长高
+  ///   1px、空白就减 1px），使底部总高度在打字过程中保持不变，彻底消除开始打字
+  ///   时的一次显示跳动，正文中也不留下任何空白。
+  Widget _buildStreamingArea() {
     final double half = MediaQuery.of(context).size.height / 2;
-    final String? currentChoice =
-        _choices.isEmpty ? null : _choices.last.text;
-    final bool hasChoice =
-        currentChoice != null && currentChoice.trim().isNotEmpty;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // 本轮用户选择：按下按钮瞬间就在空白区最上方显示（用户语言）
-        if (hasChoice)
+    final bool hasNewSegment = _storyTexts.length > _generationStartLen;
+    if (!hasNewSegment) {
+      // 续写起点段（segK）的绝对下标（用于离屏渲染其卡片以测量高度）
+      final int cardAbs = _storyStartIndex + _generationStartLen - 1;
+      // 新内容尚未到达：测量提示行高度与续写起点段卡片高度
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final double ph = _streamingPromptKey.currentContext?.size?.height ?? 0;
+        final double ch = _cardMeasureKey.currentContext?.size?.height ?? 0;
+        final bool phChanged =
+            ph > 0 && (ph - _streamingPromptHeight).abs() > 0.5;
+        final bool chChanged = ch > 0 && (ch - _cardMeasureHeight).abs() > 0.5;
+        if (phChanged || chChanged) {
+          setState(() {
+            if (phChanged) _streamingPromptHeight = ph;
+            if (chChanged) _cardMeasureHeight = ch;
+          });
+        }
+      });
+      final String? currentChoice = _choices.isEmpty
+          ? null
+          : _choices.last.text;
+      final bool hasChoice =
+          currentChoice != null && currentChoice.trim().isNotEmpty;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // 本轮用户选择：显示在（底部）输入框与按钮下方，等待新内容时保持原位；
+          // 顶部间距与正文中"卡片 → 用户选择"之间的一行空行保持一致。
+          if (hasChoice)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: StoryChoiceMarker(
+                prefix: _getChoicePrefixText(),
+                text: currentChoice,
+              ),
+            ),
           Padding(
+            key: _streamingPromptKey,
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: StoryChoiceMarker(
-              prefix: _getChoicePrefixText(),
-              text: currentChoice,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const CupertinoActivityIndicator(radius: 10),
+                const SizedBox(width: 8),
+                Text(_getGeneratingNewContentText()),
+              ],
             ),
           ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const CupertinoActivityIndicator(radius: 10),
-              const SizedBox(width: 8),
-              Text(_getGeneratingNewContentText()),
-            ],
+          SizedBox(height: half),
+          // 离屏渲染续写起点段的卡片以测量其高度（不占布局空间、不显示）
+          Offstage(
+            offstage: true,
+            child: StoryChoiceCard(
+              key: _cardMeasureKey,
+              segmentIndex: cardAbs,
+              initialValues: _segmentChoices[cardAbs] ?? const <String>[],
+              buttonText: _getRestartHereButtonText(),
+              inputPlaceholder: _getInputPlaceholder(),
+              enabled: false,
+            ),
           ),
-        ),
-        SizedBox(height: half),
-      ],
+        ],
+      );
+    }
+    // 新内容已开始打字：提示行消失、续写起点段卡片出现，两者高度并入预留空白，
+    // 空白随新段高度缩小 → 总高度保持恒定、无跳动。
+    final double reserve = _streamingPromptHeight + half - _cardMeasureHeight;
+    return ValueListenableBuilder<double>(
+      valueListenable: _streamedSegmentHeight,
+      builder: (context, segH, _) {
+        final double blank = (reserve - segH).clamp(0.0, double.infinity);
+        return SizedBox(height: blank);
+      },
     );
   }
 
-  /// 构建单个故事文本段（打字机揭示；仅最后一段触发 onTypingDone）
-  Widget _buildStorySegment(String text, {required bool isLast}) {
-    return TypewriterText(
+  /// 构建单个故事文本段（打字机揭示；仅最后一段触发 onTypingDone）。
+  /// 每个打字机段落都**恒定**包一层 [_SizeReporting]：打字机逐字长高时实时上报
+  /// 高度（用于把底部预留空白同步缩小，总高度不变、无跳动）；由于恒定包裹，
+  /// 段落交接（新段出现、旧段变为历史段）不会改变该位置的组件类型，打字机状态
+  /// 得以保留，不会从错误位置重新开始打字。
+  Widget _buildStorySegment(
+    String text, {
+    required bool isLast,
+    required int segIndex,
+  }) {
+    final Widget typewriter = TypewriterText(
       text: text,
       speedUpEvery: 20,
       segmentStart: 0,
@@ -912,6 +1128,23 @@ class _HomeContentState extends State<HomeContent>
             }
           : null,
     );
+    return _SizeReporting(
+      onSizeChanged: (size) => _onSegmentSizeChanged(segIndex, size.height),
+      child: typewriter,
+    );
+  }
+
+  /// 报告某段落的实测高度：仅当它是"正在打字的流式新段"（数组末尾那段）时，
+  /// 用其高度更新底部预留空白；非流式段的尺寸变化一律忽略。
+  void _onSegmentSizeChanged(int segIndex, double height) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (!_storyStreaming || _storyTexts.length <= _generationStartLen) return;
+      if (segIndex != _storyTexts.length - 1) return;
+      if ((height - _streamedSegmentHeight.value).abs() > 0.5) {
+        _streamedSegmentHeight.value = height;
+      }
+    });
   }
 
   @override
@@ -1088,7 +1321,8 @@ class _HomeContentState extends State<HomeContent>
                                     ),
                                     const SizedBox(height: 12),
                                     TextInputPanel(
-                                      placeholder: _getRecommendedActionPlaceholder(),
+                                      placeholder:
+                                          _getRecommendedActionPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
@@ -1099,7 +1333,8 @@ class _HomeContentState extends State<HomeContent>
                                     ),
                                     const SizedBox(height: 12),
                                     TextInputPanel(
-                                      placeholder: _getRecommendedActionPlaceholder(),
+                                      placeholder:
+                                          _getRecommendedActionPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
@@ -1112,11 +1347,11 @@ class _HomeContentState extends State<HomeContent>
                                   ],
                                 ),
                               ),
-                              // 新内容生成中（尚未收到首段）时，在页面最底部（输入框下方）
-                              // 显示"正在生成新内容"提示 + 半屏空白
-                              if (_storyStreaming &&
-                                  _storyTexts.length <= _generationStartLen)
-                                _buildGeneratingPlaceholder(),
+                              // 新内容生成中：在输入区下方显示"正在生成新内容"提示 +
+                              // 逐步缩小的预留空白（见 _buildStreamingArea），
+                              // 使打字开始时总高度保持不变、无显示跳动。
+                              if (_storyStreaming && _generationStartLen > 0)
+                                _buildStreamingArea(),
                             ],
                           ),
                         ),
@@ -1196,6 +1431,7 @@ class _HomeContentState extends State<HomeContent>
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
       _storyInputsShown = false; // 全新生成：输入区先隐藏，待首轮收到推荐后再激活
+      _streamedSegmentHeight.value = 0; // 新正文从 0 高度开始测量
     });
     // 清理"漏网之鱼"：重置/设备切换后，另一设备的延迟写入可能在服务器残留旧正文。
     // 首次生成前静默清空服务器小说正文，确保新故事从 seq 0 干净开始。
@@ -1367,7 +1603,9 @@ class _HomeContentState extends State<HomeContent>
         _storyStreaming = false;
         _storyTyped = true;
       });
-      _showGenerateError(e.toString().replaceFirst('Exception: ', ''));
+      _showGenerateError(
+        _localizeNetworkError(e).replaceFirst('Exception: ', ''),
+      );
     }
   }
 
@@ -1604,13 +1842,13 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 最新的三个输入框对应按钮文字：按照上面输入指引继续故事选择（本地化）
+  /// 最新的三个输入框对应按钮文字：按照上面指引继续故事（本地化）
   String _getLatestContinueButtonText() {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
-        return '按照上面輸入指引繼續故事選擇';
+        return '按照上面指引繼續故事';
       case 'yue':
-        return '跟住上面嘅輸入指引繼續故事選擇';
+        return '跟住上面嘅指引繼續故事';
       case 'en':
         return 'Continue the story following the guidance above';
       case 'es':
@@ -1622,11 +1860,11 @@ class _HomeContentState extends State<HomeContent>
       case 'pt':
         return 'Continue a história seguindo as orientações acima';
       case 'ja':
-        return '上記の入力ガイドに従って物語を続ける';
+        return '上記のガイドに従って物語を続ける';
       case 'ko':
-        return '위 입력 안내에 따라 이야기를 계속하기';
+        return '위 안내에 따라 이야기를 계속하기';
       default:
-        return '按照上面输入指引继续故事选择';
+        return '按照上面指引继续故事';
     }
   }
 
@@ -1660,7 +1898,10 @@ class _HomeContentState extends State<HomeContent>
   /// 用户确认后：先截断该段之后的内容（显示/本地），再走与标准生成完全一致的流程，
   /// 从该时间点续写（服务器在生成时同步截断数据库）。
   Future<void> _onRestartHerePressed(
-      int segmentIndex, String userInput, List<String> choices) async {
+    int segmentIndex,
+    String userInput,
+    List<String> choices,
+  ) async {
     if (!mounted) return;
     final confirmed = await showCupertinoDialog<bool>(
       context: context,
@@ -1682,13 +1923,15 @@ class _HomeContentState extends State<HomeContent>
     );
     if (!mounted || confirmed != true) return;
 
-    // 1) 先截断本段之后的内容：文本显示页 + App 本地存储
+    // 1) 输入框为空白时禁止继续：不允许在无用户指引的情况下
+    //    仅凭时间树生成新小说内容（按钮在空白时已禁用，此处为兜底防御；
+    //    必须在截断之前判断，避免空白输入破坏已有故事内容）
+    if (userInput.trim().isEmpty) return;
+    // 2) 先截断本段之后的内容：文本显示页 + App 本地存储
     await _truncateStoryFrom(segmentIndex);
     if (!mounted) return;
-    // 2) 走标准生成流程从该时间点续写（服务器端同步截断数据库并续写）
-    //    用户未输入时给一个本地化默认续写提示
-    final input =
-        userInput.trim().isEmpty ? _getRewriteDefaultInputText() : userInput;
+    // 3) 走标准生成流程从该时间点续写（服务器端同步截断数据库并续写）
+    final input = userInput;
     // 把被重写段三个输入框当前值（用户可能已编辑）覆盖保存到服务器该段，并从此处续写
     await _continueStory(
       input,
@@ -1713,31 +1956,6 @@ class _HomeContentState extends State<HomeContent>
       _visibleStartIndex = _storyTexts.length - 1;
       _sessionStreamStartIndex = _storyTexts.length; // 之后的新段均为会话流式段（打字机）
     });
-  }
-
-  /// 重写但用户未输入内容时的默认续写提示（本地化）
-  String _getRewriteDefaultInputText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-      case 'yue':
-        return '繼續';
-      case 'en':
-        return 'Continue the story';
-      case 'es':
-        return 'Continúa la historia';
-      case 'fr':
-        return 'Continuer l\'histoire';
-      case 'de':
-        return 'Setze die Geschichte fort';
-      case 'pt':
-        return 'Continue a história';
-      case 'ja':
-        return '物語を続けて';
-      case 'ko':
-        return '이야기를 계속해';
-      default:
-        return '继续';
-    }
   }
 
   /// "从这里重新续写"确认弹窗内容（本地化）

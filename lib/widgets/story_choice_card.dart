@@ -17,6 +17,10 @@ class StoryChoiceCard extends StatefulWidget {
   /// 本地化后的输入框占位文字
   final String inputPlaceholder;
 
+  /// 各输入框的占位提示（长度 3，与正文底部三个输入框一致）；
+  /// 缺省或某项为空时回退到 [inputPlaceholder]
+  final List<String>? placeholders;
+
   /// 打字期间为 false（按钮变灰不可点击）；打字结束后为 true（可点击）
   final bool enabled;
 
@@ -27,7 +31,7 @@ class StoryChoiceCard extends StatefulWidget {
   /// 重写按钮回调：携带本卡片所属的段下标 + 被点击输入框的文本 +
   /// 本段三个输入框的当前值（用户可能已编辑，需覆盖保存到服务器该段）。
   final void Function(int segmentIndex, String text, List<String> choices)?
-      onPressed;
+  onPressed;
 
   /// 本段对应的三个选项内容（choice_1/2/3，与正文一起从服务器拉取），
   /// 预填到三个输入框显示；缺省/不足 3 个时对应框留空。
@@ -42,6 +46,7 @@ class StoryChoiceCard extends StatefulWidget {
     required this.buttonText,
     required this.inputPlaceholder,
     required this.enabled,
+    this.placeholders,
     this.onPressed,
     this.initialValues,
     this.maxLength = 300,
@@ -61,9 +66,7 @@ class _StoryChoiceCardState extends State<StoryChoiceCard> {
     final init = widget.initialValues ?? const <String>[];
     _controllers = [
       for (int i = 0; i < 3; i++)
-        TextEditingController(
-          text: (i < init.length ? init[i] : null) ?? '',
-        ),
+        TextEditingController(text: (i < init.length ? init[i] : null) ?? ''),
     ];
   }
 
@@ -80,8 +83,9 @@ class _StoryChoiceCardState extends State<StoryChoiceCard> {
     }
   }
 
-  List<String> get _currentChoices =>
-      [for (final c in _controllers) c.text.trim()];
+  List<String> get _currentChoices => [
+    for (final c in _controllers) c.text.trim(),
+  ];
 
   @override
   void dispose() {
@@ -101,7 +105,12 @@ class _StoryChoiceCardState extends State<StoryChoiceCard> {
           for (int i = 0; i < 3; i++) ...[
             _StoryChoiceInputRow(
               controller: _controllers[i],
-              placeholder: widget.inputPlaceholder,
+              placeholder:
+                  (widget.placeholders != null &&
+                      i < widget.placeholders!.length &&
+                      widget.placeholders![i].trim().isNotEmpty)
+                  ? widget.placeholders![i]
+                  : widget.inputPlaceholder,
               buttonText: widget.buttonText,
               enabled: widget.enabled,
               onPressed: () => widget.onPressed?.call(
@@ -151,7 +160,11 @@ class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
   Widget build(BuildContext context) {
     final isDark = AppTheme.isDark(context);
     final overLimit = _isOverLimit;
-    final canPress = widget.enabled && !overLimit && widget.onPressed != null;
+    // 输入框为空白时不渲染时间树"从这里重新开始"按钮为可点击：
+    // 避免在无用户指引的情况下仅凭时间树生成新小说内容
+    final hasText = widget.controller.text.trim().isNotEmpty;
+    final canPress =
+        widget.enabled && !overLimit && hasText && widget.onPressed != null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -202,33 +215,37 @@ class _StoryChoiceInputRowState extends State<_StoryChoiceInputRow> {
         ),
         const SizedBox(height: 8),
         // 时间树"从这里重新开始"按钮（按钮位于输入框下方；超限或打字期间按钮变灰不可点击）
-        SizedBox(
-          height: 44,
-          child: CupertinoButton.filled(
-            onPressed: canPress
-                ? () {
-                    SoundService.playClick();
-                    widget.onPressed!();
-                  }
-                : null,
-            borderRadius: BorderRadius.circular(10),
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            color: isDark ? AppTheme.buttonFillDark : AppTheme.buttonFillLight,
-            disabledColor: isDark
-                ? const Color(0xFF2C2C2E)
-                : const Color(0xFFF2F2F7),
-            child: Text(
-              widget.buttonText,
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: canPress
-                    ? AppTheme.buttonText
-                    : (isDark
-                          ? AppTheme.buttonDisabledTextDark
-                          : AppTheme.buttonDisabledTextLight),
+        // 灰化（禁用）期间整体降低透明度：保留蓝色按钮外形与圆角，辨识度不减，
+        // 又明显区别于上方灰底带边框的输入框；可点击时全透明度显示
+        Opacity(
+          opacity: canPress ? 1.0 : 0.4,
+          child: SizedBox(
+            height: 44,
+            child: CupertinoButton.filled(
+              onPressed: canPress
+                  ? () {
+                      SoundService.playClick();
+                      widget.onPressed!();
+                    }
+                  : null,
+              borderRadius: BorderRadius.circular(10),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              color: isDark
+                  ? AppTheme.buttonFillDark
+                  : AppTheme.buttonFillLight,
+              // 禁用时也使用蓝色填充，靠外层 Opacity 整体变淡（避免变成灰底、与输入框混淆）
+              disabledColor: isDark
+                  ? AppTheme.buttonFillDark
+                  : AppTheme.buttonFillLight,
+              child: Text(
+                widget.buttonText,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.buttonText,
+                ),
+                overflow: TextOverflow.ellipsis,
               ),
-              overflow: TextOverflow.ellipsis,
             ),
           ),
         ),

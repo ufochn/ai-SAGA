@@ -429,23 +429,23 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
       case 'yue':
-        return '確認地點';
+        return '下一步';
       case 'en':
-        return 'Confirm Location';
+        return 'Next';
       case 'es':
-        return 'Confirmar Ubicación';
+        return 'Siguiente';
       case 'fr':
-        return 'Confirmer le Lieu';
+        return 'Suivant';
       case 'de':
-        return 'Standort Bestätigen';
+        return 'Weiter';
       case 'pt':
-        return 'Confirmar Local';
+        return 'Próximo';
       case 'ja':
-        return '場所を確定';
+        return '次へ';
       case 'ko':
-        return '장소 확인';
+        return '다음';
       default:
-        return '确认地点';
+        return '下一步';
     }
   }
 
@@ -473,183 +473,210 @@ class _LocationSetupPageState extends State<LocationSetupPage> {
         border: null,
       ),
       child: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 20),
-              // 页面标题
-              Text(
-                _getTitleText(),
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w700,
-                  color: isDark
-                      ? AppTheme.primaryTextDark
-                      : AppTheme.primaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 12),
-              // 说明文字
-              Text(
-                _getSubtitleText(),
-                style: TextStyle(
-                  fontSize: 16,
-                  color: isDark
-                      ? AppTheme.secondaryTextDark
-                      : AppTheme.secondaryTextLight,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              // 合并输入框 + 下拉选择 - 既可输入文字，又可点击右侧按钮选择城市
-              Container(
-                decoration: BoxDecoration(
-                  color: isDark
-                      ? AppTheme.cardBackgroundDark
-                      : AppTheme.cardBackgroundLight,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: CupertinoTextField(
-                  controller: _locationController,
-                  focusNode: _locationFocusNode,
-                  placeholder: _getInputPlaceholder(),
-                  placeholderStyle: TextStyle(
-                    color: isDark
-                        ? AppTheme.tertiaryTextDark
-                        : AppTheme.tertiaryTextLight,
-                  ),
-                  padding: const EdgeInsets.only(
-                    left: 16,
-                    right: 4,
-                    top: 14,
-                    bottom: 14,
-                  ),
-                  decoration: null,
-                  style: TextStyle(
-                    color: _isOverLimit
-                        ? (isDark
-                              ? AppTheme.destructiveRedDark
-                              : AppTheme.destructiveRedLight)
-                        : (isDark
-                              ? AppTheme.primaryTextDark
-                              : AppTheme.primaryTextLight),
-                    fontSize: 17,
-                  ),
-                  onChanged: (value) {
-                    setState(() {});
-                  },
-                  suffix: GestureDetector(
-                    onTap: _showCityPicker,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      child: Icon(
-                        CupertinoIcons.chevron_down_circle,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                        size: 24,
-                      ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final buttonTop = constraints.maxHeight * 0.75;
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: SingleChildScrollView(
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      24,
+                      16,
+                      constraints.maxHeight * 0.25,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const SizedBox(height: 20),
+                        // 标题 + 副标题（固定高度，保证下方输入框位置一致）
+                        SizedBox(
+                          height: 124,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                _getTitleText(),
+                                style: TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w700,
+                                  color: isDark
+                                      ? AppTheme.primaryTextDark
+                                      : AppTheme.primaryTextLight,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                _getSubtitleText(),
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  color: isDark
+                                      ? AppTheme.secondaryTextDark
+                                      : AppTheme.secondaryTextLight,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        // 合并输入框 + 下拉选择 - 既可输入文字，又可点击右侧按钮选择城市
+                        Container(
+                          height: 50,
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? AppTheme.cardBackgroundDark
+                                : AppTheme.cardBackgroundLight,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: CupertinoTextField(
+                            controller: _locationController,
+                            focusNode: _locationFocusNode,
+                            placeholder: _getInputPlaceholder(),
+                            placeholderStyle: TextStyle(
+                              color: isDark
+                                  ? AppTheme.tertiaryTextDark
+                                  : AppTheme.tertiaryTextLight,
+                            ),
+                            padding: const EdgeInsets.only(
+                              left: 16,
+                              right: 4,
+                              top: 14,
+                              bottom: 14,
+                            ),
+                            decoration: null,
+                            style: TextStyle(
+                              color: _isOverLimit
+                                  ? (isDark
+                                        ? AppTheme.destructiveRedDark
+                                        : AppTheme.destructiveRedLight)
+                                  : (isDark
+                                        ? AppTheme.primaryTextDark
+                                        : AppTheme.primaryTextLight),
+                              fontSize: 17,
+                            ),
+                            onChanged: (value) {
+                              setState(() {});
+                            },
+                            suffix: GestureDetector(
+                              onTap: _showCityPicker,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                ),
+                                child: Icon(
+                                  CupertinoIcons.chevron_down_circle,
+                                  color: isDark
+                                      ? AppTheme.accentBlueDark
+                                      : AppTheme.accentBlueLight,
+                                  size: 24,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        // 提示：可随意填写任何地点 + 示例
+                        Column(
+                          children: [
+                            Text(
+                              switch (StorageService.getLanguage()) {
+                                'zh-TW' || 'yue' => '💡 您可以自由填寫任何城市、國家或自訂地點',
+                                'en' =>
+                                  '💡 Feel free to enter any city, country, or custom location',
+                                'es' =>
+                                  '💡 Puede ingresar cualquier ciudad, país o lugar personalizado',
+                                'fr' =>
+                                  '💡 Vous pouvez saisir n\'importe quelle ville, pays ou lieu personnalisé',
+                                'de' =>
+                                  '💡 Sie können jede Stadt, jedes Land oder einen eigenen Ort eingeben',
+                                'pt' =>
+                                  '💡 Sinta-se à vontade para digitar qualquer cidade, país ou local personalizado',
+                                'ja' => '💡 都市、国、または自由な場所を入力できます',
+                                'ko' => '💡 도시, 국가 또는 원하는 장소를 자유롭게 입력할 수 있습니다',
+                                _ => '💡 您可以自由填写任何城市、国家或自定义地点',
+                              },
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: isDark
+                                    ? AppTheme.secondaryTextDark
+                                    : AppTheme.secondaryTextLight,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              switch (StorageService.getLanguage()) {
+                                'zh-TW' => '例如：我家鄉的小鎮\n      某個封閉鄉村',
+                                'yue' => '例如：我鄉下嘅小鎮\n      某個封閉鄉村',
+                                'en' =>
+                                  'e.g. A small town in Tuscany\n     A remote village in Iceland',
+                                'es' =>
+                                  'Por ejemplo: Un pueblo pequeño en Andalucía\n             Una aldea remota en los Andes',
+                                'fr' =>
+                                  'Exemple : Un petit village en Provence\n          Une campagne isolée en Bretagne',
+                                'de' =>
+                                  'Z. B. Ein kleines Dorf in Bayern\n     Ein abgelegener Ort in den Alpen',
+                                'pt' =>
+                                  'Exemplo: Uma pequena cidade no interior\n         Uma vila remota no Alentejo',
+                                'ja' => '例：田舎の小さな町\n      どこかの閉ざされた村',
+                                'ko' => '예: 고향의 작은 마을\n     어느 외딴 마을',
+                                _ => '例如：我故乡的小镇\n      某个封闭乡村',
+                              },
+                              style: TextStyle(
+                                fontSize: 13,
+                                height: 1.4,
+                                color: isDark
+                                    ? AppTheme.tertiaryTextDark
+                                    : AppTheme.tertiaryTextLight,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 8),
-              // 提示：可随意填写任何地点 + 示例
-              Column(
-                children: [
-                  Text(
-                    switch (StorageService.getLanguage()) {
-                      'zh-TW' || 'yue' => '💡 您可以自由填寫任何城市、國家或自訂地點',
-                      'en' =>
-                        '💡 Feel free to enter any city, country, or custom location',
-                      'es' =>
-                        '💡 Puede ingresar cualquier ciudad, país o lugar personalizado',
-                      'fr' =>
-                        '💡 Vous pouvez saisir n\'importe quelle ville, pays ou lieu personnalisé',
-                      'de' =>
-                        '💡 Sie können jede Stadt, jedes Land oder einen eigenen Ort eingeben',
-                      'pt' =>
-                        '💡 Sinta-se à vontade para digitar qualquer cidade, país ou local personalizado',
-                      'ja' => '💡 都市、国、または自由な場所を入力できます',
-                      'ko' => '💡 도시, 국가 또는 원하는 장소를 자유롭게 입력할 수 있습니다',
-                      _ => '💡 您可以自由填写任何城市、国家或自定义地点',
-                    },
-                    style: TextStyle(
-                      fontSize: 13,
+                // 确认按钮（固定于页面 3/4 高度位置）
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  top: buttonTop,
+                  child: SizedBox(
+                    height: 48,
+                    child: CupertinoButton.filled(
+                      onPressed: canSubmit ? _onSubmit : null,
+                      borderRadius: BorderRadius.circular(12),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
                       color: isDark
-                          ? AppTheme.secondaryTextDark
-                          : AppTheme.secondaryTextLight,
+                          ? AppTheme.buttonFillDark
+                          : AppTheme.buttonFillLight,
+                      disabledColor: isDark
+                          ? const Color(0xFF2C2C2E)
+                          : const Color(0xFFF2F2F7),
+                      child: Text(
+                        _getConfirmText(),
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                          color: canSubmit
+                              ? AppTheme.buttonText
+                              : (isDark
+                                    ? AppTheme.buttonDisabledTextDark
+                                    : AppTheme.buttonDisabledTextLight),
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    switch (StorageService.getLanguage()) {
-                      'zh-TW' => '例如：我家鄉的小鎮\n      某個封閉鄉村',
-                      'yue' => '例如：我鄉下嘅小鎮\n      某個封閉鄉村',
-                      'en' =>
-                        'e.g. A small town in Tuscany\n     A remote village in Iceland',
-                      'es' =>
-                        'Por ejemplo: Un pueblo pequeño en Andalucía\n             Una aldea remota en los Andes',
-                      'fr' =>
-                        'Exemple : Un petit village en Provence\n          Une campagne isolée en Bretagne',
-                      'de' =>
-                        'Z. B. Ein kleines Dorf in Bayern\n     Ein abgelegener Ort in den Alpen',
-                      'pt' =>
-                        'Exemplo: Uma pequena cidade no interior\n         Uma vila remota no Alentejo',
-                      'ja' => '例：田舎の小さな町\n      どこかの閉ざされた村',
-                      'ko' => '예: 고향의 작은 마을\n     어느 외딴 마을',
-                      _ => '例如：我故乡的小镇\n      某个封闭乡村',
-                    },
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1.4,
-                      color: isDark
-                          ? AppTheme.tertiaryTextDark
-                          : AppTheme.tertiaryTextLight,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              // 确认按钮
-              SizedBox(
-                height: 48,
-                child: CupertinoButton.filled(
-                  onPressed: canSubmit ? _onSubmit : null,
-                  borderRadius: BorderRadius.circular(12),
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  color: isDark
-                      ? AppTheme.buttonFillDark
-                      : AppTheme.buttonFillLight,
-                  disabledColor: isDark
-                      ? const Color(0xFF2C2C2E)
-                      : const Color(0xFFF2F2F7),
-                  child: Text(
-                    _getConfirmText(),
-                    style: TextStyle(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w600,
-                      color: canSubmit
-                          ? AppTheme.buttonText
-                          : (isDark
-                                ? AppTheme.buttonDisabledTextDark
-                                : AppTheme.buttonDisabledTextLight),
-                    ),
-                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              ),
-              const SizedBox(height: 48),
-            ],
-          ),
+              ],
+            );
+          },
         ),
       ),
     );

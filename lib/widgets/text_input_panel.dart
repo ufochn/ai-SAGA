@@ -121,41 +121,43 @@ class _TextInputPanelState extends State<TextInputPanel> {
 
     // 确定输入按钮（生成中/超限/为空时置灰禁用）
     final bool canConfirm = !widget.disabled && _canConfirm;
-    final Widget confirmButton = SizedBox(
-      height: 44,
-      child: CupertinoButton.filled(
-        onPressed: canConfirm
-            ? () {
-                SoundService.playConfirm();
-                // 必须读"生效中的控制器"（外部传入时用户输入在外部控制器里，
-                // 内部 _textController 是空的，读它会误判为空输入导致无反应）
-                widget.onConfirm(_controller.text);
-                // 仅当没有外部控制器时才清空内部控制器（外部控制器由持有方管理，
-                // 不清空预填的推荐/兜底内容）
-                if (widget.controller == null) {
-                  _textController.clear();
+    // 灰化（禁用）期间整体降低透明度：保留蓝色按钮外形与圆角，辨识度不减，
+    // 又明显区别于上方灰底带边框的输入框；可点击时全透明度显示
+    final Widget confirmButton = Opacity(
+      opacity: canConfirm ? 1.0 : 0.4,
+      child: SizedBox(
+        height: 44,
+        child: CupertinoButton.filled(
+          onPressed: canConfirm
+              ? () {
+                  SoundService.playConfirm();
+                  // 必须读"生效中的控制器"（外部传入时用户输入在外部控制器里，
+                  // 内部 _textController 是空的，读它会误判为空输入导致无反应）
+                  widget.onConfirm(_controller.text);
+                  // 仅当没有外部控制器时才清空内部控制器（外部控制器由持有方管理，
+                  // 不清空预填的推荐/兜底内容）
+                  if (widget.controller == null) {
+                    _textController.clear();
+                  }
+                  setState(() {});
                 }
-                setState(() {});
-              }
-            : null,
-        borderRadius: BorderRadius.circular(10),
-        padding: EdgeInsets.zero,
-        color: isDark
-            ? AppTheme.buttonFillDark
-            : AppTheme.buttonFillLight,
-        disabledColor: isDark
-            ? const Color(0xFF2C2C2E)
-            : const Color(0xFFF2F2F7),
-        child: Text(
-          widget.confirmText,
-          style: TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.w600,
-            color: canConfirm
-                ? AppTheme.buttonText
-                : (isDark
-                      ? AppTheme.buttonDisabledTextDark
-                      : AppTheme.buttonDisabledTextLight),
+              : null,
+          borderRadius: BorderRadius.circular(10),
+          padding: EdgeInsets.zero,
+          color: isDark
+              ? AppTheme.buttonFillDark
+              : AppTheme.buttonFillLight,
+          // 禁用时也使用蓝色填充，靠外层 Opacity 整体变淡（避免变成灰底、与输入框混淆）
+          disabledColor: isDark
+              ? AppTheme.buttonFillDark
+              : AppTheme.buttonFillLight,
+          child: Text(
+            widget.confirmText,
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.buttonText,
+            ),
           ),
         ),
       ),

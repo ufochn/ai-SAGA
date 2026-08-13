@@ -13,6 +13,12 @@
 > **⚠️ 2026-08-09 (settings-in-story)**: the dedicated `user_settings` table was **removed** — the seven user settings now travel with each story segment and are stored as per-row snapshot columns on `story_segments`; a new `language` column makes the stored value the authoritative base for all language handling, and the redundant per-request language upload on continuation was removed. The debug database was **rebuilt from scratch** (old data cleared). Read the **[Settings-in-Story Refactor & Language-as-Authority (2026-08-09)](#settings-in-story-refactor--language-as-authority-2026-08-09)** section at the bottom.
 >
 > **⚠️ 2026-08-12 (generation architecture & cost)**: a design session covered **DeepSeek V4 Pro vs Flash cost modelling**, why post-stream variables cannot live in the streamed `text`, the **single-module JSON** option (Option A), Dify **Workflow vs Chatflow** for the streaming-novel pipeline, the **two-round Chatflow** replacement for the two-LLM graph, **prompt-caching (cache-hit) discount** mechanics, `max_tokens` as a hard cap, token↔character conversion, and **context strategies** (full text vs outline vs two-stage planning). Read the **[Design Session: Novel-Generation Cost, Prompt Caching & Workflow/Chatflow Architecture (2026-08-12)](#design-session-novel-generation-cost-prompt-caching--workflowchatflow-architecture-2026-08-12)** section at the bottom.
+>
+> **⚠️ 2026-08-13 (setup wizard polish & countdown removal)**: the setup wizard's buttons were unified (fixed at 75% of the page height and relabelled to localized "Next"), the final-confirmation button was moved to the bottom of its scrollable content, the language-selection box was aligned with the location/era input boxes (the missing navigation bar was the root cause), and the 5-second countdown display was removed so the previously-delayed action runs immediately after moderation passes. Read the **[Setup Wizard UI Polish & Countdown Removal (2026-08-13)](#setup-wizard-ui-polish--countdown-removal-2026-08-13)** section at the bottom.
+>
+> **⚠️ 2026-08-13 (story-page UX & localization hardening)**: eliminated the display jump when the typewriter starts typing, made the "Generating new content…" indicator disappear once typing begins, stabilized the typewriter so it never re-types from a wrong position, kept historical input cards populated with the choice values saved at the moment of the user's choice, kept every popup and error string in the current app language, made the language-selection picker default to the user's language (stored → system → English), and preserved the language preference across the "Restart" reset. Read the **[Story-Page UX Hardening & Full-Language Localization (2026-08-13)](#story-page-ux-hardening--full-language-localization-2026-08-13)** section at the bottom.
+>
+> **⚠️ 2026-08-13 (full chatflow summary)**: a consolidated, English, desensitized summary of the whole 2026-08-13 chatflow — setup-wizard polish & countdown removal, continuation-button copy, disabled-button visuals, blank-input guards, and the story-page UX hardening (jump-free typewriter, stable layout, full localization). Read the **[Full Chatflow Summary — Setup & Story-Page UX Hardening (2026-08-13)](#full-chatflow-summary--setup--story-page-ux-hardening-2026-08-13)** section at the bottom.
 
 ---
 
@@ -63,7 +69,7 @@ The app was originally created from the default Flutter template (`flutter_appli
 3. **Lightweight authorization** (first use) → Google on Android, Sign in with Apple on iOS (or a local dev account).
 4. **Story setup wizard**: location → era → player character (gender + name) → partner (gender + name + traits).
 5. **AI moderation** on every submitted setting (via the audit gateway) before the story is unlocked.
-6. **Confirmation page** with a 5‑second countdown → enter the main story page.
+6. **Confirmation page** → server moderation passes → enter the main story page.
 7. **Main story page**: reading panel, action buttons, free-text input — all content is persisted locally.
 8. **AI fiction generation**: on confirmation, the server calls the Dify **fiction workflow** in streaming mode; the first audited segment is typed out, then the remainder is revealed with progressive acceleration.
 
@@ -1198,3 +1204,228 @@ Net effect: abandoned content is removed in three places (display page, app loca
 - **Why not force a user restart on bad metadata?** Restarting only re-samples randomness; it is not a reliable fix and can loop. Server-side defaults (with the outline falling back to the segment text) guarantee usable data every time.
 - **Why put the choice-overwrite before the quota gate?** So an out-of-quota user can still persist their latest three action choices without spending any LLM tokens — state is saved, generation is blocked.
 - **Why reuse `_continueStory` for rewrites?** One code path for both normal continuation and time-tree rewrites keeps behavior consistent and makes future changes single-point (only an optional `rewrite_from` field is added).
+
+---
+
+# Session Update (2026-08-13)
+
+> Session covering: renaming the latest-continuation button copy to **"Continue the story following the guidance above"** across all 10 languages, reworking the **disabled-button visual state** (opacity fade instead of a bordered grey block, so a disabled button stays distinct from the input field above it), and hardening the **time-tree "Restart from here"** flow so that **blank input can never trigger a rewrite / generation** — enforced at the UI, handler, core, and server layers. Written in English for other developers. **Desensitized** — no secrets, credentials, server addresses, or real identifiers appear anywhere.
+
+## 1. Continuation button copy: "Continue the story following the guidance above"
+
+The button under the three latest input boxes was renamed in [`_getLatestContinueButtonText()`](AI-SAGA/lib/logic/home_content.dart:1846):
+
+- **Before**: "按照上面输入指引继续故事选择" — *"Continue the story **choice** following the **input** guidance above"*.
+- **After**: "按照上面指引继续故事" — *"Continue the story following the guidance above"* (the "input" and "choice" wording is removed).
+
+All 10 languages were adapted to match: zh-CN / zh-TW / yue / ja / ko had the "input"/"choice" wording stripped (e.g. 上記の**入力**ガイド → 上記のガイド, 위 **입력** 안내 → 위 안내); en / es / fr / de / pt already read as "…following the guidance above" and were left unchanged.
+
+## 2. Disabled-button visual state: opacity fade (not a border)
+
+**The problem.** While input/generation is disabled the buttons grey out; the original design kept them recognizable by adding a 1 px border, but that made a disabled button look almost identical to the input field directly above it (both grey fill + border) → visual confusion.
+
+**The fix (implemented).** Keep the button's **blue fill and rounded shape** and simply fade the whole button via an `Opacity` widget — `1.0` when clickable, **`0.4` when disabled**. Because the fill stays blue (not grey) and the text stays white, a disabled button remains unmistakably a button and clearly distinct from the grey bordered input field.
+
+- [`text_input_panel.dart`](AI-SAGA/lib/widgets/text_input_panel.dart:124) — the three bottom confirm buttons (`canConfirm == false`: generating / over-limit / empty).
+- [`story_choice_card.dart`](AI-SAGA/lib/widgets/story_choice_card.dart:212) — the historical "Restart from here" buttons (`canPress == false`: typing / over-limit / empty).
+- Both set `disabledColor` to the same blue fill (`AppTheme.buttonFillDark/Light`) and let the outer `Opacity` do the "greyed out" work; button text is always `AppTheme.buttonText` (white).
+
+## 3. Time-tree blank-input guard (three client layers + server)
+
+The concern: the "Restart from here" button could be pressed while its input box was empty, letting the time tree generate new novel content **without any user guidance**. This must be impossible.
+
+### 3.1 UI layer — button disabled when blank
+[`StoryChoiceCard`](AI-SAGA/lib/widgets/story_choice_card.dart:163) `canPress` now requires `hasText` (`controller.text.trim().isNotEmpty`): when the corresponding input box is blank the button is disabled (`onPressed == null`), so it cannot even be pressed — no sound, no press feedback, nothing.
+
+### 3.2 Handler layer — return before any story mutation
+[`_onRestartHerePressed()`](AI-SAGA/lib/logic/home_content.dart:1900) now checks `userInput.trim().isEmpty` and returns **before** `_truncateStoryFrom(segmentIndex)`. Blank input can therefore never truncate the story, never reach the server, and never delete later content. The former fallback that auto-filled a localized default prompt ("继续" / "Continue the story") for blank rewrite input was **removed**, along with its now-unused helper `_getRewriteDefaultInputText()`.
+
+### 3.3 Core layer — final safety net
+[`_continueStory()`](AI-SAGA/lib/logic/home_content.dart:705) already returned on blank input at its very first line (`if (!mounted || userInput.trim().isEmpty) return;`) — before any `setState`, scroll, network call, or choice recording. This covers every entry point (bottom boxes, time-tree rewrite, and the re-auth retry path).
+
+### 3.4 Server layer — reject crafted/blank continuation requests
+[`generate_story()`](AI-SAGA/server/main.py:1609) now rejects a blank `user_input` for any **continuation or rewrite** with `HTTP 400 "续写需要用户输入指引，请先填写内容再继续"` — placed **before any database write or truncation**. Only a genuine **first generation** (empty `story_segments` for the user and no `rewrite_from`) may carry an empty `user_input`, so creating a brand-new story is unaffected.
+
+## 4. Behaviour with blank input (analysis)
+
+Traced end-to-end:
+
+- **Normal app usage**: blank input is stopped at the UI layer — the button is disabled, so the tap is not even registered (no sound, no dialog, no scroll, no network, no DB change). The story and the screen are completely unchanged; it is as if the instruction never happened.
+- **If the UI were bypassed**: the handler returns before truncation, and `_continueStory` returns at its first line — still no state change, no network, no truncation.
+- **Crafted API request**: the server returns `400` before any write/truncate, so the stored story is untouched and Dify is never called.
+- Note: the only caller of `_onRestartHerePressed` is the `StoryChoiceCard` button, which is gated by `hasText` — the "bypassed" path is not reachable in the current code; the handler/core/server guards are defense-in-depth.
+
+## 5. Verification
+
+- `flutter analyze` → no issues (including `text_input_panel.dart` and `story_choice_card.dart`).
+- `python3 -m py_compile server/main.py` → Syntax OK.
+- The unused `_getRewriteDefaultInputText()` helper was deleted to keep the analyzer clean.
+
+---
+
+# Setup Wizard UI Polish & Countdown Removal (2026-08-13)
+
+> Session covering: unifying the confirm/Next button placement across the setup wizard (fixed at 75% of the page height), moving the final-confirmation button to the bottom of its scrollable content, localizing the setup-page buttons to "Next" across all 10 languages, aligning the language-selection box with the location/era input boxes (root cause: the language page had no navigation bar), and removing the 5-second countdown display so the previously-delayed action runs immediately after moderation passes. All logic (server moderation, per-item edit shortcuts, back navigation, localization) is preserved. Written in English for other developers. **Desensitized** — no secrets, credentials, server addresses, or real identifiers appear anywhere.
+
+## 1. Unified button placement on the setup pages (fixed at 75% height)
+
+**The problem.** The four setup pages (location, era, player, partner) placed their confirm/Next button at the end of a scrolling `Column`. Depending on content length the button could sit at different heights or be pushed off-screen, so the flow did not feel consistent.
+
+**The fix (implemented).** Each page now uses a `LayoutBuilder + Stack` layout:
+
+- The content scrolls inside a `Positioned.fill → SingleChildScrollView` (with extra bottom padding so the last field can scroll above the button).
+- The button is fixed with `Positioned(top: constraints.maxHeight * 0.75, left: 16, right: 16)` — always visible at 75% of the page height, regardless of how much content there is.
+
+Files: [`location_setup_page.dart`](AI-SAGA/lib/widgets/location_setup_page.dart:475), [`era_setup_page.dart`](AI-SAGA/lib/widgets/era_setup_page.dart:459), [`player_setup_page.dart`](AI-SAGA/lib/widgets/player_setup_page.dart:551), [`character_setup_page.dart`](AI-SAGA/lib/widgets/character_setup_page.dart:555). The language page ([`initialization_page.dart`](AI-SAGA/lib/widgets/initialization_page.dart:230)) received the same 75%-height button placement.
+
+## 2. Confirmation-page button moved to the bottom of the content
+
+On the final confirmation page ([`setup_confirmation_page.dart`](AI-SAGA/lib/widgets/setup_confirmation_page.dart)), the button is deliberately **not** fixed. It is the last item inside the scrollable summary column, so the player naturally scrolls through the full list of settings before reaching it — preventing them from missing any setting.
+
+## 3. Setup-page buttons renamed to localized "Next"
+
+The button labels on the language, location, era, and partner pages were changed from "Confirm / 完成设定 / 确认…" to **"Next / 下一步"**, localized across all 10 languages (zh-CN / zh-TW / yue / en / es / fr / de / pt / ja / ko). This makes the multi-step wizard's forward progression unambiguous on every step.
+
+## 4. Language-selection box aligned with the location/era input boxes
+
+Two distinct issues were addressed:
+
+- **Physical height.** The language dropdown was converted from a `Container + Row` into the same `CupertinoTextField` structure used by the location/era input fields (identical padding, fixed 50 px height, suffix chevron), so all three boxes render at the same physical height.
+- **Screen position.** The location/era pages carry a `CupertinoNavigationBar` (with a back button) that pushes their body down; the language page had **no navigation bar**, so its selection box appeared higher on screen. Adding the same navigation bar to the language page aligned the body start position. In addition, the header (title + subtitle) block height was fixed on the language/location/era pages so the boxes stay aligned regardless of how the localized title/subtitle wrap across languages.
+
+## 5. 5-second countdown removed — action runs immediately after moderation
+
+**Before.** Tapping "确定" on the confirmation page ran the server moderation dialog, then showed a 5-second countdown display, and only after the countdown ended called `onConfirmed()` (which triggers story generation in [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart:1417)).
+
+**Now.** The countdown display is removed entirely — the `_counting`/`_countdown` state, the `Timer`, the `_buildCountdown()` UI, and the "entering a brand-new world" copy were all deleted. When the server moderation approves (`action == "none"`), the new `_onAuditApproved()` calls `widget.onConfirmed()` immediately.
+
+**All other logic is preserved:** the server audit dialog (token, timeout, device-conflict and account-limit handling), the per-item "Edit" shortcuts (`widget.onEdit(index)`), the back button (`widget.onBack()`), and every localization helper.
+
+## 6. Verification
+
+- `dart format` on all modified widgets → clean.
+- `flutter analyze` on all modified widgets → no issues.
+
+---
+
+# Story-Page UX Hardening & Full-Language Localization (2026-08-13)
+
+> Session covering: eliminating the display jump when the typewriter starts typing, making the "Generating new content…" indicator disappear once typing begins, stabilizing the typewriter so it never re-types from a wrong position, keeping historical input cards populated with the choice values saved at the moment of the user's choice, keeping a constant one-line gap between the input boxes and the "Your choice" marker, keeping the page stable behind error/violation dialogs, making earlier in-memory segments reveal smoothly on up-scroll, and forcing **every popup and error string to follow the current app language** (no more mixed-language warnings). Also: the language-selection picker now defaults to the user's language (stored first, then system if supported, else English), and the language preference survives the "Restart" reset. Written in English for other developers. **Desensitized** — no secrets, credentials, server addresses, or real identifiers appear anywhere.
+
+## 1. Jump-free typewriter reveal (total height stays constant)
+
+**The problem.** When the first content chunk arrived, the placeholder (a "Generating new content…" row + a half-screen reserved blank) was removed all at once while the previous segment gained its time-tree card and the new segment began typing — the total layout height collapsed and the view "jumped".
+
+**The fix.** A bottom "generation area" now stays visible for the whole stream:
+
+- Before the first chunk it shows the prompt + a half-screen reserved blank.
+- Once typing starts, the prompt disappears and its height is folded into the blank; the blank then shrinks 1:1 as the streaming segment grows (the segment's height is measured by a small custom size-reporting render object), so **the total height never changes** — no jump at the start of typing and none while it types.
+- The just-continued segment's time-tree card appears without a layout shift: its height is measured off-screen during the waiting phase and absorbed by the reserved blank when it appears, so no extra card "pops in".
+
+## 2. Stable typewriter state (never re-types from a wrong position)
+
+Each typewriter segment is wrapped in a **stable** size-reporting widget (applied unconditionally, with no moving `GlobalKey`). Because the wrapper never moves between segments at hand-off, a segment's element/state is never destroyed mid-typing — previously the moving wrapper caused the typewriter to lose all typed text and restart from a wrong position. Only the current streaming (last) segment's height is tracked, to shrink the reserved blank.
+
+## 3. Consistent layout around the "Your choice" marker
+
+- Historical input cards now display the **choice_1/2/3 values saved at the moment of the user's choice** (kept in sync with the server); previously they were blank for segments generated in the current session.
+- The three input boxes of a historical card use the **same placeholders** as the bottom input boxes.
+- A **constant one-line gap** is kept between the input boxes and the "Your choice" marker in both the waiting and the typing states, so the marker never shifts when typing starts.
+
+## 4. Stable page behind error / violation dialogs
+
+When generation fails or is aborted, the "generation area" (user choice + reserved blank) is kept visible while the dialog is up, so the page behind the popup does not jump. The error dialog forces a restart (which resets state); the violation dialog transitions to the idle state only after it is dismissed. The error details produced by the client services and OS network exceptions are localized too (see §5).
+
+## 5. Full popup localization (no mixed languages)
+
+A shared [`StorageService.localizedText()`](AI-SAGA/lib/logic/storage_service.dart) helper returns text per the current app language. All client-side error messages in the story / sync / auth services and raw OS network exceptions (socket / client / timeout) are localized, so a popup shown in any language (e.g. Portuguese) is entirely in that language — no more "Portuguese title + Chinese detail".
+
+- First-use popups follow the **system language** when no language has been selected (existing `getLanguage()` fallback).
+
+## 6. Language-selection default + persistence across reset
+
+- The language picker's default gear position follows: **stored language** (old users) → **system language if supported** (new users) → **English** otherwise.
+- The language preference is **preserved across the "Restart" reset** — the previously-used language outranks the system language, so after a reset the picker and the app text stay in the user's chosen language instead of falling back to the system language.
+
+## 7. Smooth up-scroll of earlier content
+
+In-memory earlier segments (e.g. the tail loaded at startup) are now revealed **all at once** — matching the server-batch behaviour — and the reveal triggers as soon as the user scrolls into the top pull area, eliminating the previous "scroll to the very top → stop → scroll again" one-at-a-time stops.
+
+## 8. Robustness note: `_onRestartHerePressed` with blank input (the only point worth noting)
+
+If the UI were bypassed and [`_onRestartHerePressed()`](AI-SAGA/lib/logic/home_content.dart) were invoked directly with a **blank** input, the handler returns **before** truncating or generating anything, so existing story content can never be harmed. This is a defense-in-depth guard on top of the UI-level disabled button (blank boxes cannot be pressed). The same blank-input early-return exists at the core entry point ([`_continueStory`](AI-SAGA/lib/logic/home_content.dart)), covering every continuation / rewrite path.
+
+## 9. Verification
+
+- `flutter analyze` → no issues.
+- All fixes verified against the waiting → typing → done lifecycle, the error / violation dialog flows, historical-segment scrolling, and the language-selection page (stored / system / unsupported / post-reset).
+
+---
+
+# Full Chatflow Summary — Setup & Story-Page UX Hardening (2026-08-13)
+
+> A consolidated English summary of the whole 2026-08-13 chatflow: eliminating the display jump when the streaming typewriter starts, stabilizing the typewriter so it never re-types from a wrong position, keeping historical input cards populated and the layout constant around the "Your choice" marker, keeping the page stable behind error/violation dialogs, forcing every popup and error string into the current app language, and hardening the setup wizard (unified button placement, countdown removal, localized "Next", blank-input guards). **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. The central problem: the display jump when typing starts
+
+After the player taps **Continue** (or a time-tree "Restart from here"), the page shows a placeholder: the user's current choice, a "Generating new content…" row, and a half-screen reserved blank. When the server's first content chunk arrived, the old code removed the whole placeholder in one `setState` while the previous segment gained its time-tree card and the new segment began typing — the total layout height collapsed and the view "jumped" in a single visible frame.
+
+## 2. Jump-free typewriter reveal (total height stays constant)
+
+A bottom "generation area" now stays visible for the whole stream:
+
+- **Before the first chunk** it shows the prompt + a half-screen reserved blank.
+- **Once typing starts** the prompt disappears and its measured height is folded into the blank; the blank then shrinks **1:1** as the streaming segment grows, so the total height never changes — no jump at the start of typing and none while it types.
+- **Time-tree card appears without a layout shift**: the just-continued segment's card height is measured off-screen during the waiting phase and absorbed by the reserved blank when it appears, so no extra card "pops in".
+
+The mechanics live in [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart):
+
+- [`_SizeReporting`](AI-SAGA/lib/logic/home_content.dart:101) — a `SingleChildRenderObjectWidget` + [`_RenderSizeReporting`](AI-SAGA/lib/logic/home_content.dart:120) (`RenderProxyBox`) that calls back the child's size on every change (including first layout) via `SizeChangedLayoutNotifier`-style semantics but without a `GlobalKey`.
+- The wrapper is applied **unconditionally** to every typewriter segment, so the element/state is never destroyed mid-typing at segment hand-off (this was the root cause of the typewriter re-typing from a wrong position).
+- Only the current streaming (last) segment's reported height drives the reserved-blank shrink, so historical segments never disturb it.
+- The reserved blank is computed as `_streamingPromptHeight + half − _cardMeasureHeight` and rendered through a `ValueListenableBuilder` that clamps the remaining blank to `≥ 0`.
+
+## 3. Consistent layout around the "Your choice" marker
+
+- Historical input cards display the **`choice_1/2/3` values saved at the moment of the user's choice** (kept in sync with the server), not blank values for segments generated in the current session.
+- The three input boxes of a historical card use the **same placeholders** as the bottom input boxes.
+- A **constant one-line gap** is kept between the input boxes and the "Your choice" marker in both the waiting and the typing states, so the marker never shifts when typing starts.
+
+## 4. Stable page behind error / violation dialogs
+
+When generation fails or is aborted, the generation area (user choice + reserved blank) stays visible while the dialog is up, so the page behind the popup does not jump:
+
+- The **error dialog** keeps `_storyStreaming` true while shown and forces a restart (which resets state).
+- The **violation dialog** transitions to the idle state only **after** it is dismissed (`_storyStreaming = false` in the dialog's `.then`).
+
+## 5. Full popup localization (no mixed languages)
+
+A shared [`StorageService.localizedText()`](AI-SAGA/lib/logic/storage_service.dart) helper returns text per the current app language. All client-side error messages in the story / sync / auth services and raw OS network exceptions (socket / client / timeout) are localized, so a popup shown in any language (e.g. Portuguese) is entirely in that language — no more "Portuguese title + Chinese detail". First-use popups follow the **system language** when no language has been selected (existing `getLanguage()` fallback).
+
+## 6. Language-selection default + persistence across reset
+
+- The language picker's default follows: **stored language** (old users) → **system language if supported** (new users) → **English** otherwise.
+- The language preference is **preserved across the "Restart" reset** — the previously-used language outranks the system language, so after a reset the picker and the app text stay in the user's chosen language.
+
+## 7. Setup wizard polish & countdown removal
+
+- **Unified button placement**: the confirm/"Next" button on the language, location, era, player, and partner pages is fixed at **75% of the page height** (`LayoutBuilder + Stack`), so it never sits at different heights or falls off-screen. The final-confirmation button is deliberately the last item in its scrollable summary column.
+- **Localized "Next"**: setup-page buttons renamed to "Next / 下一步" across all 10 languages.
+- **Language box alignment**: the language dropdown now uses the same `CupertinoTextField` structure and navigation bar as the location/era pages, so all boxes render at the same height and screen position.
+- **Countdown removed**: the 5-second countdown display is gone — once server moderation approves, `onConfirmed()` runs immediately; all other logic (audit dialog, edit shortcuts, back navigation, localization) is preserved.
+
+## 8. Continuation button copy, disabled visual, and blank-input guards
+
+- **Copy**: the latest-continuation button reads "Continue the story following the guidance above" in all 10 languages (the "input"/"choice" wording was stripped).
+- **Disabled visual**: disabled buttons keep their blue fill and rounded shape and simply fade via `Opacity` (1.0 enabled / 0.4 disabled), so a disabled button stays distinct from the grey input field above it ([`text_input_panel.dart`](AI-SAGA/lib/widgets/text_input_panel.dart), [`story_choice_card.dart`](AI-SAGA/lib/widgets/story_choice_card.dart)).
+- **Blank-input guards (defense-in-depth)**: the historical "Restart from here" button is disabled when its box is blank; [`_onRestartHerePressed`](AI-SAGA/lib/logic/home_content.dart) returns before any truncation; [`_continueStory`](AI-SAGA/lib/logic/home_content.dart) returns on blank input at its first line; and the server rejects a blank `user_input` for any continuation/rewrite with HTTP 400 **before** any DB write. Only a genuine first generation may carry an empty `user_input`.
+
+## 9. Smooth up-scroll of earlier content
+
+In-memory earlier segments (e.g. the tail loaded at startup) are revealed **all at once** — matching the server-batch behaviour — and the reveal triggers as soon as the user scrolls into the top pull area, eliminating the previous "scroll to the very top → stop → scroll again" one-at-a-time stops.
+
+## 10. Verification
+
+- `flutter analyze` → no issues.
+- All fixes verified against the waiting → typing → done lifecycle, the error / violation dialog flows, historical-segment scrolling, and the language-selection page (stored / system / unsupported / post-reset).
+- Because the generation area and typewriter wrappers changed in [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart), test the changes with **Hot Restart (↻/R)**, not Hot Reload (⚡/r).

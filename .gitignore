@@ -79,6 +79,13 @@ id_ed25519
 # 本地调试脚本：从 .env 读取真实请求样本打印，不入库
 print_request_sample.py
 
+# Dify LLM 提示词生成脚本（dify 模块内部工具，不入库）
+dify/dify_llm_prompt_generator.py
+
+# Dify 代码节点 / 其它 Dify Python 脚本（不入库；覆盖如 dify_code_node.py、dify/*.py）
+dify_code_node.py
+dify/*.py
+
 # ============================================================
 # 备份 / 归档文件：可能包含泄露前的敏感历史（含真实 IP/密钥等），严禁提交
 # ============================================================

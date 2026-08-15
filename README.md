@@ -1429,3 +1429,85 @@ In-memory earlier segments (e.g. the tail loaded at startup) are revealed **all 
 - `flutter analyze` → no issues.
 - All fixes verified against the waiting → typing → done lifecycle, the error / violation dialog flows, historical-segment scrolling, and the language-selection page (stored / system / unsupported / post-reset).
 - Because the generation area and typewriter wrappers changed in [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart), test the changes with **Hot Restart (↻/R)**, not Hot Reload (⚡/r).
+
+---
+
+# Full Chatflow Summary — Randomized Murder-Case Fiction, Case Lifecycle & Dify Contract (2026-08-15)
+
+> An English, desensitized summary of the 2026-08-15 chatflow. It covers: reworking the interactive-novel generation prompt into a randomized murder-case generator; the Dify code node that picks one case scenario from ten options; the `story_segments` schema extension with `case_type`/`case_core`; a dedicated case-generation Dify workflow (no inputs) returning victim identity / death scene / murder method, which the server concatenates into `case_core`; the exact 15-variable server→Dify story-workflow contract; the LLM2 inference mapping; the "persist only when story text + all four inference values arrive" rule; the 20-round case lifecycle; the `former_content` / `corrent_outlet` context variables (and removal of the unused `previous_story`); recommended DeepSeek V4 Pro LLM-node parameters for JSON structured output; a fresh-deployment (no-migration) server update; and `.gitignore` rules for Dify Python code. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. From interactive novel to randomized murder-case generator
+
+- The original interactive-fiction prompt was reworked into a randomized murder-case generator: it randomly draws a **location × era × industry × background** combination and produces a case that becomes the story's background and final truth.
+- Ten case scenarios are defined (e.g. "attempted murder followed by an accidental death", "counter-kill", "pure accident that looks like homicide", "two independent killers", "one-by-one victims among suspects", "four conspirators"). Each scenario pairs a type label with a generation prompt.
+- A Dify code node picks one of the ten scenarios uniformly at random and returns `core_type` (label) + `core_content` (prompt); on any failure it returns empty strings (fail-safe, never raises).
+
+## 2. Database: `story_segments` gains case columns
+
+- The novel-text table `story_segments` was extended with two columns:
+  - `case_type TEXT DEFAULT ''` — the current case type (e.g. "counter-kill").
+  - `case_core TEXT DEFAULT ''` — the current case core (victim identity / death scene / murder method / truth background).
+- Total columns: 22 (id, user_id, seq, content, created_at, choice_1/2/3, user_choice, outline, music_style, location, era, player_*, partner_*, language, case_type, case_core).
+- Because the project is in the testing phase, the schema is created fresh on every deploy; **no migration/compatibility code** is kept.
+
+## 3. Case-generation Dify workflow
+
+- A dedicated workflow (no input variables, blocking response mode) generates the case content.
+- Its LLM node (DeepSeek V4 Pro) is configured with **JSON structured output** (response format `json_object` + JSON Schema + output variable `structured_output`) producing three fields: `victim_identity`, `death_scene`, `murder_method`.
+- The server's case caller receives these three fields and **concatenates them (newline-joined) into `case_core`**; `case_type` is read from `case_type`/`core_type`/`type` (aliases tolerated). Missing/empty fields are skipped; total failure returns `("", "")`.
+- Recommended LLM-node parameters for this JSON task: temperature ≈ 0.8, max_tokens ≈ 800, top_p ≈ 0.9, **thinking mode off** (keeps the JSON clean — thinking blocks such as `<think>` can otherwise pollute structured output).
+
+## 4. Server → Dify story-workflow contract (exactly 15 inputs)
+
+The server's `dify_payload.inputs` sends only these variables (all legacy inputs removed):
+`location, era, player_name, player_gender, partner_name, partner_gender, partner_traits, language, player_traits, seq, former_content, corrent_outlet, user_choice, case_type, case_core`.
+
+- `seq` — the current round number (segment count).
+- `former_content` — the latest segment's story text (continuation hook; empty on a brand-new story).
+- `corrent_outlet` — the outlines from the most recent 20-multiple round (inclusive) up to the previous round (inclusive), newline-joined; **empty when `seq` is a multiple of 20**.
+- `user_choice` — the player's action instruction for this round.
+- `case_type` / `case_core` — the current case (from the snapshot on continuation).
+
+## 5. LLM2 (inference) output mapping
+
+The story workflow runs LLM1 (streaming novel text) then LLM2 (structured output `outline` / `action_a` / `action_b` / `music_style`). The server maps them:
+- `outlet` or `outline` → `outline`
+- `music` or `music_style` → `music_style` (whitelist validated)
+- `action_a` → `choice_2`
+- `action_b` → `choice_3`
+- `choice_1` → left blank (the player can fill it in later, or pick choice_2/3 directly)
+- `case_type`/`case_core` (aliases `core_type`/`core_content`) read when present.
+
+## 6. Persistence timing: only persist when everything arrived
+
+- A new story segment is written to the database **only when both** the complete story text **and** the four inference values (`outline/outlet`, `music/music_style`, `action_a`, `action_b`) are present in the workflow outputs.
+- A `_has_inference_outputs` guard decides this; if any of the four is missing, the segment is **not** persisted (the text is still streamed to the client).
+- The old fallback paths (stream ended without `workflow_finished`) no longer persist, since they can never carry the four values.
+
+## 7. Case lifecycle: one case per 20-round arc
+
+- On `seq % 20 == 0` (including 0, the start of a new arc): call the case-generation workflow and store a **fresh** `case_type`/`case_core`.
+- On every other round: **copy the previous round's** `case_type`/`case_core` unchanged, so an arc keeps the same case for 20 consecutive rounds, then regenerates at the next multiple of 20 — repeating cyclically.
+
+## 8. Context variables and removal of `previous_story`
+
+- `former_content` (previous segment's text) replaced the earlier `previous_story` input, which was removed as unused; `_get_story_tail` was simplified to `_get_story_count` (segment count only).
+- `corrent_outlet` reads `outline` values for `seq in [(seq//20)*20, seq-1]` and newline-joins them (empty on multiples of 20).
+
+## 9. Deployment (testing phase, no migrations)
+
+- The FastAPI server runs in a Docker container with the code and the SQLite data bind-mounted from the host; updating means uploading `main.py`, restarting the container, and letting the fresh schema be recreated.
+- The old database is backed up (renamed) and the container recreates an empty database with the latest schema — intentionally **no migration/compatibility** logic, since the app is pre-release.
+
+## 10. `.gitignore` for Dify assets
+
+- All `*.yml` (Dify workflow DSL) were already ignored. Added:
+  - `dify_code_node.py`
+  - `dify/*.py`
+- These keep Dify code-node / script Python files out of version control.
+
+## 11. Verification
+
+- `python3 -m py_compile` passes after every server change.
+- The 20-round case-inheritance, the four-value persistence guard, and the case-core concatenation were each validated with standalone simulation tests.
+- The deployed container was verified to serve the new schema (22 columns) and the new functions, and the service responds correctly.

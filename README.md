@@ -19,6 +19,10 @@
 > **⚠️ 2026-08-13 (story-page UX & localization hardening)**: eliminated the display jump when the typewriter starts typing, made the "Generating new content…" indicator disappear once typing begins, stabilized the typewriter so it never re-types from a wrong position, kept historical input cards populated with the choice values saved at the moment of the user's choice, kept every popup and error string in the current app language, made the language-selection picker default to the user's language (stored → system → English), and preserved the language preference across the "Restart" reset. Read the **[Story-Page UX Hardening & Full-Language Localization (2026-08-13)](#story-page-ux-hardening--full-language-localization-2026-08-13)** section at the bottom.
 >
 > **⚠️ 2026-08-13 (full chatflow summary)**: a consolidated, English, desensitized summary of the whole 2026-08-13 chatflow — setup-wizard polish & countdown removal, continuation-button copy, disabled-button visuals, blank-input guards, and the story-page UX hardening (jump-free typewriter, stable layout, full localization). Read the **[Full Chatflow Summary — Setup & Story-Page UX Hardening (2026-08-13)](#full-chatflow-summary--setup--story-page-ux-hardening-2026-08-13)** section at the bottom.
+>
+> **⚠️ 2026-08-16 update**: added a cinematic **"enter your world"** transition between setup confirmation and the story page (4s fade to black → 6s localized prompt text that fades in/out → 1s full black → 4s brighten, 15s total, no waiting spinner), and fixed several related issues: the blackout only covering the top half of the screen (the inner `Stack` shrank to a short story page), bright system bars at the screen edges during the pure-black phase, a **server** bug that persisted every new story segment's choices as fallback defaults, an **app** bug where the time-tree rewrite displayed the wrong options, and a one-frame red debug screen caused by a `Curves` assertion on a floating-point value slightly outside `[0,1]`. Read the **[Session Update (2026-08-16)](#session-update-2026-08-16)** section at the bottom.
+>
+> **⚠️ 2026-08-16 (dialog background freeze)**: fixed a story-page jump where the error/stall/violation dialog made the background rearrange itself — the "Your choice" text and the input buttons swapped places and the button's bottom edge got pinned to the screen's bottom edge with a violent jump, instead of staying frozen in its pre-error state. Root cause: the error handlers mutated the streaming layout (removed the partial segment / set `_storyStreaming = false`) in the same `setState` before showing the dialog. Fix: the background is now kept **completely unchanged** behind every such dialog. Read the **[Full Chatflow Summary — Dialog Background Freeze (2026-08-16)](#full-chatflow-summary--dialog-background-freeze-2026-08-16)** section at the bottom.
 
 ---
 
@@ -1511,3 +1515,89 @@ The story workflow runs LLM1 (streaming novel text) then LLM2 (structured output
 - `python3 -m py_compile` passes after every server change.
 - The 20-round case-inheritance, the four-value persistence guard, and the case-core concatenation were each validated with standalone simulation tests.
 - The deployed container was verified to serve the new schema (22 columns) and the new functions, and the service responds correctly.
+
+---
+
+# Session Update (2026-08-16)
+
+> An English, desensitized summary of the 2026-08-16 chatflow. It covers: the new cinematic **"enter your world"** transition between setup confirmation and the story page; a fix for the blackout only covering the top half of the screen; darkening the system bars during the pure-black phase; a **server** bug that persisted every new story segment's choices as fallback defaults; an **app** bug where the time-tree rewrite displayed the wrong options; and the root cause of a one-frame red debug screen (a `Curves` floating-point assertion). **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. "Enter your world" cinematic transition
+
+- When a user confirms their settings, the app now plays a phased cinematic instead of a plain black screen with a spinner: **4s fade to fully black → 6s prompt text that fades in then out → 1s full black → 4s gradual brighten** revealing the story page (15s total).
+- The prompt ("You are about to enter the world you created…") is localized into every supported language; no waiting spinner is shown during the black phase.
+- Driven by a single 15s `AnimationController`; an `AnimatedBuilder` overlay computes per-phase black/text opacities ([`home_content.dart`](AI-SAGA/lib/logic/home_content.dart)).
+- The backend flow is unchanged — audit, persistence, and LLM generation all still start immediately; only the presentation timing is cinematic.
+
+## 2. Blackout covered only the top half of the screen
+
+- **Root cause**: `RenderStack` sizes to its **largest non-positioned child**. When `_setupStep` switched to the story page (which is short/empty for a brand-new user), the inner `Stack` shrank, so the `Positioned.fill` blackout covered only the top portion and the bottom half showed the bright page background.
+- **Fix**: added a transparent full-size `SizedBox.expand()` as the first non-positioned child of the inner `Stack`, forcing it to always be full-screen so the overlay always covers the whole screen.
+
+## 3. Bright system bars at the screen edges
+
+- During the pure-black phase, the status/navigation bars could appear as bright strips at the top/bottom edges (outside the app content area).
+- **Fix**: temporarily set the system UI overlay style to dark (black bars, light icons) for the duration of the cinematic and restore the previous day/night style afterwards — on completion, on abort/error, and on disposal. The overlay also extends over the safe-area/status-bar edges.
+
+## 4. Server: story-segment choices persisted as fallback defaults
+
+- **Root cause**: `_persist_story_segment` re-ran `_extract_story_meta` on the **already-extracted** meta dict, which no longer contains the raw Dify `action_a`/`action_b` keys. Every lookup missed, so `choice_2`/`choice_3` fell back to the localized defaults for **every** persisted segment. The app showed the correct LLM choices live (from the streamed outputs) but, after a restart, reloaded the fallback values from the database — exactly the reported "latest segment always shows fallback options" symptom.
+- **Fix**: persist the already-extracted `choice_1/2/3`/`music_style` directly, only gap-filling missing keys with language-appropriate defaults. Deployed to the server.
+- Existing rows that already contain fallback values are **not** auto-healed (the original LLM values were never stored); they are corrected by continuing (new segments are correct) or by restarting the story.
+
+## 5. App: time-tree rewrite displayed the wrong options
+
+- **Root cause**: when rewriting from an earlier point, `_continueStory` recorded `_segmentChoices[choiceSegAbs]` using the **global** input values (still holding the pre-truncation latest segment's options) instead of the rewrite point's `choice1/2/3` arguments; the bottom input panels also kept the stale latest options.
+- **Fix**: use `choice1/2/3 ?? _inputChoice1/2/3` when recording the segment's choices, and when `rewriteFrom != null` sync the bottom input panels to the rewrite point's options ([`home_content.dart`](AI-SAGA/lib/logic/home_content.dart)).
+
+## 6. One-frame red debug screen (floating-point `Curves` assert)
+
+- **Root cause**: at the end of the cinematic the blackout fade computes `(v - 11/15)/(4/15)` with `v = 1.0`, which evaluates to `1.0000000000000002` (and the text fade can produce a tiny negative value) because of binary floating-point precision. `Curves.easeInOut.transform()` asserts its argument is in `[0,1]`, so the assertion fired for one frame → the full red debug error screen with text.
+- **Diagnosis**: a temporary global `FlutterError.onError` handler that reported exceptions to a short-lived server log endpoint captured the exact assertion and stack trace.
+- **Fix**: clamp all four `Curves.easeInOut.transform(...)` inputs to `[0,1]` ([`home_content.dart`](AI-SAGA/lib/logic/home_content.dart)). The visuals are unchanged (the boundaries were already fully black/transparent).
+- **Cleanup**: all diagnostic exception-capture code (the app-side handler/reporting and the server-side log endpoint) was **removed** after the root cause was found; the server was redeployed and the temporary log file deleted. No database schema was changed.
+
+## 7. Verification
+
+- `flutter analyze` passes on the app; `python3 -m py_compile` passes on the server.
+- The server was redeployed and verified healthy; the temporary error-log endpoint now returns 404 and its log file is gone.
+- Because the typewriter/transition code changed, test with **Hot Restart (↻/R)**, not Hot Reload (⚡/r).
+
+---
+
+# Full Chatflow Summary — Dialog Background Freeze (2026-08-16)
+
+> An English, desensitized summary of the 2026-08-16 chatflow that fixed a story-page display jump: when a continuation pull failed (or stalled / was aborted), the moment the warning dialog appeared the background rearranged itself — the "Your choice" marker and the input buttons appeared to swap places, and the button's bottom edge got pinned to the screen's bottom edge with a violent jump, instead of staying frozen in its pre-error state. The fix keeps the streaming layout (story text + input buttons + user choice + reserved blank) **completely unchanged** behind every such dialog. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. The reported symptom
+
+After the player picks one of the three options, the app pulls the next novel segment from the server. If the pull fails, the app shows a warning dialog. The expected behavior is that the page behind the dialog stays exactly as it was (story text → input buttons → the user's choice text → reserved blank, or partially typed text, depending on the moment). Instead, at the instant the dialog appeared, the user's choice text and the buttons swapped positions and the button's bottom edge aligned with the screen's bottom edge — a violent jump.
+
+## 2. Root cause: the error handlers mutated the streaming layout right before showing the dialog
+
+The streaming page renders a fixed-order layout: **story body → input area → bottom "generation area"**. During streaming, two derived states decide what the background shows:
+
+- `hasNewSegment` (`_storyTexts.length > _generationStartLen`) in [`_buildStreamingArea()`](AI-SAGA/lib/logic/home_content.dart:1042) chooses between the "waiting" branch (choice marker + "Generating new content…" prompt + half-screen reserved blank) and the "typing" branch (reserved blank only).
+- `_storyInputsVisible` decides whether the input buttons are shown or kept hidden with `maintainSize` while typing.
+
+The error handlers in [`_continueStory()`](AI-SAGA/lib/logic/home_content.dart:716) called `setState` **before** opening the dialog, mutating those derived states:
+
+1. `onError` / `onAbort` / `onDone` (no content) **removed the partially received segment**, dropping `_storyTexts.length` back to `_generationStartLen`. That flipped `hasNewSegment` to false (the generation area switched to the waiting branch) and flipped `_storyInputsVisible` to true (the buttons popped back in). Because the current-choice marker lives **above** the buttons in the story body while typing, but **below** the buttons in the waiting branch, this moved the marker across the buttons — the observed "choice text and button swap".
+2. [`_onStreamStalled()`](AI-SAGA/lib/logic/home_content.dart:2332) set `_storyStreaming = false` before its dialog, which removed the whole bottom generation area (choice + prompt + half-screen blank). The content height collapsed and the scroll position was clamped to the new `maxScrollExtent`, snapping the view to the bottom — the observed "violent jump with the button pinned to the screen bottom".
+
+## 3. The fix: freeze the background behind every dialog
+
+The streaming layout state is no longer mutated before (or while) a dialog is up:
+
+- [`onError`](AI-SAGA/lib/logic/home_content.dart:849) — shows the "Generation Failed" dialog without touching any layout state. Since the dialog's only action is "Restart", the startup sync discards the partial segment afterwards.
+- [`onDone` (no content)](AI-SAGA/lib/logic/home_content.dart:860) — same: no layout mutation before the dialog.
+- [`onAbort` (violation)](AI-SAGA/lib/logic/home_content.dart:832) — defers the partial-segment removal and `_storyStreaming = false` until **after** the "Re-enter" dialog closes, so the background stays frozen during the dialog and only resets to the waiting-input state afterwards.
+- [`_onStreamStalled()`](AI-SAGA/lib/logic/home_content.dart:2332) — no longer sets `_storyStreaming = false` before the "Network Issue" dialog, so the generation area stays put and the scroll is never clamped to the bottom.
+
+The restart-path dialogs (`_showGenerateError`, `_onStreamStalled`) rely on the app restart to reset state; the violation dialog resets state itself after being dismissed.
+
+## 4. Verification
+
+- `flutter analyze lib/logic/home_content.dart` → no issues.
+- The waiting-state and typing-state error flows now leave the background untouched when the dialog appears; only the deliberate "Restart" / "Re-enter" action resets the page afterwards.
+- Because the streaming layout code changed, test with **Hot Restart (↻/R)**, not Hot Reload (⚡/r).

@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
+import 'package:flutter/services.dart' show SystemChrome, SystemUiOverlayStyle;
 import 'package:ai_saga/widgets/account_limit_warning.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
 import 'package:ai_saga/widgets/character_text.dart';
@@ -181,11 +184,16 @@ class _HomeContentState extends State<HomeContent>
   /// 设置完成后进入正式主页前的黑屏过渡动画控制器
   late final AnimationController _blackoutController;
 
-  /// 是否正在显示黑屏过渡（全黑 → 渐渐点亮）
+  /// 是否正在显示"进入你的世界"过渡动画（4s 渐黑 → 6s 文字渐显渐隐 → 1s 全黑 → 4s 渐亮）
   bool _blackoutActive = false;
 
-  /// 是否正在调用服务器/Dify 生成小说（黑屏上显示加载提示）
-  bool _generating = false;
+  /// 进入世界动画第 6 秒（已全黑）把 `_setupStep` 切到正式主页面：此刻黑屏稳定完全不透明，
+  /// AnimatedSwitcher 对设置确认页的交叉淡出被黑屏盖住（设置页不闪回）。
+  Timer? _transitionStepTimer;
+
+  /// 进入世界动画期间是否已把系统栏设为深色，以及进入前按日/夜间模式记录，用于恢复
+  bool _blackoutBarsDark = false;
+  bool _blackoutBarsApplied = false;
 
   /// 流式小说正文：每次生成的内容单独存为数组的一个元素。
   final List<String> _storyTexts = [];
@@ -290,7 +298,8 @@ class _HomeContentState extends State<HomeContent>
 
     _blackoutController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 3000),
+      // 进入世界动画总时长：4s 渐黑 + 6s 文字渐显渐隐 + 1s 全黑 + 4s 渐亮 = 15s
+      duration: const Duration(milliseconds: 15000),
     );
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -312,6 +321,8 @@ class _HomeContentState extends State<HomeContent>
     _scrollController.dispose();
     _pageController.dispose();
     _blackoutController.dispose();
+    _transitionStepTimer?.cancel();
+    _restoreSystemBars();
     _choice2Ctrl.dispose();
     _choice3Ctrl.dispose();
     _streamedSegmentHeight.dispose();
@@ -718,7 +729,6 @@ class _HomeContentState extends State<HomeContent>
     // 本次续写是否收到过非空正文（LLM 返回空白时用于弹窗警告）
     bool hadContent = false;
     setState(() {
-      _generating = true;
       _storyStreaming = true;
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
@@ -739,11 +749,24 @@ class _HomeContentState extends State<HomeContent>
       );
       // 保存本轮三个输入框当前值到该段（与服务器 choice_1/2/3 覆盖一致），
       // 使该段成为历史段后其输入框显示"用户选择那一瞬间"的文本。
+      // 注意：时间树"从这里重写"时 choice1/2/3 参数携带的是被重写段的正确选项
+      // （由 StoryChoiceCard 传入），而全局 _inputChoice1/2/3 仍保留着删除前
+      // 最新段的选项——必须优先用参数，否则会把最新段的选项错误覆盖到重写点
+      // （只影响 App 内存显示；服务器端存的是正确值，重启后回读才正确）。
       _segmentChoices[choiceSegAbs] = [
-        _inputChoice1,
-        _inputChoice2,
-        _inputChoice3,
+        choice1 ?? _inputChoice1,
+        choice2 ?? _inputChoice2,
+        choice3 ?? _inputChoice3,
       ];
+      // 时间树"从这里重写"：被重写段现在是"最新一段"，其选项改由页面底部三个输入框
+      // 显示。把全局输入框同步为该段选项，避免残留删除前最新段的选项。
+      if (rewriteFrom != null) {
+        _inputChoice1 = choice1 ?? '';
+        _inputChoice2 = choice2 ?? '';
+        _inputChoice3 = choice3 ?? '';
+        _choice2Ctrl.text = _inputChoice2;
+        _choice3Ctrl.text = _inputChoice3;
+      }
     });
     // 点击继续后：平滑下移半屏，为即将生成的新内容预留空白区（顶部提示 + 空白）。
     // 用 animateTo 平滑滚动（不用 jumpTo 的瞬间跳转），让上方正文与输入按钮平滑上拉、
@@ -784,7 +807,6 @@ class _HomeContentState extends State<HomeContent>
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
-            _generating = false;
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
         },
@@ -803,44 +825,34 @@ class _HomeContentState extends State<HomeContent>
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
-            _generating = false;
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
           _applyRecommendedActions(outputs);
         },
         onAbort: (_) {
           if (!mounted) return;
-          // 违规中止：删掉本次可能已由打字机打出的残缺段落，弹"内容违规，请重新输入
-          // 提示词"对话框（唯一"重新输入"按钮）。弹窗期间保持流式布局（用户选择 +
-          // 预留空白）不变，弹窗关闭后再恢复等待输入状态，避免弹窗背后的页面跳动。
-          setState(() {
-            if (_storyTexts.length > preStreamLen) {
-              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-            }
-            _generating = false;
-            _storyTyped = true;
-          });
+          // 违规中止：弹窗期间保持当前流式布局（用户选择 + 残缺段 + 预留空白）在
+          // 弹窗背后原样冻结，不在弹窗前改动任何布局状态；弹窗关闭后再删掉本次
+          // 可能已由打字机打出的残缺段落、恢复等待输入状态，避免弹窗背后的页面跳动
+          // （在弹窗前删段/切"生成区"分支会让按钮弹出、选择文本与按钮错位）。
           _showViolationDialog().then((_) {
             if (!mounted) return;
             setState(() {
+              if (_storyTexts.length > preStreamLen) {
+                _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+              }
+              _storyTyped = true;
               _storyStreaming = false; // 弹窗关闭后恢复等待输入状态
             });
           });
         },
         onError: (message, {code}) {
           if (!mounted) return;
-          setState(() {
-            // 流未完整结束（未收到 done）：丢弃本次未传完的段落，
-            // 避免基于残缺文本续写/误判。
-            if (_storyTexts.length > preStreamLen) {
-              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-            }
-            _generating = false;
-            // 保持 _storyStreaming=true：弹窗期间正文布局（选择+预留空白）不变，
-            // 弹窗（重启 App）关闭后由重启重置状态，避免弹窗背后的页面跳动。
-            _storyTyped = true;
-          });
-          // 服务器未返回有效正文（如额度用尽）：按当前语言提示检查额度
+          // 流失败：不在此处改动任何正文布局状态——弹窗（重启 App）前保持当前流式
+          // 布局（用户选择 + 按钮 + 预留空白）在弹窗背后原样冻结。若在弹窗前删除
+          // 残缺段落/切换"生成区"分支，会让输入按钮突然弹出、用户选择文本与按钮
+          // 错位、按钮贴到屏幕下沿，弹窗瞬间页面剧烈跳动；弹窗关闭后 App 重启，
+          // 由启动同步重新拉取并对齐（残缺段落自然丢弃）。
           _showGenerateError(
             code == 'empty_output' ? _getQuotaWarningText() : message,
           );
@@ -848,15 +860,9 @@ class _HomeContentState extends State<HomeContent>
         onDone: (outputs) async {
           if (!mounted) return;
           if (!hadContent) {
-            // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：丢弃空段落并弹窗警告
-            setState(() {
-              if (_storyTexts.length > preStreamLen) {
-                _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-              }
-              _generating = false;
-              // 保持 _storyStreaming=true：弹窗期间正文布局不变（见 onError 说明）
-              _storyTyped = true;
-            });
+            // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：不在弹窗前改动
+            // 布局状态——保持当前流式布局在弹窗背后原样冻结（见 onError 说明），
+            // 弹窗关闭后 App 重启，由启动同步重新拉取并对齐（空段落自然丢弃）。
             _showGenerateError(_getQuotaWarningText());
             return;
           }
@@ -875,7 +881,6 @@ class _HomeContentState extends State<HomeContent>
       // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
       if (!mounted) return;
       setState(() {
-        _generating = false;
         // 保持 _storyStreaming=true：弹窗期间正文布局不变，弹窗确认后退出 App
         _storyTyped = true;
       });
@@ -884,7 +889,6 @@ class _HomeContentState extends State<HomeContent>
       // 登录令牌/授权过期：引导重新授权后重试本次续写（不重复记录选择节点）
       if (!mounted || retryDepth >= 2) {
         setState(() {
-          _generating = false;
           // 保持 _storyStreaming=true：弹窗期间正文布局不变
           _storyTyped = true;
         });
@@ -894,7 +898,6 @@ class _HomeContentState extends State<HomeContent>
       final reauthed = await _promptReAuth();
       if (!reauthed || !mounted) {
         setState(() {
-          _generating = false;
           // 保持 _storyStreaming=true：弹窗期间正文布局不变
           _storyTyped = true;
         });
@@ -915,7 +918,6 @@ class _HomeContentState extends State<HomeContent>
       // 其它注册/鉴权异常（如 IP 限流"注册过于频繁"）：展示具体原因
       if (!mounted) return;
       setState(() {
-        _generating = false;
         // 保持 _storyStreaming=true：弹窗期间正文布局不变，弹窗关闭后重启重置状态
         _storyTyped = true;
       });
@@ -1151,6 +1153,11 @@ class _HomeContentState extends State<HomeContent>
   Widget build(BuildContext context) {
     return Stack(
       children: [
+        // 占满整屏的透明占位：Stack 的尺寸等于其最大的非定位子组件，
+        // 若正文内容较矮，AnimatedSwitcher 会收缩、导致 Positioned.fill 的黑屏
+        // 覆盖层只盖住上半屏。放一个整屏占位可强制本 Stack 恒为整屏，
+        // 保证"进入你的世界"黑屏过渡期间始终覆盖整屏。
+        const SizedBox.expand(),
         AnimatedSwitcher(
           duration: const Duration(milliseconds: 600),
           switchInCurve: const Cubic(0.22, 1.0, 0.36, 1.0),
@@ -1357,37 +1364,78 @@ class _HomeContentState extends State<HomeContent>
                         ),
                 ),
         ),
-        // 设置完成后的黑屏过渡：全黑 → 渐渐点亮；生成中显示加载提示
+        // "进入你的世界"动画覆盖层：4s 渐黑 → 6s 文字渐显渐隐 → 1s 全黑 → 4s 渐亮。
+        // 不显示任何等待旋转圈/加载提示，纯黑 + 提示文字。
         if (_blackoutActive)
-          Positioned.fill(
-            child: FadeTransition(
-              opacity: Tween<double>(
-                begin: 1.0,
-                end: 0.0,
-              ).animate(_blackoutController),
-              child: ColoredBox(
-                color: CupertinoColors.black,
-                child: _generating
-                    ? Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const CupertinoActivityIndicator(
+          Positioned(
+            // 覆盖到整屏（含状态栏/安全区）：黑屏过渡期间不露出系统栏/边缘亮条
+            left: -MediaQuery.of(context).padding.left,
+            top: -MediaQuery.of(context).padding.top,
+            right: -MediaQuery.of(context).padding.right,
+            bottom: 0,
+            child: AnimatedBuilder(
+              animation: _blackoutController,
+              builder: (context, _) {
+                final double v = _blackoutController.value; // 0..1，共 15s
+                // 黑屏不透明度：0-4/15（4s）渐入全黑；4/15-11/15（7s）保持全黑；
+                // 11/15-1（4s）渐亮。
+                // 注意：transform 入参必须 clamp 到 [0,1]——动画末尾 v=1 或 t=1 时，
+                // 除减法的浮点精度会算出 1.0000000000000002 / -2.2e-16 这类越界值，
+                // Curves.easeInOut.transform 会断言失败，在 debug 模式整屏闪红。
+                final double blackOpacity;
+                if (v <= 4 / 15) {
+                  blackOpacity = Curves.easeInOut.transform(
+                    (v / (4 / 15)).clamp(0.0, 1.0),
+                  );
+                } else if (v <= 11 / 15) {
+                  blackOpacity = 1.0;
+                } else {
+                  blackOpacity =
+                      1 -
+                      Curves.easeInOut.transform(
+                        ((v - 11 / 15) / (4 / 15)).clamp(0.0, 1.0),
+                      );
+                }
+                // 提示文字不透明度：仅 4/15-2/3（6s）内先渐显、再渐隐。
+                double textOpacity = 0.0;
+                if (v >= 4 / 15 && v <= 2 / 3) {
+                  final double t = (v - 4 / 15) / (2 / 5);
+                  if (t < 0.3) {
+                    textOpacity = Curves.easeInOut.transform(
+                      (t / 0.3).clamp(0.0, 1.0),
+                    );
+                  } else if (t <= 0.7) {
+                    textOpacity = 1.0;
+                  } else {
+                    textOpacity = Curves.easeInOut.transform(
+                      (1 - (t - 0.7) / 0.3).clamp(0.0, 1.0),
+                    );
+                  }
+                }
+                return Opacity(
+                  opacity: blackOpacity,
+                  child: ColoredBox(
+                    color: CupertinoColors.black,
+                    child: Center(
+                      child: Opacity(
+                        opacity: textOpacity,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 32),
+                          child: Text(
+                            _getEnteringWorldText(),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
                               color: CupertinoColors.white,
-                              radius: 14,
+                              fontSize: 18,
+                              height: 1.6,
                             ),
-                            const SizedBox(height: 12),
-                            Text(
-                              _getGeneratingWorldText(),
-                              style: const TextStyle(
-                                color: CupertinoColors.white,
-                              ),
-                            ),
-                          ],
+                          ),
                         ),
-                      )
-                    : null,
-              ),
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
           ),
       ],
@@ -1412,13 +1460,15 @@ class _HomeContentState extends State<HomeContent>
   }
 
   /// 设置确认页倒计时结束：将草稿统一写入持久化存储，把用户设定发送到服务器，
-  /// 由网关转发 Dify 生成小说正文；成功后进入正式主页面显示生成文本。
-  /// 全黑过渡期间若仍在生成，则显示加载提示。
+  /// 由网关转发 Dify 生成小说正文；同时启动"进入你的世界"动画
+  /// （4s 渐黑 → 6s 文字渐显渐隐 → 1s 全黑 → 4s 渐亮），期间 LLM 照常生成，
+  /// 动画结束后显示正式主页面中的生成文本。
   Future<void> _onSetupConfirmed({int retryDepth = 0}) async {
     if (!mounted) return;
+    // 重新生成时中止上一次可能残留的"进入你的世界"动画（取消切页计时、停止黑屏动画）
+    _abortBlackoutTransition();
 
     setState(() {
-      _generating = true;
       _storyTexts.clear();
       _generationStartLen = _storyTexts.length; // 全新生成：0
       _storyStartIndex = 0; // 全新生成：绝对下标从 0 开始（服务器同步清空旧段）
@@ -1426,12 +1476,32 @@ class _HomeContentState extends State<HomeContent>
       _visibleStartIndex = 0;
       _sessionStreamStartIndex = 0;
       _blackoutActive = true;
-      _blackoutController.value = 0; // 覆盖层完全不透明（全黑）
+      _blackoutController.value = 0; // 动画起点：覆盖层透明（下方设置确认页可见）
       _storyStreaming = true;
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
       _storyInputsShown = false; // 全新生成：输入区先隐藏，待首轮收到推荐后再激活
       _streamedSegmentHeight.value = 0; // 新正文从 0 高度开始测量
+    });
+    // 启动"进入你的世界"动画：4s 渐黑 → 6s 文字渐显渐隐 → 1s 全黑 → 4s 渐亮。
+    // 期间 LLM 照常生成（onChunk 等只负责正文数据与打字机，不干预黑屏动画）。
+    // 动画期间把系统状态栏/导航栏设为深色，避免纯黑背景下系统栏露出亮条。
+    _applyBlackoutSystemBars();
+    _blackoutController.forward().whenComplete(() {
+      if (!mounted) return;
+      _restoreSystemBars();
+      setState(() {
+        _blackoutActive = false;
+      });
+    });
+    // 第 6 秒（已全黑）切入正式主页面：此刻黑屏已稳定完全不透明，AnimatedSwitcher
+    // 对设置确认页的交叉淡出被盖住（设置页不闪回），随后渐亮直接露出正文。
+    _transitionStepTimer = Timer(const Duration(seconds: 6), () {
+      if (!mounted) return;
+      setState(() {
+        _setupStep = 6;
+        showMenuNotifier.value = true;
+      });
     });
     // 清理"漏网之鱼"：重置/设备切换后，另一设备的延迟写入可能在服务器残留旧正文。
     // 首次生成前静默清空服务器小说正文，确保新故事从 seq 0 干净开始。
@@ -1471,11 +1541,7 @@ class _HomeContentState extends State<HomeContent>
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
-            _generating = false;
-            _setupStep = 6;
-            showMenuNotifier.value = true;
-            _blackoutActive = false;
-            _blackoutController.value = 1;
+            // 只负责正文数据与打字机状态：页面切换与黑屏动画由"进入世界"动画统一驱动
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
         },
@@ -1489,9 +1555,6 @@ class _HomeContentState extends State<HomeContent>
             } else {
               _storyTexts[_storyTexts.length - 1] += text;
             }
-            _generating = false;
-            _blackoutActive = false;
-            _blackoutController.value = 1;
             _storyTyped = false; // 文本仍在增长：尚未彻底显示完成
           });
           _applyRecommendedActions(outputs);
@@ -1504,14 +1567,12 @@ class _HomeContentState extends State<HomeContent>
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
-            _generating = false;
             _setupStep = 6;
             showMenuNotifier.value = true;
-            _blackoutActive = false;
-            _blackoutController.value = 1;
             _storyStreaming = false;
             _storyTyped = true;
           });
+          _abortBlackoutTransition();
           _showViolationDialog();
         },
         onError: (message, {code}) {
@@ -1522,11 +1583,10 @@ class _HomeContentState extends State<HomeContent>
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
-            _generating = false;
-            _blackoutActive = false;
             _storyStreaming = false;
             _storyTyped = true;
           });
+          _abortBlackoutTransition();
           // 服务器未返回有效正文（如额度用尽）：按当前语言提示检查额度
           _showGenerateError(
             code == 'empty_output' ? _getQuotaWarningText() : message,
@@ -1540,10 +1600,10 @@ class _HomeContentState extends State<HomeContent>
               if (_storyTexts.length > preStreamLen) {
                 _storyTexts.removeRange(preStreamLen, _storyTexts.length);
               }
-              _generating = false;
               _storyStreaming = false;
               _storyTyped = true;
             });
+            _abortBlackoutTransition();
             _showGenerateError(_getQuotaWarningText());
             return;
           }
@@ -1562,51 +1622,92 @@ class _HomeContentState extends State<HomeContent>
       // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
       if (!mounted) return;
       setState(() {
-        _generating = false;
-        _blackoutActive = false;
         _storyStreaming = false;
         _storyTyped = true;
       });
+      _abortBlackoutTransition();
       await showAccountLimitWarning(context);
     } on AuthNotAuthorizedException {
       // 登录令牌/授权过期：引导重新授权后重试本次生成
       if (!mounted || retryDepth >= 2) {
         setState(() {
-          _generating = false;
-          _blackoutActive = false;
           _storyStreaming = false;
           _storyTyped = true;
         });
+        _abortBlackoutTransition();
         _showGenerateError(_getReauthRequiredText());
         return;
       }
       final reauthed = await _promptReAuth();
       if (!reauthed || !mounted) {
         setState(() {
-          _generating = false;
-          _blackoutActive = false;
           _storyStreaming = false;
           _storyTyped = true;
         });
+        _abortBlackoutTransition();
         _showGenerateError(_getReauthRequiredText());
         return;
       }
-      // 已重新授权：重试
+      // 已重新授权：中止当前动画后重试（重新走完整进入世界动画）
+      _abortBlackoutTransition();
       await _onSetupConfirmed(retryDepth: retryDepth + 1);
       return;
     } catch (e) {
       // 其它注册/鉴权异常（如 IP 限流"注册过于频繁"）：展示具体原因
       if (!mounted) return;
       setState(() {
-        _generating = false;
-        _blackoutActive = false;
         _storyStreaming = false;
         _storyTyped = true;
       });
+      _abortBlackoutTransition();
       _showGenerateError(
         _localizeNetworkError(e).replaceFirst('Exception: ', ''),
       );
     }
+  }
+
+  /// 中止"进入你的世界"动画（出错/违规/卡死时立即结束黑屏，不再等完整 15s 走完）。
+  /// 取消切页计时、停止黑屏动画、恢复系统栏样式，并移除黑屏覆盖层。
+  void _abortBlackoutTransition() {
+    _transitionStepTimer?.cancel();
+    _transitionStepTimer = null;
+    if (_blackoutController.isAnimating) {
+      _blackoutController.stop();
+    }
+    _restoreSystemBars();
+    if (!mounted) return;
+    setState(() {
+      _blackoutActive = false;
+    });
+  }
+
+  /// 进入世界动画期间把系统状态栏/导航栏设为深色（黑底浅图标），
+  /// 避免纯黑背景下系统栏露出亮条；结束/中止时用 [_restoreSystemBars] 恢复。
+  void _applyBlackoutSystemBars() {
+    _blackoutBarsDark =
+        CupertinoTheme.of(context).brightness == Brightness.dark;
+    _blackoutBarsApplied = true;
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: CupertinoColors.black,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+        systemNavigationBarColor: CupertinoColors.black,
+        systemNavigationBarIconBrightness: Brightness.light,
+        systemNavigationBarDividerColor: CupertinoColors.black,
+      ),
+    );
+  }
+
+  /// 恢复进入动画前的系统栏样式（按记录的日/夜间模式）。
+  void _restoreSystemBars() {
+    if (!_blackoutBarsApplied) return;
+    _blackoutBarsApplied = false;
+    SystemChrome.setSystemUIOverlayStyle(
+      _blackoutBarsDark
+          ? SystemUiOverlayStyle.light
+          : SystemUiOverlayStyle.dark,
+    );
   }
 
   // ---- 正文页面本地化：根据用户所选语言返回对应的界面文字 ----
@@ -1714,29 +1815,29 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 黑屏过渡中"正在生成"提示
-  String _getGeneratingWorldText() {
+  /// 全黑时显示的"即将进入你创造的世界"提示文字
+  String _getEnteringWorldText() {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
-        return '正在生成你的世界…';
+        return '即將進入您自己創造的、充滿了命案以及愛的世界';
       case 'yue':
-        return '正在生成你嘅世界…';
+        return '即將進入您自己創造嘅、充滿咗兇案同埋愛嘅世界';
       case 'en':
-        return 'Creating your world…';
+        return 'You are about to enter the world you created — a world of murder and love';
       case 'es':
-        return 'Creando tu mundo…';
+        return 'Estás a punto de entrar en el mundo que creaste, lleno de asesinatos y amor';
       case 'fr':
-        return 'Création de votre monde…';
+        return "Vous êtes sur le point d'entrer dans le monde que vous avez créé, rempli de meurtres et d'amour";
       case 'de':
-        return 'Deine Welt wird erschaffen…';
+        return 'Du bist dabei, die Welt zu betreten, die du erschaffen hast – voller Mord und Liebe';
       case 'pt':
-        return 'Criando seu mundo…';
+        return 'Você está prestes a entrar no mundo que criou, cheio de assassinatos e amor';
       case 'ja':
-        return 'あなたの世界を生成中…';
+        return 'あなたが創り上げた、殺人事件と愛に満ちた世界へまもなく入ります';
       case 'ko':
-        return '당신의 세계를 생성 중…';
+        return '당신이 창조한 살인 사건과 사랑으로 가득한 세계로 곧 들어갑니다';
       default:
-        return '正在生成你的世界…';
+        return '即将进入您自己创造的、充满了杀人案以及爱的世界';
     }
   }
 
@@ -2230,11 +2331,11 @@ class _HomeContentState extends State<HomeContent>
   /// 为保证小说文本完整，弹出警告并强制用户重启本 App，重启后重新拉取完整数据。
   Future<void> _onStreamStalled() async {
     if (!mounted) return;
-    setState(() {
-      _generating = false;
-      _storyStreaming = false;
-      _storyTyped = true;
-    });
+    _abortBlackoutTransition();
+    // 不在弹窗前把 _storyStreaming 置 false：否则会移除下方"生成区"（用户选择 +
+    // 提示 + 半屏预留空白），内容高度骤减、滚动位置被钳到底部，弹窗瞬间页面剧烈
+    // 跳动、按钮贴到屏幕下沿。保持当前流式布局在弹窗背后原样冻结，弹窗关闭后由
+    // App 重启重置状态。
     await showCupertinoDialog<void>(
       context: context,
       barrierDismissible: false,

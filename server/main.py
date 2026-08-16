@@ -1575,9 +1575,16 @@ async def _persist_story_segment(
         return
     now = int(time.time())
     settings = settings or {}
-    meta = _finalize_meta(
-        _extract_story_meta(meta, settings.get("language")), new_segment
-    )
+    # 直接用上层已提取好的后续变量（choice_1/2/3/music_style），只对缺失字段用保底补齐。
+    # 不能再次 _extract_story_meta：它是在 Dify 原始输出里找 action_a/action_b，
+    # 而这里收到的是已转成 choice_2/3 的 meta，action_a/b 已不存在；再提取会把
+    # LLM 生成的选项全部回退成保底默认值（导致重启后最新段选项永远是保底选项）。
+    m = dict(meta or {})
+    _defaults = _meta_defaults(settings.get("language"))
+    for _k in ("choice_1", "choice_2", "choice_3", "music_style"):
+        if not m.get(_k):
+            m[_k] = _defaults.get(_k, "")
+    meta = _finalize_meta(m, new_segment)
     conn = _db()
     try:
         row = conn.execute(

@@ -6,7 +6,7 @@ AI-SAGA 审核网关 v2（账号 + 硬件公钥 + 付费权益 + 云同步）
 - 身份：Apple / Google ID Token，服务器用官方 JWKS 校验，取稳定 sub 作为 user_id。
 - 设备：每设备持有安全硬件公钥（私钥永不出硬件）。public_key UNIQUE 防止
   "同一硬件注册多个 ID"（同硬件 = 一身份 = 一份配额）。
-- 配额：审核 Dify 流程全局 2000 次/天；生成 Dify 流程全局 1000 次/天（24h 滚动）。
+- 配额：审核 Dify 流程全局 4000 次/天；生成 Dify 流程全局 1000 次/天（24h 滚动）。
 - 付费：entitlements 表预留"有效期 + 购买次数"双模型；付费校验服务器端完成，
   平台推送（App Store Server Notifications / Google RTDN）吊销退款，预留接口。
 - 成本控制：输入 ≤ MAX_INPUT_TOKENS（默认 5000），输出 ≤ DIFY_MAX_TOKENS（默认 4000）。
@@ -81,11 +81,21 @@ HARDWARE_ACCOUNTS_PER_DAY = int(os.environ.get("HARDWARE_ACCOUNTS_PER_DAY", "2")
 STORY_DAILY_LIMIT = int(os.environ.get("STORY_DAILY_LIMIT", "1000"))
 STORY_WINDOW_SECONDS = 24 * 3600
 # 审核工作流全局每日上限（24 小时滚动窗口）：覆盖设定页审核与生成过程中的内容审核
-AUDIT_DAILY_LIMIT = int(os.environ.get("AUDIT_DAILY_LIMIT", "2000"))
-# 小说生成首段字数：攒满该字数先审核，通过才开始显示
-STORY_FIRST_CHUNK = int(os.environ.get("STORY_FIRST_CHUNK", "450"))
-# 第二次审核起点：从该位置到结尾（默认 400，与首段形成 50 字重叠，防边界漏网）
-STORY_SECOND_AUDIT_START = int(os.environ.get("STORY_SECOND_AUDIT_START", "400"))
+AUDIT_DAILY_LIMIT = int(os.environ.get("AUDIT_DAILY_LIMIT", "4000"))
+# 小说生成过程中的内容审核（增量滑动审核，每攒满一段即送审，通过才显示）：
+# - STORY_AUDIT_STEP：每次审核窗口在正文中前进的新增字数（默认 400，即"400 字一次送审"），
+#   也是审核的触发点——正文每满 STEP 的整倍数（400、800、1200、1600...）即触发一次审核。
+# - STORY_AUDIT_OVERLAP：除第一次审核外，每次审核向前多带的回溯字数（默认 50，
+#   使相邻审核窗口重叠 50 字，防边界漏网）。
+# 第 k 次审核（k=1,2,3,...）的窗口为：
+#   [max(0, STEP*(k-1)-OVERLAP), STEP*k)
+#   即 [0,400)、[350,800)、[750,1200)、[1150,1600)...；审核通过后把该窗口新确认的
+#   STEP 字正文以 chunk/reveal 事件送回 App 显示（打字机速度不变，由客户端控制）。
+# 兼容旧环境变量名：STORY_SECOND_AUDIT_START（步长）。
+STORY_AUDIT_STEP = int(
+    os.environ.get("STORY_AUDIT_STEP", os.environ.get("STORY_SECOND_AUDIT_START", "400"))
+)
+STORY_AUDIT_OVERLAP = int(os.environ.get("STORY_AUDIT_OVERLAP", "50"))
 
 # 客户端配置（校验 ID Token 的 audience / issuer）
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -173,7 +183,6 @@ CREATE TABLE IF NOT EXISTS story_segments (
     -- 用户本轮实际选择（点击"继续"时从三个输入框所选/所输的文本；未选择时为空）
     user_choice TEXT DEFAULT '',
     -- 后续变量（LLM② 生成；任一原因取不到时写入保底默认值）
-    outline     TEXT DEFAULT '',
     music_style TEXT DEFAULT '',
     -- 用户当前设定快照（生成该段时点上的设定值，服务器权威保存）
     location       TEXT DEFAULT '',
@@ -982,7 +991,7 @@ async def audit_and_chat(data: InputData, request: Request):
     user_text = data.text
     _check_input_budget(user_text)
 
-    # 设定页审核无每用户限制，唯一硬限为全局审核 Dify 流程 AUDIT_DAILY_LIMIT（2000 次/天）
+    # 设定页审核无每用户限制，唯一硬限为全局审核 Dify 流程 AUDIT_DAILY_LIMIT（4000 次/天）
     _check_audit_quota(int(time.time()))
 
     headers = {
@@ -1321,7 +1330,9 @@ async def _generate_case_meta() -> dict:
         victim_identity = _pick("victim_identity")
         death_scene = _pick("death_scene")
         murder_method = _pick("murder_method")
-        # 将三个量简单拼接（换行连接）赋给 case_core
+        # 将三个量简单拼接（换行连接）赋给 case_core（即 README 原设计）。
+        # 注意：工作流代码节点另返回 core_content（= 生成案件的提示词）与 core_type（类型标签），
+        # core_content 是提示词而非生成结果，绝不可作为 case_core 入库。
         core = "\n".join(
             p for p in (victim_identity, death_scene, murder_method) if p
         )
@@ -1361,38 +1372,48 @@ def _get_former_content(user_id: str) -> str:
         conn.close()
 
 
-def _get_corrent_outlet(user_id: str, seq: int) -> str:
-    """汇总当前案件的大纲（corrent_outlet）。
+# 一个案件/一卷的轮次数（案件设定刷新周期，也是 corrent_outlet 的正文回溯窗口）
+CASE_ROUNDS = 14
 
-    规则：当前轮 seq 是 20 的整倍数（含 0，新一卷起点）→ 返回空串；
-    否则从最近一个 20 整倍数轮次（含）到当前轮前一轮（seq-1，含）的所有 outline，
-    按 seq 升序以换行拼接；该区间无大纲时返回空串。
+
+def _get_current_case_story(user_id: str, seq: int) -> str:
+    """汇总要回传给 Dify 的正文（corrent_outlet 的取值来源）。
+
+    规则（seq 为当前正要生成的那一轮，0 起计；CASE_ROUNDS=14）：
+    - seq == 0（第 0 轮，无前文）→ 返回空串；
+    - seq 是 CASE_ROUNDS 的整倍数（14/28/42...，新一卷起点）→ 返回
+      上一整卷全部正文（0~13 / 14~27 / 28~41），而不是空串；
+    - 其余轮次 → 从最近一个 CASE_ROUNDS 整倍数轮次（含）到当前轮前一轮
+      （seq-1，含）的正文，按 seq 升序以换行拼接；该区间无正文时返回空串。
+    注：原 corrent_outlet 读的是 outline 列（大纲），outline 已彻底移除，
+    现改读 content 列（正文原文），为下一轮生成提供当前案件的完整续写上下文。
     """
-    if seq % 20 == 0:
+    if seq == 0:
         return ""
-    start = (seq // 20) * 20
+    if seq % CASE_ROUNDS == 0:
+        start = seq - CASE_ROUNDS
+    else:
+        start = (seq // CASE_ROUNDS) * CASE_ROUNDS
     end = seq - 1
     conn = _db()
     try:
         rows = conn.execute(
-            """SELECT outline FROM story_segments
+            """SELECT content FROM story_segments
                WHERE user_id=? AND seq BETWEEN ? AND ? ORDER BY seq ASC""",
             (user_id, start, end),
         ).fetchall()
-        parts = [r["outline"] for r in rows if r["outline"] and r["outline"].strip()]
+        parts = [r["content"] for r in rows if r["content"] and r["content"].strip()]
         return "\n".join(parts)
     finally:
         conn.close()
 
 
 # 后续变量保底默认值：任一原因取不到时写入数据库的兜底值
-# outline 无静态默认：缺失时由 _finalize_meta 用本段小说正文原文兜底（用户要求）
 # choice_1/2/3 即 LLM② 推荐的下一轮行动（统一用 choices_1/2/3）。
 # 默认行动选项按用户语言（App 随请求上传 / 最新段快照的 language）选择对应语言版本；
 # 未知语言回退简体中文。music_style 是 Dify 工作流结构化枚举（白名单 MUSIC_STYLE_VALUES），
 # 为保持与画布兼容，各语言统一用白名单内取值，不做本地化。
 META_DEFAULTS = {
-    "outline": "",
     "choice_1": "继续当前行动，深入探索",
     "choice_2": "停下脚步，先观察四周再行动",
     "choice_3": "换一个方向，探索其它可能",
@@ -1403,63 +1424,54 @@ META_DEFAULTS = {
 META_DEFAULTS_BY_LANG = {
     "zh": META_DEFAULTS,
     "zh-TW": {
-        "outline": "",
         "choice_1": "繼續目前行動，深入探索",
         "choice_2": "停下腳步，先觀察四周再行動",
         "choice_3": "換一個方向，探索其他可能",
         "music_style": "悬疑",
     },
     "yue": {
-        "outline": "",
         "choice_1": "繼續而家嘅行動，深入探索",
         "choice_2": "停低腳步，先睇下四周再行動",
         "choice_3": "轉另一個方向，探索其他可能",
         "music_style": "悬疑",
     },
     "en": {
-        "outline": "",
         "choice_1": "Continue your current action and explore deeper",
         "choice_2": "Pause, observe your surroundings before acting",
         "choice_3": "Change direction and explore other possibilities",
         "music_style": "悬疑",
     },
     "es": {
-        "outline": "",
         "choice_1": "Continúa tu acción actual y explora a fondo",
         "choice_2": "Detente, observa tu entorno antes de actuar",
         "choice_3": "Cambia de dirección y explora otras posibilidades",
         "music_style": "悬疑",
     },
     "fr": {
-        "outline": "",
         "choice_1": "Continuez votre action actuelle et explorez en profondeur",
         "choice_2": "Arrêtez-vous, observez les alentours avant d'agir",
         "choice_3": "Changez de direction et explorez d'autres possibilités",
         "music_style": "悬疑",
     },
     "de": {
-        "outline": "",
         "choice_1": "Setze deine aktuelle Handlung fort und erkunde tiefer",
         "choice_2": "Halte inne und beobachte zuerst deine Umgebung",
         "choice_3": "Schlage eine andere Richtung ein und erkunde weitere Möglichkeiten",
         "music_style": "悬疑",
     },
     "pt": {
-        "outline": "",
         "choice_1": "Continue sua ação atual e explore a fundo",
         "choice_2": "Pare, observe ao redor antes de agir",
         "choice_3": "Mude de direção e explore outras possibilidades",
         "music_style": "悬疑",
     },
     "ja": {
-        "outline": "",
         "choice_1": "現在の行動を続けて、深く探索する",
         "choice_2": "立ち止まり、まず周囲を観察してから行動する",
         "choice_3": "方向を変えて、他の可能性を探る",
         "music_style": "悬疑",
     },
     "ko": {
-        "outline": "",
         "choice_1": "현재 행동을 계속하며 깊이 탐험한다",
         "choice_2": "멈추고, 먼저 주변을 관찰한 뒤 행동한다",
         "choice_3": "방향을 바꿔 다른 가능성을 탐색한다",
@@ -1472,13 +1484,13 @@ def _meta_defaults(language: Optional[str]) -> dict:
     """按用户语言返回后续变量保底默认值；未知/为空回退简体中文。
 
     先用简体中文 META_DEFAULTS 打底（含 case_type/case_core 等公共键），
-    再用该语言的 choice/outline/music_style 覆盖，保证任意语言都拥有完整键集合。
+    再用该语言的 choice/music_style 覆盖，保证任意语言都拥有完整键集合。
     """
     base = dict(META_DEFAULTS)
     base.update(META_DEFAULTS_BY_LANG.get((language or "").strip(), {}))
     return base
-# 大纲的终极兜底：仅当正文也为空时使用（正常不会走到）
-OUTLINE_FALLBACK = "本段剧情继续推进，主角做出新的选择。"
+
+
 # music_style 合法取值白名单（与 Dify 提示词一致）
 MUSIC_STYLE_VALUES = ["喜悦", "温情", "爱情", "黑暗", "悬疑", "推理", "惊悚", "幸福", "兴奋"]
 
@@ -1486,16 +1498,14 @@ MUSIC_STYLE_VALUES = ["喜悦", "温情", "爱情", "黑暗", "悬疑", "推理"
 def _extract_story_meta(
     outputs: Optional[dict], language: Optional[str] = None
 ) -> dict:
-    """从 Dify outputs 中提取后续变量（outline/choice_1/choice_2/choice_3/music_style）与案件信息。
+    """从 Dify outputs 中提取后续变量（choice_1/choice_2/choice_3/music_style）与案件信息。
 
     推演结果（LLM2 structured_output，经 End 节点扁平输出）映射：
-      outlet / outline        -> outline
       music / music_style     -> music_style
       action_a                -> choice_2
       action_b                -> choice_3
       choice_1 恒为空（用户后续自行填写，或直接选 choice_2/3）
-    任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值；
-    outline 缺失时由 _finalize_meta 用正文原文兜底（保持原逻辑）。
+    任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值。
     """
     src = outputs if isinstance(outputs, dict) else {}
     defaults = _meta_defaults(language)
@@ -1508,7 +1518,6 @@ def _extract_story_meta(
         return ""
 
     meta = {
-        "outline": _s("outlet", "outline") or defaults["outline"],
         "choice_1": "",  # 默认空白，由用户后续自行填写
         "choice_2": _s("action_a") or defaults["choice_2"],
         "choice_3": _s("action_b") or defaults["choice_3"],
@@ -1522,9 +1531,9 @@ def _extract_story_meta(
 
 
 def _has_inference_outputs(outputs: Optional[dict]) -> bool:
-    """判断 Dify 返回里是否已包含推演四量（outline/outlet、music/music_style、action_a、action_b）。
+    """判断 Dify 返回里是否已包含推演三量（music/music_style、action_a、action_b）。
 
-    四量齐备才认为推演完成，是"写入数据库新片段"的前置条件。
+    三量齐备才认为推演完成，是"写入数据库新片段"的前置条件。
     """
     if not isinstance(outputs, dict):
         return False
@@ -1535,22 +1544,10 @@ def _has_inference_outputs(outputs: Optional[dict]) -> bool:
         )
 
     return (
-        _pick("outline", "outlet")
-        and _pick("music_style", "music")
+        _pick("music_style", "music")
         and _pick("action_a")
         and _pick("action_b")
     )
-
-
-def _finalize_meta(meta: dict, story_text: str) -> dict:
-    """补全 outline 兜底：LLM 大纲缺失/为空时，用本段小说正文原文作大纲。
-
-    正文也为空时才退回 OUTLINE_FALLBACK（正常不会走到）。
-    """
-    m = dict(meta)
-    if not m.get("outline"):
-        m["outline"] = (story_text or "").strip() or OUTLINE_FALLBACK
-    return m
 
 
 async def _persist_story_segment(
@@ -1565,10 +1562,10 @@ async def _persist_story_segment(
     与 App 是否收全无关；App 断流/卡死重启后，冷启动同步即可拉回完整文本。
     每段一行，追加不重写任何旧数据。
     同时把生成该段时点上的"本轮三个选择（choice_1/2/3，LLM② 推荐的下一轮行动，
-    取不到用保底默认值）"、"后续变量（outline/music_style）"与"用户设定快照"
+    取不到用保底默认值）"、"后续变量（music_style）"与"用户设定快照"
     随行落库，供后续 RAG / 时间树返回等功能回溯本段的生成上下文。
 
-    案件设定：新条目序号能被 20 整除（含 0，即全新小说 / 新的一卷）时，
+    案件设定：新条目序号能被 CASE_ROUNDS 整除（含 0，即全新小说 / 新的一卷）时，
     调用案件生成工作流刷新 case_type/case_core；调用失败则写入保底空值。
     """
     if not new_segment or not new_segment.strip():
@@ -1584,7 +1581,7 @@ async def _persist_story_segment(
     for _k in ("choice_1", "choice_2", "choice_3", "music_style"):
         if not m.get(_k):
             m[_k] = _defaults.get(_k, "")
-    meta = _finalize_meta(m, new_segment)
+    meta = m
     conn = _db()
     try:
         row = conn.execute(
@@ -1592,11 +1589,11 @@ async def _persist_story_segment(
             (user_id,),
         ).fetchone()
         next_seq = row["m"] + 1
-        # 案件设定：20 轮一循环。
-        # - 20 整倍数轮（含 0，新一卷起点）：调用案件生成工作流刷新案件类型/核心，
+        # 案件设定：CASE_ROUNDS 轮一循环。
+        # - CASE_ROUNDS 整倍数轮（含 0，新一卷起点）：调用案件生成工作流刷新案件类型/核心，
         #   失败时返回空串保底，写入即为空值；
-        # - 非 20 整倍数轮：原样复制上一轮的 case_type/case_core（整卷 20 轮保持不变）。
-        if next_seq % 20 == 0:
+        # - 非 CASE_ROUNDS 整倍数轮：原样复制上一轮的 case_type/case_core（整卷 CASE_ROUNDS 轮保持不变）。
+        if next_seq % CASE_ROUNDS == 0:
             case_meta = await _generate_case_meta()
             meta["case_type"] = case_meta.get("case_type") or ""
             meta["case_core"] = case_meta.get("case_core") or ""
@@ -1618,12 +1615,12 @@ async def _persist_story_segment(
                  (user_id, seq, content, created_at,
                   choice_1, choice_2, choice_3,
                   user_choice,
-                  outline, music_style,
+                  music_style,
                   location, era, player_gender, player_name, player_traits,
                   partner_gender, partner_name, partner_traits,
                   language,
                   case_type, case_core)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 next_seq,
@@ -1633,7 +1630,6 @@ async def _persist_story_segment(
                 meta["choice_2"],
                 meta["choice_3"],
                 "",  # user_choice：新段刚生成，用户尚未选择；选择后由 generate_story 覆盖写入
-                meta["outline"],
                 meta["music_style"],
                 (settings.get("location") or ""),
                 (settings.get("era") or ""),
@@ -1788,7 +1784,7 @@ def _clean_story_text(raw: str) -> str:
     return cleaned
 
 
-# ================= 路由：小说生成（流式：先审首段 → 打字 → 剩余全审 → reveal） =================
+# ================= 路由：小说生成（流式：每满 400 字增量审核 → 通过即 chunk/reveal 显示） =================
 @app.post("/api/generate-story")
 async def generate_story(data: StoryInputData, request: Request):
     token = _extract_token(data, request)
@@ -1883,8 +1879,8 @@ async def generate_story(data: StoryInputData, request: Request):
     user_input_counter = _get_story_count(user_id)
     # 前一段小说文本（former_content，续写衔接用；新故事为空）
     former_content = _get_former_content(user_id)
-    # 当前案件所有大纲（corrent_outlet；见 _get_corrent_outlet 的 20 整倍数规则）
-    corrent_outlet = _get_corrent_outlet(user_id, user_input_counter)
+    # 当前案件正文原文（corrent_outlet 取值来源；见 _get_current_case_story 的 CASE_ROUNDS 整倍数规则）
+    corrent_outlet = _get_current_case_story(user_id, user_input_counter)
 
     # 输入成本控制（花钱之前硬拦）：设定 + 用户输入合并估算 token
     combined = " ".join(
@@ -1928,7 +1924,7 @@ async def generate_story(data: StoryInputData, request: Request):
             # 本轮信息
             "seq": user_input_counter,
             "former_content": former_content,
-            "corrent_outlet": corrent_outlet,
+            "corrent_outlet": corrent_outlet,  # 当前案件正文原文（原 outline 大纲已移除）
             "user_choice": data.user_input or "",
             # 当前案件（续写时从快照读取；首轮为空）
             "case_type": settings.get("case_type") or "",
@@ -1948,13 +1944,80 @@ async def generate_story(data: StoryInputData, request: Request):
                     yield _sse({"event": "error", "message": f"Dify 接口失败 {resp.status_code}: {body[:500]}"})
                     return
 
-                first_buf = ""      # 前 STORY_FIRST_CHUNK 字（先审后发）
-                rest_buf = ""       # 剩余缓冲（先审后 reveal）
-                full_text = ""      # 累计全部文本
-                sent_first = False
+                # 增量审核状态：正文每满 STORY_AUDIT_STEP 的整倍数（400、800、1200...）
+                # 即触发一次审核；审核窗口每步前进 STORY_AUDIT_STEP 字（其余窗口前带
+                # OVERLAP 回溯重叠），审核通过后把新确认的正文送回 App（首段 chunk
+                # 打字机、其后 reveal）。
+                full_text = ""          # 累计全部正文（<think> 已剥离）
+                displayed_len = 0       # 已发送给 App 的字符数
+                audit_no = 1            # 下一次审核序号 k（窗口 [STEP*(k-1)-OVERLAP, STEP*k)）
+                sent_first = False      # 是否已发送过首段 chunk
                 outputs = {}
                 think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
-                meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/outline/music_style）；workflow_finished 时更新，失败用保底默认
+                meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/music_style）；workflow_finished 时更新，失败用保底默认
+
+                async def _audit_pipeline(text_arg: str, final: bool, final_outputs: Optional[dict] = None):
+                    """增量审核管道：把当前累计正文按审核窗口逐批送审，审核通过后
+                    把新确认的正文以 chunk/reveal 事件回发 App。
+
+                    - 正文每满 STEP 的整倍数（400、800、1200...）触发一次审核，
+                      把对应整窗口送审（final=False 时也只做这一步）；
+                    - final=True 时，再把末尾不足 STEP 整倍数的剩余部分整体审一次
+                      （窗口前仍带 OVERLAP 回溯，防边界漏网），并携带真实 outputs。
+                    返回 (events, fail)：events 为待发送事件列表；fail 非 None 表示
+                    审核未通过/不可用，应立即发送 fail 并终止。
+                    """
+                    nonlocal audit_no, displayed_len, sent_first
+                    events: list = []
+                    while len(text_arg) >= STORY_AUDIT_STEP * audit_no:
+                        k = audit_no
+                        win_end = STORY_AUDIT_STEP * k
+                        if len(text_arg) < win_end:
+                            break
+                        win_start = max(
+                            0, STORY_AUDIT_STEP * (k - 1) - STORY_AUDIT_OVERLAP
+                        )
+                        audit_text = text_arg[win_start:win_end]
+                        mr = await _moderate_story(audit_text)
+                        fail = _moderation_failure_sse(mr)
+                        if fail is not None:
+                            return events, fail
+                        new_text = text_arg[displayed_len:win_end]
+                        if not sent_first:
+                            events.append({"event": "chunk", "text": new_text})
+                        else:
+                            events.append({"event": "reveal", "text": new_text, "outputs": {}})
+                        logger.warning(
+                            "STREAM audit k=%d OK win=[%d,%d) disp=[%d,%d)",
+                            k, win_start, win_end, displayed_len, win_end,
+                        )
+                        displayed_len = win_end
+                        audit_no += 1
+                        sent_first = True
+                    if final and displayed_len < len(text_arg):
+                        win_start = max(
+                            0, STORY_AUDIT_STEP * (audit_no - 1) - STORY_AUDIT_OVERLAP
+                        )
+                        audit_text = text_arg[win_start:]
+                        mr = await _moderate_story(audit_text)
+                        fail = _moderation_failure_sse(mr)
+                        if fail is not None:
+                            return events, fail
+                        new_text = text_arg[displayed_len:]
+                        if not sent_first:
+                            events.append({"event": "chunk", "text": new_text})
+                        else:
+                            ev: dict = {"event": "reveal", "text": new_text}
+                            if final_outputs:
+                                ev["outputs"] = final_outputs
+                            events.append(ev)
+                        logger.warning(
+                            "STREAM audit tail OK win_start=%d disp=[%d,%d)",
+                            win_start, displayed_len, len(text_arg),
+                        )
+                        displayed_len = len(text_arg)
+                        sent_first = True
+                    return events, None
 
                 async for line in resp.aiter_lines():
                     if not line.strip().startswith("data:"):
@@ -1971,72 +2034,52 @@ async def generate_story(data: StoryInputData, request: Request):
 
                     if etype == "text_chunk":
                         txt = _strip_think(edata.get("text", "") or "", think_state)
-                        full_text += txt
-                        if not sent_first:
-                            first_buf += txt
-                            if len(first_buf) >= STORY_FIRST_CHUNK:
-                                mr = await _moderate_story(first_buf)
-                                fail = _moderation_failure_sse(mr)
-                                if fail is not None:
-                                    yield _sse(fail)
-                                    return
-                                yield _sse({"event": "chunk", "text": first_buf})
-                                logger.warning("STREAM first_chunk sent len=%d", len(first_buf))
-                                sent_first = True
-                        else:
-                            rest_buf += txt
+                        if txt:
+                            full_text += txt
+                            events, fail = await _audit_pipeline(full_text, final=False)
+                            if fail is not None:
+                                yield _sse(fail)
+                                return
+                            for ev in events:
+                                yield _sse(ev)
 
                     elif etype == "workflow_finished":
                         outputs = edata.get("outputs") or {}
                         meta = _extract_story_meta(
                             outputs, settings.get("language")
                         )
-                        if not sent_first:
-                            # 全文不足首段字数：整体审一次再发
-                            final_all = _clean_story_text(
-                                outputs.get("text", "") or full_text,
-                            )
-                            if not final_all or not final_all.strip():
-                                yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
-                                return
-                            mr = await _moderate_story(final_all)
-                            fail = _moderation_failure_sse(mr)
-                            if fail is not None:
-                                yield _sse(fail)
-                                return
-                            final_segment = final_all
-                            yield _sse({"event": "chunk", "text": final_all})
-                        else:
-                            out_text = _clean_story_text(
-                                outputs.get("text", "") or full_text,
-                            )
-                            if not out_text or not out_text.strip():
-                                yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
-                                return
-                            if out_text and out_text.startswith(first_buf):
-                                rest = out_text[len(first_buf):]   # 展示：首段(450)之后，避免重复
-                            else:
-                                rest = rest_buf
-                            final_segment = out_text
-                            if rest:
-                                # 第二次审核：从 STORY_SECOND_AUDIT_START(400) 到结尾（含与首段的 50 字重叠）
-                                if out_text and len(out_text) > STORY_SECOND_AUDIT_START:
-                                    audit_text = out_text[STORY_SECOND_AUDIT_START:]
-                                else:
-                                    audit_text = rest
-                                mr = await _moderate_story(audit_text)
-                                fail = _moderation_failure_sse(mr)
-                                if fail is not None:
-                                    logger.warning("STREAM moderate2 FAILED: %s", mr.value)
-                                    yield _sse(fail)
-                                    return
-                                logger.warning("STREAM moderate2 OK")
-                                yield _sse({"event": "reveal", "text": rest, "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
-                            else:
-                                yield _sse({"event": "reveal", "text": "", "outputs": {**outputs, **_finalize_meta(meta, final_segment)}})
-                        # 只有"完整正文 + 推演四量（outline/outlet、music/music_style、action_a、action_b）"
+                        # 权威全文：优先用 Dify 结束节点返回的完整 text（清洗后）。
+                        out_text = _clean_story_text(
+                            outputs.get("text", "") or full_text,
+                        )
+                        if not out_text or not out_text.strip():
+                            yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
+                            return
+                        # 正常情况 out_text == full_text（均为清洗后的正文）。若 out_text
+                        # 前缀与"已显示部分"不一致（罕见异常），回退用流式累计的 full_text，
+                        # 保证已发送的正文不错位。
+                        if not out_text.startswith(full_text[:displayed_len]):
+                            logger.warning("STREAM out_text 前缀与已显示不一致，回退 full_text")
+                            out_text = full_text
+                        final_segment = out_text
+                        # 增量送审（含末尾兜底），通过后把剩余正文 reveal 给 App。
+                        events, fail = await _audit_pipeline(
+                            out_text,
+                            final=True,
+                            final_outputs={
+                                **outputs,
+                                **meta,
+                            },
+                        )
+                        if fail is not None:
+                            logger.warning("STREAM audit FAILED: %s", fail)
+                            yield _sse(fail)
+                            return
+                        for ev in events:
+                            yield _sse(ev)
+                        # 只有"完整正文 + 推演三量（music/music_style、action_a、action_b）"
                         # 都收到，才真正落库；缺任一推演量则跳过持久化（正文仍照常推送给 App）。
-                        fmeta = _finalize_meta(meta, final_segment)
+                        fmeta = dict(meta)
                         if _has_inference_outputs(outputs):
                             try:
                                 await _persist_story_segment(user_id, final_segment, settings, fmeta)
@@ -2044,7 +2087,7 @@ async def generate_story(data: StoryInputData, request: Request):
                             except Exception as pe:
                                 logger.warning("STREAM persist EXCEPTION: %s", pe, exc_info=True)
                         else:
-                            logger.warning("STREAM skip persist: 推演四量未齐全 final_len=%d", len(final_segment))
+                            logger.warning("STREAM skip persist: 推演三量未齐全 final_len=%d", len(final_segment))
                         logger.warning("STREAM yielding done")
                         yield _sse({"event": "done", "outputs": {**outputs, **fmeta}})
                         return
@@ -2053,34 +2096,20 @@ async def generate_story(data: StoryInputData, request: Request):
                         yield _sse({"event": "error", "message": edata.get("message") or "Dify 工作流执行失败"})
                         return
 
-                # 流意外结束（未收到 workflow_finished）：兜底，但剩余内容仍须先审核再 reveal
-                if not sent_first and full_text:
-                    mr = await _moderate_story(full_text)
-                    fail = _moderation_failure_sse(mr)
+                # 流意外结束（未收到 workflow_finished）：兜底，剩余内容仍须先审核再 reveal
+                if full_text:
+                    events, fail = await _audit_pipeline(full_text, final=True)
                     if fail is not None:
                         yield _sse(fail)
-                    else:
-                        yield _sse({"event": "chunk", "text": full_text})
-                        # 未收到推演四量（无 workflow_finished），按新规则不落库，仅推送正文
-                        logger.warning("STREAM fallback skip persist (无推演四量) final_len=%d", len(full_text))
-                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
-                elif rest_buf:
-                    mr = await _moderate_story(rest_buf)
-                    fail = _moderation_failure_sse(mr)
-                    if fail is not None:
-                        yield _sse(fail)
-                    else:
-                        yield _sse({"event": "reveal", "text": rest_buf, "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
-                        # full_text = 首段 + 剩余，即完整文本；未收到推演四量，按新规则不落库
-                        logger.warning("STREAM fallback skip persist (无推演四量) final_len=%d", len(full_text))
-                        yield _sse({"event": "done", "outputs": {**outputs, **_finalize_meta(meta, full_text)}})
+                        return
+                    for ev in events:
+                        yield _sse(ev)
+                    # 未收到推演三量（无 workflow_finished），按新规则不落库，仅推送正文
+                    logger.warning("STREAM fallback skip persist (无推演三量) final_len=%d", len(full_text))
+                    yield _sse({"event": "done", "outputs": {**outputs, **meta}})
                 else:
-                    if not full_text or not full_text.strip():
-                        logger.warning("STREAM fallback empty_output full_len=%d sent_first=%s", len(full_text), sent_first)
-                        yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
-                    else:
-                        logger.warning("STREAM fallback unexpected-end full_len=%d sent_first=%s rest_len=%d", len(full_text), sent_first, len(rest_buf))
-                        yield _sse({"event": "error", "message": "生成流意外中断"})
+                    logger.warning("STREAM fallback empty_output full_len=%d sent_first=%s", len(full_text), sent_first)
+                    yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
         except httpx.RequestError as exc:
             logger.warning("STREAM RequestError: %s", exc, exc_info=True)
             yield _sse({"event": "error", "message": f"与 Dify 通信异常: {str(exc)}"})
@@ -2376,6 +2405,41 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     if total is not None:
         resp["total"] = total
     return resp
+
+
+@app.get("/api/story/latest")
+async def story_latest(request: Request):
+    """【调试专用】返回当前用户最新一段 story_segments 的【全部字段】。
+
+    与 /api/story 不同：本端点返回完整一行（含 content / music_style / created_at /
+    设定快照/案件信息等所有列），供 App 在每次生成后弹窗核对"数据库落库内容"。
+    仅返回当前用户自己的数据；无任何数据时 latest 为 null。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    device_id = claims["device_id"]
+    _enforce_active_device(user_id, device_id)
+    conn = _db()
+    try:
+        row = conn.execute(
+            """SELECT id, seq, content, created_at,
+                      choice_1, choice_2, choice_3, user_choice,
+                      music_style,
+                      location, era, player_gender, player_name, player_traits,
+                      partner_gender, partner_name, partner_traits, language,
+                      case_type, case_core
+               FROM story_segments
+               WHERE user_id=?
+               ORDER BY seq DESC, id DESC
+               LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"latest": None}
+    return {"latest": dict(row)}
 
 
 @app.post("/api/story")

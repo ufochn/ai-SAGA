@@ -23,12 +23,16 @@
 > **⚠️ 2026-08-16 update**: added a cinematic **"enter your world"** transition between setup confirmation and the story page (4s fade to black → 6s localized prompt text that fades in/out → 1s full black → 4s brighten, 15s total, no waiting spinner), and fixed several related issues: the blackout only covering the top half of the screen (the inner `Stack` shrank to a short story page), bright system bars at the screen edges during the pure-black phase, a **server** bug that persisted every new story segment's choices as fallback defaults, an **app** bug where the time-tree rewrite displayed the wrong options, and a one-frame red debug screen caused by a `Curves` assertion on a floating-point value slightly outside `[0,1]`. Read the **[Session Update (2026-08-16)](#session-update-2026-08-16)** section at the bottom.
 >
 > **⚠️ 2026-08-16 (dialog background freeze)**: fixed a story-page jump where the error/stall/violation dialog made the background rearrange itself — the "Your choice" text and the input buttons swapped places and the button's bottom edge got pinned to the screen's bottom edge with a violent jump, instead of staying frozen in its pre-error state. Root cause: the error handlers mutated the streaming layout (removed the partial segment / set `_storyStreaming = false`) in the same `setState` before showing the dialog. Fix: the background is now kept **completely unchanged** behind every such dialog. Read the **[Full Chatflow Summary — Dialog Background Freeze (2026-08-16)](#full-chatflow-summary--dialog-background-freeze-2026-08-16)** section at the bottom.
+>
+> **⚠️ 2026-08-17 update**: the post-generation **outline extraction feature was completely removed** (server, app, and database schema); the `corrent_outlet` context input now carries the **actual previous story text** (read from the `content` column) instead of stored outlines; the case lifecycle was shortened from **20 to 14 rounds** via a `CASE_ROUNDS = 14` constant; and the `corrent_outlet` window was reworked so that a **multiple of 14** passes the full previous arc's text (instead of an empty string) while the immediately-following round passes only that boundary round's text. Read the **[Full Chatflow Summary — Outline Removal, Content-Based Context, 14-Round Case Lifecycle (2026-08-17)](#full-chatflow-summary--outline-removal-content-based-context-14-round-case-lifecycle-2026-08-17)** section at the bottom.
+> **⚠️ 2026-08-17 (incremental moderation)**: the novel-generation content moderation was changed from *"audit the first chunk, then audit the whole remainder at once"* to **incremental sliding-window auditing** — every **400** generated characters trigger an audit, each window advancing 400 new chars plus a **50-char look-back** overlap so boundary text can never slip through: `[0,400)`, `[350,800)`, `[750,1200)`, `[1150,1600)`, … until the whole text is audited. On approval each newly confirmed 400 chars are streamed to the app (first batch as `chunk`, later batches as `reveal`); the typewriter speed is unchanged. The **guardrail (audit) 24-hour quota** was also raised from **2000 to 4000** calls/day. Read the **[Full Chatflow Summary — Incremental Sliding-Window Moderation & Guardrail Quota (2026-08-17)](#full-chatflow-summary--incremental-sliding-window-moderation--guardrail-quota-2026-08-17)** section at the bottom.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Key Decision: Full Story Text Instead of Outline Summaries](#key-decision-full-story-text-instead-of-outline-summaries)
 - [Tech Stack](#tech-stack)
 - [Major Improvements & Decisions](#major-improvements--decisions)
   1. [From template to a real product](#1-from-template-to-a-real-product)
@@ -61,6 +65,39 @@
 - [Deployment & Configuration](#deployment--configuration)
 - [Roadmap](#roadmap)
 - [Notes for the Repository](#notes-for-the-repository)
+
+---
+
+## Key Decision: Full Story Text Instead of Outline Summaries
+
+**The change.** We abandoned outline-guided generation for subsequent novel segments and instead feed the LLM the **actual prior story text** directly. The full reasoning:
+
+1. **Near-zero cost difference for non-paying users** — a new non-paying user averages only **two rounds** of use, so for them the cost difference is negligible. And if only the first three rounds are used, the architecture cost of *not* maintaining an outline is actually **lower**.
+
+2. **Generation quality differs enormously** — prose written against the real prior text is dramatically better than prose generated from a condensed outline.
+
+3. **Long text vs. a highly condensed outline** — an LLM tends to focus on the **beginning and the end** of a long context. But the current episodic ("unit drama") structure and humans' own inherent writing patterns share this same bias (readers also favor early and recent memories), and it is further mitigated by **RAG correction**, by the fact that a single ~20,000-character installment has only **limited absolute memory drift**, and by the rapid capability gains of future large models. Given all this, it is hard to say definitively whether continuing with outline summaries wins on the trade-off between benefit, quality, and cost.
+
+4. **Higher quality raises acquisition success** — better output directly increases the chance of converting users.
+
+5. **Long text always corresponds to a paying user** — a long text implies a paying user, so its extra cost is **borne specifically by that paying user**; it is not spread uniformly across all users.
+
+6. **Much simpler prompts** — no more per-small-segment-user character profiles, adaptation, identity fixing, or plot settings. All of the user's settings **emerge naturally** through the LLM's text creation.
+
+7. **The math (per round)**:
+
+   - Outline input fixed cost: **2,500 chars** (max outline 20,000 ÷ 4 = 5,000; the per-round length grows in steps, so the fixed cost uses the median 5,000 ÷ 2 = 2,500).
+   - 20,000-char novel: fixed **10,000 chars** per round.
+   - Difference: 10,000 − 2,500 = **7,500**.
+   - Outline's extra supplementary input — supporting-character settings + plot settings: **500 chars**.
+   - Extra character-generation LLM call — 200 input + 800 output (the output is also ~200 chars but output is more expensive): **1,000 chars**.
+   - Per-round outline condensation — extra output cost 400 chars ≈ **1,600 chars** equivalent.
+   - Per-round injection of all the above into the model prompt: **500 chars**.
+   - **Net result: the full-text approach costs an extra 7,500 − 500 − 1,000 − 1,600 − 500 = 3,900 tokens per round — not a saving.** But this extra cost is controllable and, because a long text always corresponds to a paying user (point 5), it is borne specifically by that paying user.
+
+8. **Avoids the opportunity cost of quality loss** — the outline mode raises the chance of prompt-input tuning issues and LLM misunderstanding, degrading quality and costing customers.
+
+**Conclusion.** We changed the original plan: **remove the outline summary and feed the actual story text directly** — accepting a controllable extra cost of ~3,900 tokens per round that paying users bear, in exchange for far better generation quality and much simpler prompts. This is how story consistency is maintained.
 
 ---
 
@@ -215,6 +252,8 @@ _HomeContentState relays the text onto the main story page (lib/logic/home_conte
 **Agreed design (implemented)**: A global rolling 24-hour quota over all users — `STORY_DAILY_LIMIT = 500` calls per 24 h, tracked in a SQLite `story_usage` table with a rolling window (`_check_story_quota`, [`server/main.py`](server/main.py:899)). When the count reaches the limit, the endpoint returns **HTTP 429** with an alarm message and refuses further generation until the window rolls over. This protects against abuse/DoS while staying convenient for testing. Both the audit path and the story path enforce their own budgets.
 
 ### 18. Two-phase streaming moderation & progressive typewriter
+
+> ⚠️ **Superseded 2026-08-17**: the *two-phase* moderation described here (audit the first chunk, then audit the **whole remainder at once** from char 400) was replaced by **incremental sliding-window moderation** — an audit fires every **400** chars with a **50-char overlap**, and each approved 400-char window is revealed as soon as it is confirmed. The typewriter scheme below is unchanged. See the **[Full Chatflow Summary — Incremental Sliding-Window Moderation & Guardrail Quota (2026-08-17)](#full-chatflow-summary--incremental-sliding-window-moderation--guardrail-quota-2026-08-17)** section at the bottom.
 
 This is the core UX. The user asked: *“先审 400 字 → 打字 → 剩余全审 → 一次性显示；看起来输出不断加速。”* Later the first audit was widened to **450 chars** and the second audit was pinned to start at **char 400**, creating a **50-char overlap** so no violating text can slip through the boundary.
 
@@ -1601,3 +1640,166 @@ The restart-path dialogs (`_showGenerateError`, `_onStreamStalled`) rely on the 
 - `flutter analyze lib/logic/home_content.dart` → no issues.
 - The waiting-state and typing-state error flows now leave the background untouched when the dialog appears; only the deliberate "Restart" / "Re-enter" action resets the page afterwards.
 - Because the streaming layout code changed, test with **Hot Restart (↻/R)**, not Hot Reload (⚡/r).
+
+---
+
+# Full Chatflow Summary — Outline Removal, Content-Based Context, 14-Round Case Lifecycle (2026-08-17)
+
+> An English, desensitized summary of the 2026-08-17 chatflow. It covers: the **complete removal of the post-generation "outline extraction" feature** from the server, the app, and the database schema; the replacement of the `corrent_outlet` context input with the **actual previous story text** (reading the `content` column instead of the removed `outline` column); shortening the case lifecycle from **20 to 14 rounds** via a `CASE_ROUNDS = 14` constant; and a reworked `corrent_outlet` window so a multiple of 14 passes the full previous arc's text while the following round passes only that boundary round's text. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. The outline-extraction feature is removed entirely
+
+The pipeline used to ask the second LLM for a per-segment **outline** (`outlet`/`outline`) after each generated segment, store it in a `story_segments.outline` column, and later feed it back into the next generation as `corrent_outlet`. This feature is now **completely removed**:
+
+- **Database**: the `outline TEXT DEFAULT ''` column was dropped from the `story_segments` schema ([`server/main.py`](AI-SAGA/server/main.py:173)). The project recreates the schema on every deploy, so no migration code is needed.
+- **Server** ([`server/main.py`](AI-SAGA/server/main.py)): removed the `OUTLINE_FALLBACK` constant, the `_finalize_meta` fallback function and all of its call sites, and the `"outline"` keys from `META_DEFAULTS` / `META_DEFAULTS_BY_LANG`. [`_extract_story_meta()`](AI-SAGA/server/main.py:1486) no longer maps `outlet`/`outline` from the Dify outputs, and [`_has_inference_outputs()`](AI-SAGA/server/main.py:1521) now gates persistence on **three** inference values (`music_style`, `action_a`, `action_b`) instead of four. The debug endpoint `/api/story/latest` no longer selects `outline`.
+- **App**: `outline` was never used functionally in the app — only a doc comment on the debug endpoint was updated.
+- **Dify assets**: the obsolete `dify/OUTLINE_PROMPT.md` (the outline-extraction prompt spec) was deleted.
+
+## 2. `corrent_outlet` now carries the actual story text
+
+- The Dify workflow input key `corrent_outlet` is **kept unchanged** (so the Dify canvas needs no edits), but its value is no longer built from stored outlines.
+- The new [`_get_current_case_story()`](AI-SAGA/server/main.py:1379) reads the **`content` column** (the real story text) from `story_segments` and newline-joins the selected window, giving the LLM the complete prior prose for continuity.
+
+## 3. Case lifecycle shortened from 20 to 14 rounds
+
+- A module-level `CASE_ROUNDS = 14` constant ([`server/main.py`](AI-SAGA/server/main.py:1376)) now defines one "case / arc" length.
+- Case refresh ([`_persist_story_segment()`](AI-SAGA/server/main.py:1590)): on `seq % CASE_ROUNDS == 0` (including 0, the start of a new arc) the server calls the case-generation workflow and stores a **fresh** `case_type`/`case_core`; on every other round it copies the previous round's values unchanged.
+
+## 4. New `corrent_outlet` window logic
+
+Let `seq` be the round currently being generated (0-based). [`_get_current_case_story()`](AI-SAGA/server/main.py:1379) implements:
+
+```
+if seq == 0:            empty
+elif seq % 14 == 0:     rounds [seq-14, seq-1]   (the full previous arc)
+else:                   rounds [(seq//14)*14, seq-1]
+```
+
+| seq | `corrent_outlet` passed to Dify |
+|---|---|
+| 0 | empty (no prior text) |
+| 1–13 | rounds 0 … seq−1 |
+| **14** | **rounds 0–13 (the full previous arc — was empty before)** |
+| **15** | **round 14 only (shrinks back)** |
+| 16–27 | rounds 14 … seq−1 |
+| **28** | **rounds 14–27 (full previous arc — was empty before)** |
+| **29** | **round 28 only (shrinks back)** |
+| 30–41 | rounds 28 … seq−1 |
+| **42** | **rounds 28–41 (full previous arc — was empty before)** |
+| **43** | **round 42 only (shrinks back)** |
+| 44–55 | rounds 42 … seq−1 |
+| **56** | **rounds 42–55 (full previous arc)** |
+| **57** | **round 56 only (shrinks back)** |
+
+- Round 0 stays empty (there is no prior text yet).
+- On a **multiple of 14** (a new-arc start) the value is no longer an empty string — it becomes the **entire previous arc** (0–13, 14–27, 28–41, …).
+- On the round **immediately after** a multiple (15, 29, 43, …) the value shrinks to just that boundary round's text (14, 28, 42, …).
+- All other rounds keep the growing window from the nearest multiple of 14 (inclusive) up to the previous round.
+
+## 5. Verification
+
+- `python3 -m py_compile server/main.py` passes.
+- A standalone simulation confirmed the window for seq 0 / 1 / 13 / 14 / 15 / 27 / 28 / 29 / 41 / 42 / 43 / 55 / 56 / 57 matches the table above.
+- Only the server context-builder changed; the Dify canvas and the Flutter app require no changes.
+
+---
+
+# Full Chatflow Summary — Incremental Sliding-Window Moderation & Guardrail Quota (2026-08-17)
+
+> An English, desensitized summary of the 2026-08-17 chatflow. It covers two changes: (1) the novel-generation content moderation was reworked from *"audit the first chunk, then audit the whole remainder at once"* into **incremental sliding-window auditing** — an audit fires every **400** generated characters, each window advancing 400 new chars plus a **50-char look-back** overlap so boundary violations can never slip through; and (2) the **guardrail (audit) 24-hour quota** was raised from **2000 to 4000** calls/day. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. The problem: one big "audit the remainder" call
+
+**Before.** The server audited the first chunk, started the typewriter, buffered the whole remainder, and only after generation finished audited `[400, end)` **in a single call**, then revealed everything at once. This worked, but:
+
+- The remainder can be very long, so a single moderation call had a very large input, and the user waited for the entire remainder to be audited before any of it appeared.
+- A violation anywhere in the tail withheld the **whole** tail, even if most of it was fine.
+
+## 2. The change: incremental sliding-window moderation
+
+The generation pipeline now audits **every 400 characters** as they stream in and reveals each approved window immediately.
+
+### 2.1 Audit windows
+
+The k-th audit uses the window
+
+```
+[max(0, STEP·(k−1) − OVERLAP),  STEP·k)        with STEP = 400, OVERLAP = 50
+```
+
+| k | Window (chars) |
+|---|---|
+| 1 | `[0, 400)` — 0–400 (no look-back yet) |
+| 2 | `[350, 800)` |
+| 3 | `[750, 1200)` |
+| 4 | `[1150, 1600)` |
+| … | continues until the whole text is audited |
+
+- Each window advances **400 new chars** and, except for the first, adds a **50-char look-back** into the already-audited region, so the boundary between two windows is audited twice and no violating text can slip through the gap.
+- An audit fires when the accumulated text reaches a **multiple of 400** (400, 800, 1200, …) — exactly when the window end becomes available. This also matches "400 chars per audit" (第一次攒 400 字送审: 0–400).
+
+### 2.2 Streaming & reveal behavior
+
+- On **approval**, the newly confirmed 400 chars `[400·(k−1), 400·k)` are sent to the app: the first batch as a `chunk` event (the typewriter starts), every later batch as a `reveal` event (appended to the same segment and typed out continuously).
+- Moderation outcomes are unchanged: **reject → `abort`** (violation dialog, nothing of that window is shown), **unavailable → `error`** (retryable, not treated as a violation), **pass → stream**.
+- After generation finishes (`workflow_finished`), any trailing remainder shorter than 400 chars is audited **one final time** (still with the 50-char look-back) and then revealed — *"until everything is audited"*.
+- If the stream ends unexpectedly, the same incremental audit still runs over whatever text was received before any reveal — unaudited content is never shown.
+
+### 2.3 Server implementation
+
+- New configuration ([`server/main.py`](server/main.py:85)): `STORY_AUDIT_STEP = 400` (window step **and** trigger cadence) and `STORY_AUDIT_OVERLAP = 50` (look-back). The old `STORY_FIRST_CHUNK` / `STORY_SECOND_AUDIT_START` two-phase constants were removed; `STORY_SECOND_AUDIT_START` remains supported as a backward-compatible environment fallback for the step.
+- The streaming state machine inside `generate_story` ([`server/main.py`](server/main.py:1937)) was rewritten: the `first_buf` / `rest_buf` buffering was replaced by a `full_text` accumulator plus `displayed_len` / `audit_no` bookkeeping, and a nested `_audit_pipeline()` ([`server/main.py`](server/main.py:1959)) drives the sliding windows, sends the approved windows, and performs the final catch-all audit.
+- **No Flutter changes were required**: the app already appends consecutive `chunk` / `reveal` events to the same segment, so the **typewriter speed is unchanged** (still the original accelerating slow→fast scheme).
+
+## 3. Guardrail 24-hour quota raised to 4000
+
+- The guardrail (audit) workflow's global 24-hour rolling limit, `AUDIT_DAILY_LIMIT` ([`server/main.py`](server/main.py:84)), was raised from **2000 to 4000** calls/day. It remains configurable via the `AUDIT_DAILY_LIMIT` environment variable; the 429 "quota reached" message reads the constant directly, so it now reports 4000 automatically.
+
+## 4. Verification
+
+- `python3 -m py_compile server/main.py` passes.
+- A standalone simulation across many text lengths (≈50 → 4500 chars) confirmed: every displayed character falls inside at least one audited window; the first windows match the spec exactly (`0-400`, `350-800`, `750-1200`, `1150-1600`); and the **entire** generated text is eventually displayed.
+- Spot checks: 400 chars → one window `[0,400)`; 800 → `[0,400)`, `[350,800)`; 1200 → `[0,400)`, `[350,800)`, `[750,1200)`; 2000 → `[0,400)`, `[350,800)`, `[750,1200)`, `[1150,1600)`, plus a final tail window `[1550,2000)`.
+
+---
+
+# Full Chatflow Summary — Empty `case_core` & the Case-Workflow LLM Contract (2026-08-17)
+
+> An English, desensitized summary of the 2026-08-17 chatflow that diagnosed why `story_segments.case_core` was always empty. It covers: ruling out schema, credentials, deployed code, and the app; a live blocking call to the case-generation Dify workflow showing it returned only `core_type` plus `core_content` — where `core_content` is the **prompt** emitted by the workflow's code node, not generated content — with `total_tokens = 0` (the LLM node never executed); the resulting two-layer mismatch (the server builds `case_core` only from `victim_identity` / `death_scene` / `murder_method`, which the workflow never produced); a wrong intermediate server fallback that would have stored the prompt and was later reverted; and the resolution: the Dify workflow's LLM node was fixed to actually run and return the three fields (verified live with non-zero tokens), after which the server's original concatenation logic was restored, deployed, and byte-verified against the local file. **Desensitized** — no secrets, credentials, API keys, server addresses, or real identifiers appear anywhere.
+
+## 1. The symptom
+
+Every row in `story_segments` had a populated `case_type` but an **empty** `case_core`, for every user. `case_core` is the current murder-case core (victim identity / death scene / murder method / truth background) that the server persists alongside each story segment.
+
+## 2. What was ruled out first
+
+- **Schema**: `story_segments` has both `case_type` and `case_core` columns ([`server/main.py`](server/main.py:198)).
+- **Credentials**: the case workflow's API key is set in the container environment and works (a direct call returns HTTP 200).
+- **Deployed code**: the running container's `/code/main.py` is byte-identical (md5) to the local file and contains the case-generation logic.
+- **Client**: the Flutter app never writes these columns — the database is the single source of truth, written only server-side.
+
+## 3. Root cause: the case workflow's LLM node was not executing
+
+A live (blocking) call to the case-generation Dify workflow returned:
+
+- `core_type` — the case-type label (picked by the workflow's **code node**);
+- `core_content` — the **prompt** for that scenario (also emitted by the code node), *not* generated content;
+- `total_tokens = 0`, elapsed ≈ 0.1 s — **the LLM node never ran**.
+
+The server's [`_generate_case_meta()`](server/main.py:1287) builds `case_core` only by newline-joining `victim_identity` / `death_scene` / `murder_method` ([`server/main.py`](server/main.py:1330)) and reads `case_type` from `case_type` / `core_type` / `type`. Because the workflow produced none of the three content fields, `case_core` stayed `""` — while `case_type` was still populated via the `core_type` alias, exactly matching the observed symptom.
+
+## 4. A wrong intermediate fix (reverted)
+
+A temporary fallback was added to store `core_content` whenever the three fields were missing. Since `core_content` is the **prompt**, this would have persisted the prompt text into `case_core` — wrong. After confirming the intended contract (the workflow must return the three generated fields), the fallback was removed and the original three-field concatenation restored.
+
+## 5. Resolution & verification
+
+- **Dify side**: the case workflow's LLM node was fixed (in the Dify console) to actually execute and surface `victim_identity` / `death_scene` / `murder_method` as workflow outputs. A follow-up live call confirmed real generation (`total_tokens ≈ 600`, elapsed ≈ 6 s) with all three non-empty string fields plus `core_type`.
+- **Server side**: the corrected code is deployed to the container; [`_persist_story_segment()`](server/main.py:1553) refreshes the case on `seq % CASE_ROUNDS == 0` ([`server/main.py`](server/main.py:1596)) and copies the previous round's values otherwise, so new arcs now persist a proper `case_core`.
+- **End-to-end**: applying the deployed parsing to a real workflow response yields a non-empty `case_core` (a multi-line victim / scene / method description) alongside `case_type`.
+- **Existing rows** written while the workflow was broken still have an empty `case_core`; they are not auto-healed (the content was never generated) and can be backfilled on demand.
+
+## 6. Key contract reminder
+
+`core_content` = the **prompt** (code node), `core_type` = the type label (code node), and `case_core` = the newline-joined **LLM-generated** `victim_identity` / `death_scene` / `murder_method`. Never store `core_content` as `case_core`.

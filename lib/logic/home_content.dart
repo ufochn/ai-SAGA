@@ -875,6 +875,8 @@ class _HomeContentState extends State<HomeContent>
             await _onStreamStalled();
             return;
           }
+          // 【调试】弹窗打印数据库最新一条落库内容，确认后继续
+          await _showLatestDbRowDebugDialog();
         },
       );
     } on HardwareAccountLimitException {
@@ -1516,7 +1518,7 @@ class _HomeContentState extends State<HomeContent>
     // 本次生成是否收到过非空正文（LLM 返回空白时用于弹窗警告）
     bool hadContent = false;
 
-    // 流式：服务器先审首段，通过后 chunk 开始打字；剩余全审后 reveal 一次性显示
+    // 流式：服务器每满 400 字增量审核，通过后 chunk 开始打字、后续 reveal 逐段追加
     try {
       // 设定不再单独上传服务器：仅在第一轮生成时随请求一并发送，随小说正文落库
       await StoryService.generateStoryStream(
@@ -1616,6 +1618,8 @@ class _HomeContentState extends State<HomeContent>
             await _onStreamStalled();
             return;
           }
+          // 【调试】弹窗打印数据库最新一条落库内容，确认后继续
+          await _showLatestDbRowDebugDialog();
         },
       );
     } on HardwareAccountLimitException {
@@ -2327,7 +2331,7 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 流式卡死（30 秒未收到任何数据且未完成）：网络可能有问题，
+  /// 流式卡死（40 秒未收到任何数据且未完成）：网络可能有问题，
   /// 为保证小说文本完整，弹出警告并强制用户重启本 App，重启后重新拉取完整数据。
   Future<void> _onStreamStalled() async {
     if (!mounted) return;
@@ -2501,6 +2505,73 @@ class _HomeContentState extends State<HomeContent>
         ],
       ),
     );
+  }
+
+  /// 【调试】弹窗打印数据库（story_segments）最新一条生成条目的全部字段。
+  ///
+  /// 每次生成完成（正文 + 推荐按钮均已就绪）后调用：从服务器拉取最新一行，
+  /// 以只读文本弹窗展示所有字段，用户点"确认"后按原逻辑继续运行。
+  ///
+  /// 重要：App 根组件是 CupertinoApp，必须使用 Cupertino 弹窗。若用 Material 的
+  /// showDialog/AlertDialog/TextButton/SelectableText，会因缺少 MaterialLocalizations
+  /// 与 Material Theme 导致弹窗内容构建失败——只剩一个不可见遮罩挡住所有输入，
+  /// 表现为"窗口失去焦点/锁死、看不到弹窗也无法点击"（本次已修复）。
+  Future<void> _showLatestDbRowDebugDialog() async {
+    if (!mounted) return;
+    final Map<String, dynamic>? row = await StoryService.fetchLatestStoryRow();
+    if (!mounted) return;
+    final String body = row == null
+        ? '(无法获取数据库最新条目，请确认服务器已部署 /api/story/latest 调试端点)'
+        : _formatDebugRow(row);
+    // 调试内容用"只读 CupertinoTextField"承载：与 App 内其它输入框同款控件，
+    // 在 macOS 上原生支持鼠标框选 + 右键"拷贝"。该控件只出现在本调试弹窗内，
+    // 其它弹窗仍是纯 Text（不可选中复制），互不影响。
+    final TextEditingController ctrl = TextEditingController(text: body);
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('调试 · 数据库最新生成条目'),
+        content: SizedBox(
+          width: 460,
+          height: 400,
+          child: CupertinoTextField(
+            controller: ctrl,
+            readOnly: true, // 只读：可选中/复制，不可编辑
+            maxLines: null,
+            minLines: null,
+            expands: true, // 填满 460x400 区域，超高内容内部滚动
+            keyboardType: TextInputType.multiline,
+            padding: const EdgeInsets.all(12),
+            decoration: null, // 无边框/背景，观感接近纯文本
+            cursorColor: const Color(0x00000000), // 隐藏光标，更像普通文本
+            style: const TextStyle(fontSize: 13),
+            enableInteractiveSelection: true,
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('确认'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+  }
+
+  /// 把数据库一行的全部字段格式化为可读文本（保留服务器返回的列顺序）。
+  String _formatDebugRow(Map<String, dynamic> row) {
+    final buf = StringBuffer();
+    row.forEach((key, value) {
+      final s = value is String ? value : (value?.toString() ?? '');
+      buf.writeln('[$key]');
+      if (key == 'content') buf.writeln('(length=${s.length})');
+      buf.writeln(s.isEmpty ? '（空）' : s);
+      buf.writeln('----------------');
+    });
+    return buf.toString();
   }
 
   /// 生成失败弹窗：仅提供"重启 App"按钮。

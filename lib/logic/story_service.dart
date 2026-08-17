@@ -6,8 +6,9 @@ import 'package:http/http.dart' as http;
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 
-/// 小说生成服务（流式）：把用户设定发送到 FastAPI 网关，网关先审首段、
-/// 通过后以 SSE 流式返回正文（chunk → reveal），用于打字机效果显示。
+/// 小说生成服务（流式）：把用户设定发送到 FastAPI 网关，网关每满 400 字增量审核
+/// （窗口 [0,400)、[350,800)、[750,1200)... 重叠防漏网）、通过后以 SSE 流式返回
+/// 正文（chunk → reveal），用于打字机效果显示（打字机速度由客户端控制，维持原设定）。
 class StoryService {
   StoryService._();
 
@@ -26,7 +27,7 @@ class StoryService {
   /// 流式生成小说正文。
   ///
   /// [onChunk]：审核通过的首段正文（打字机开始打）
-  /// [onReveal]：剩余正文 + 结束节点 outputs（审核通过后一次性显示）
+  /// [onReveal]：后续各段审核通过的正文 + 结束节点 outputs（逐段追加显示）
   /// [onAbort]：内容违规被中止
   /// [onError]：出错
   /// [onDone]：流程结束（可在此保存/收尾）
@@ -74,7 +75,7 @@ class StoryService {
     final token = await AuthService.ensureToken();
 
     final client = http.Client();
-    // 流式"卡死"标记：30 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
+    // 流式"卡死"标记：40 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
     var stalled = false;
     try {
       final request = http.Request('POST', Uri.parse(url));
@@ -128,9 +129,9 @@ class StoryService {
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .timeout(
-            const Duration(seconds: 30),
+            const Duration(seconds: 40),
             onTimeout: (sink) {
-              // 30 秒内没有任何数据到达（且未收到 done）：判定为网络异常/卡死，
+              // 40 秒内没有任何数据到达（且未收到 done）：判定为网络异常/卡死，
               // 通知上层弹出"请重启"警告，并结束本次流式读取，避免半截文本被误用。
               if (!stalled) {
                 stalled = true;
@@ -252,6 +253,45 @@ class StoryService {
       } else {
         onError(e.toString());
       }
+    } finally {
+      client.close();
+    }
+  }
+
+  /// 【调试专用】获取服务器数据库（story_segments）最新一条生成条目的全部字段。
+  ///
+  /// 调用服务器调试端点 `GET /api/story/latest`，返回完整一行
+  /// （含 content / music_style / 设定快照 / 案件信息等所有列）。
+  /// 失败或未登录时返回 null，由调用方决定如何提示。
+  static Future<Map<String, dynamic>?> fetchLatestStoryRow() async {
+    final story = _storyApiUrl; // 形如 http://host/api/generate-story
+    if (story.isEmpty) return null;
+    // 调试端点固定为 /api/story/latest，需把故事生成地址的 /api/generate-story
+    // 替换为 /api/story/latest（不能直接拼接 /latest，否则会得到不存在的
+    // /api/generate-story/latest）。
+    final String url = story.contains('/api/generate-story')
+        ? story.replaceFirst('/api/generate-story', '/api/story/latest')
+        : '$story/latest';
+    final token = await AuthService.ensureToken();
+    final client = http.Client();
+    try {
+      final resp = await client
+          .get(
+            Uri.parse(url),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Content-Type': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 30));
+      if (resp.statusCode != 200) return null;
+      final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
+      if (decoded is Map && decoded['latest'] is Map) {
+        return (decoded['latest'] as Map).cast<String, dynamic>();
+      }
+      return null;
+    } catch (_) {
+      return null;
     } finally {
       client.close();
     }

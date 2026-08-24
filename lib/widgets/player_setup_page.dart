@@ -6,7 +6,7 @@ import 'package:ai_saga/logic/sound_service.dart';
 import 'package:ai_saga/logic/text_width.dart';
 import 'package:ai_saga/logic/trait_defaults.dart';
 
-/// 主角设定页面 - 性别 + 姓名（iOS风格表单）
+/// 主角设定页面 - 姓名 + 特质（iOS风格表单）
 class PlayerSetupPage extends StatefulWidget {
   final VoidCallback onComplete;
   final VoidCallback? onBack;
@@ -30,14 +30,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   final TextEditingController _playerTraitsController = TextEditingController();
   final FocusNode _playerNameFocusNode = FocusNode();
 
-  int _playerGenderIndex = 0; // 0=男, 1=女
-
-  /// 标记用户是否已手动编辑过姓名（防止性别切换时覆盖用户输入）
-  bool _playerNameEdited = false;
-
-  /// 标记用户是否已手动编辑过特质（防止性别切换时覆盖用户输入）
-  bool _playerTraitsEdited = false;
-
   /// 最近一次加载姓名所使用的语言（用于检测语言变更）
   String? _loadedLanguage;
 
@@ -57,23 +49,17 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   void initState() {
     super.initState();
 
-    // 若此前已确认过主角（进入下一页后返回本页），恢复性别与姓名，否则用默认
-    final savedGender = SetupDraft.instance.playerGender;
-    if (savedGender == '女') {
-      _playerGenderIndex = 1;
-    } else if (savedGender == '男') {
-      _playerGenderIndex = 0;
-    }
+    // 若此前已确认过主角（进入下一页后返回本页），恢复姓名与特质，否则用默认
     final savedName = SetupDraft.instance.playerName.trim();
     _playerNameController.text = savedName.isNotEmpty
         ? savedName
-        : _getDefaultName(genderIndex: _playerGenderIndex);
-    // 特质默认值：按性别 + 语言自动填入；用户此前已确认过则恢复已保存值
+        : _getDefaultName();
+    // 特质默认值：自动填入默认文案；用户此前已确认过则恢复已保存值
     final savedTraits = SetupDraft.instance.playerTraits.trim();
     _playerTraitsController.text = savedTraits.isNotEmpty
         ? savedTraits
         : buildDefaultTraits(
-            genderIndex: _playerGenderIndex,
+            genderIndex: 0,
             language: _language,
             location: SetupDraft.instance.location,
           );
@@ -90,11 +76,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
             extentOffset: _playerNameController.text.length,
           );
         });
-        if (!_playerNameEdited) {
-          setState(() {
-            _playerNameEdited = true;
-          });
-        }
       }
     });
   }
@@ -108,17 +89,11 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
       // （延迟到当前帧结束后重置，避免在 build 过程中调用 setState）
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        _playerNameEdited = false;
-        _playerGenderIndex = 0;
         SetupDraft.instance.playerName = '';
-        SetupDraft.instance.playerGender = '';
         SetupDraft.instance.playerTraits = '';
-        _playerNameController.text = _getDefaultName(
-          genderIndex: _playerGenderIndex,
-        );
-        _playerTraitsEdited = false;
+        _playerNameController.text = _getDefaultName();
         _playerTraitsController.text = buildDefaultTraits(
-          genderIndex: _playerGenderIndex,
+          genderIndex: 0,
           language: newLanguage,
           location: SetupDraft.instance.location,
         );
@@ -136,21 +111,18 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
   }
 
   // ──────────────────────────────────────────────
-  // 默认姓名体系（按语言 x 性别）
+  // 默认姓名体系（按语言）
   // ──────────────────────────────────────────────
 
   /// 获取当前语言的代码
   String get _language => StorageService.getLanguage();
 
   /// 获取主角的默认姓名
-  String _getDefaultName({required int genderIndex}) {
-    final lang = _language;
-    final isMale = genderIndex == 0;
-
-    return isMale ? _getPlayerMaleDefault(lang) : _getPlayerFemaleDefault(lang);
+  String _getDefaultName() {
+    return _getPlayerMaleDefault(_language);
   }
 
-  /// 玩家 - 男性默认姓名
+  /// 玩家 - 默认姓名
   String _getPlayerMaleDefault(String language) {
     switch (language) {
       case 'zh-TW':
@@ -171,46 +143,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     }
   }
 
-  /// 玩家 - 女性默认姓名
-  String _getPlayerFemaleDefault(String language) {
-    switch (language) {
-      case 'zh-TW':
-      case 'yue':
-        return '林語嫣';
-      case 'en':
-      case 'es':
-      case 'fr':
-      case 'de':
-      case 'pt':
-        return 'Aurora';
-      case 'ja':
-        return '琴音';
-      case 'ko':
-        return '아린';
-      default:
-        return '林语嫣';
-    }
-  }
-
-  /// 当性别切换时更新默认姓名（仅当用户未手动编辑过）
-  void _onPlayerGenderChanged(int? value) {
-    if (value == null || value == _playerGenderIndex) return;
-    setState(() {
-      _playerGenderIndex = value;
-      if (!_playerNameEdited) {
-        _playerNameController.text = _getDefaultName(genderIndex: value);
-      }
-      if (!_playerTraitsEdited) {
-        // 性别切换时，特质输入框随性别自动换成对应的默认文案
-        _playerTraitsController.text = buildDefaultTraits(
-          genderIndex: value,
-          language: _language,
-          location: SetupDraft.instance.location,
-        );
-      }
-    });
-  }
-
   void _onSubmit() {
     final playerName = _playerNameController.text.trim();
     final playerTraits = _playerTraitsController.text.trim();
@@ -218,7 +150,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     SoundService.playHorror2();
     // 保存主角设定并进入下一步（审核统一在最终确认页进行）
     SetupDraft.instance.playerName = playerName;
-    SetupDraft.instance.playerGender = _playerGenderIndex == 0 ? '男' : '女';
     SetupDraft.instance.playerTraits = playerTraits;
     widget.onComplete();
   }
@@ -295,80 +226,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
         return '당신의 이름';
       default:
         return '您在游戏中的姓名';
-    }
-  }
-
-  /// 根据语言返回本地化的"性别"标签
-  String _getGenderLabel() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '您的性別';
-      case 'en':
-        return 'Your Gender';
-      case 'es':
-        return 'Tu Género';
-      case 'fr':
-        return 'Votre Genre';
-      case 'de':
-        return 'Dein Geschlecht';
-      case 'pt':
-        return 'Seu Gênero';
-      case 'ja':
-        return 'あなたの性別';
-      case 'ko':
-        return '당신의 성별';
-      default:
-        return '您的性别';
-    }
-  }
-
-  /// 根据语言返回本地化的性别选项
-  String _getMaleText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '男';
-      case 'en':
-        return 'Male';
-      case 'es':
-        return 'Masculino';
-      case 'fr':
-        return 'Masculin';
-      case 'de':
-        return 'Männlich';
-      case 'pt':
-        return 'Masculino';
-      case 'ja':
-        return '男性';
-      case 'ko':
-        return '남성';
-      default:
-        return '男';
-    }
-  }
-
-  String _getFemaleText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '女';
-      case 'en':
-        return 'Female';
-      case 'es':
-        return 'Femenino';
-      case 'fr':
-        return 'Féminin';
-      case 'de':
-        return 'Weiblich';
-      case 'pt':
-        return 'Feminino';
-      case 'ja':
-        return '女性';
-      case 'ko':
-        return '여성';
-      default:
-        return '女';
     }
   }
 
@@ -588,58 +445,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                           textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 32),
-                        // 性别选择卡片
-                        Container(
-                          decoration: BoxDecoration(
-                            color: isDark
-                                ? AppTheme.cardBackgroundDark
-                                : AppTheme.cardBackgroundLight,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Column(
-                            children: [
-                              _buildFormRow(
-                                context,
-                                label: _getGenderLabel(),
-                                child: CupertinoSlidingSegmentedControl<int>(
-                                  groupValue: _playerGenderIndex,
-                                  children: {
-                                    0: Text(
-                                      _getMaleText(),
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        color: _playerGenderIndex == 0
-                                            ? (isDark
-                                                  ? AppTheme.primaryTextDark
-                                                  : AppTheme.primaryTextLight)
-                                            : (isDark
-                                                  ? AppTheme.secondaryTextDark
-                                                  : AppTheme
-                                                        .secondaryTextLight),
-                                      ),
-                                    ),
-                                    1: Text(
-                                      _getFemaleText(),
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        color: _playerGenderIndex == 1
-                                            ? (isDark
-                                                  ? AppTheme.primaryTextDark
-                                                  : AppTheme.primaryTextLight)
-                                            : (isDark
-                                                  ? AppTheme.secondaryTextDark
-                                                  : AppTheme
-                                                        .secondaryTextLight),
-                                      ),
-                                    ),
-                                  },
-                                  onValueChanged: _onPlayerGenderChanged,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 16),
                         // 姓名输入卡片
                         Container(
                           decoration: BoxDecoration(
@@ -783,8 +588,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
                                         fontSize: 17,
                                       ),
                                       onChanged: (value) {
-                                        // 用户手动输入后，性别切换不再覆盖其自定义内容
-                                        _playerTraitsEdited = true;
                                         setState(() {});
                                       },
                                     ),

@@ -1,6 +1,6 @@
 # AI SAGA
 
-**AI SAGA** (AI 傳奇 / AI サーガ / AI 사가) is a multilingual, iOS‑style interactive fiction game for Android, iOS, macOS and Web. It lets players build a character and partner, choose a location and era, and then generate an adventure detective–romance story, with every piece of player input **moderated by an AI audit gateway** before it is accepted.
+**AI SAGA** (AI 傳奇 / AI サーガ / AI 사가) is a multilingual, iOS‑style interactive fiction game for Android, iOS, macOS and Web. It lets players set up their protagonist, choose a location and era, and then generate an adventure detective–romance story, with every piece of player input **moderated by an AI audit gateway** before it is accepted.
 
 > This document records the project’s current state, every major improvement made so far, and the reasoning behind each design decision — based on our collaboration history. A dedicated section at the end documents the **AI fiction generation pipeline** (Dify streaming + two-phase moderation + typewriter) and the full Q&A that led to it.
 >
@@ -26,6 +26,14 @@
 >
 > **⚠️ 2026-08-17 update**: the post-generation **outline extraction feature was completely removed** (server, app, and database schema); the `corrent_outlet` context input now carries the **actual previous story text** (read from the `content` column) instead of stored outlines; the case lifecycle was shortened from **20 to 14 rounds** via a `CASE_ROUNDS = 14` constant; and the `corrent_outlet` window was reworked so that a **multiple of 14** passes the full previous arc's text (instead of an empty string) while the immediately-following round passes only that boundary round's text. Read the **[Full Chatflow Summary — Outline Removal, Content-Based Context, 14-Round Case Lifecycle (2026-08-17)](#full-chatflow-summary--outline-removal-content-based-context-14-round-case-lifecycle-2026-08-17)** section at the bottom.
 > **⚠️ 2026-08-17 (incremental moderation)**: the novel-generation content moderation was changed from *"audit the first chunk, then audit the whole remainder at once"* to **incremental sliding-window auditing** — every **400** generated characters trigger an audit, each window advancing 400 new chars plus a **50-char look-back** overlap so boundary text can never slip through: `[0,400)`, `[350,800)`, `[750,1200)`, `[1150,1600)`, … until the whole text is audited. On approval each newly confirmed 400 chars are streamed to the app (first batch as `chunk`, later batches as `reveal`); the typewriter speed is unchanged. The **guardrail (audit) 24-hour quota** was also raised from **2000 to 4000** calls/day. Read the **[Full Chatflow Summary — Incremental Sliding-Window Moderation & Guardrail Quota (2026-08-17)](#full-chatflow-summary--incremental-sliding-window-moderation--guardrail-quota-2026-08-17)** section at the bottom.
+>
+> **⚠️ 2026-08-24 (gender / partner / suspect removal)**: the protagonist's **gender option** and the entire **partner (supporting-character) setup** were **removed** from the app, the FastAPI server, and the database, and the seven **suspect-related** fields were also removed from the server schema and the database. Read the **[Full Chatflow Summary — Removal of Gender, Partner & Suspect Settings (2026-08-24)](#full-chatflow-summary--removal-of-gender-partner--suspect-settings-2026-08-24)** section at the bottom.
+>
+> **⚠️ 2026-08-24 (chatflow summary)**: this session (1) extended the `story_segments` database schema with eight new story-metadata columns and synced them into the server's `CREATE TABLE`; (2) fixed a server bug that left the freshly generated `case_type` / `case_core` empty in the first-generation Dify payload; (3) added an app feature that disables the story page's top-right menu button during generation (with a lock visual and a localized hint) and restores it when generation completes; and (4) created a standalone Dify code-module script (two-layer random prompt-content selection, 11 round interfaces + a `seq` dispatcher) that is kept in Dify for testing and git-ignored. Read the **[Full Chatflow Summary — Session Updates (2026-08-24)](#full-chatflow-summary--session-updates-2026-08-24)** section at the bottom.
+>
+> **⚠️ 2026-08-18 (debug & payload cleanup)**: the **outline** feature was completely purged from the live server code and database (the `story_segments.outline` column was dropped from the main database and its backups; no migration or legacy-compatibility code was kept, per the pre-launch policy). A **debug pre-send confirmation** flow was added — before calling Dify the server first streams the would-be payload to the app (SSE `debug_payload` event), the app shows it in a dialog, and only after the user confirms does the server actually call Dify (new `POST /api/generate-story/confirm`); a `debug_waiting` heartbeat keeps the connection alive while waiting, and the feature is toggled by `DEBUG_PAYLOAD_PREVIEW`. The `language` value sent to Dify switched from codes (`zh`/`en`/`yue`…) to **full names** (`简体中文`/`English`/`粤语（广府话 / Cantonese）`…) via a server-side mapping. The redundant `former_content` input was removed from the Dify payload (its helper function, call site and payload key were deleted). The legacy-named continuation-context variable `corrent_outlet` was renamed to `corrent_case_all_content` (server variable + Dify payload key; the app has no reference to it). Read the **[Full Chatflow Summary — Debug Payload Preview & Prompt-Cleanup (2026-08-18)](#full-chatflow-summary--debug-payload-preview--prompt-cleanup-2026-08-18)** section at the bottom.
+>
+> **⚠️ 2026-08-19 (Dify stream output pollution)**: the Dify fiction-generation workflow intermittently appended the LLM② structured outputs (`action_a` / `action_b` paragraphs and the `music_style` value) to the end of the novel body, and the polluted text was persisted to `story_segments`. Fixed **server-side only** — `text_chunk` events are now filtered by source-node variable path (`STORY_STREAM_SOURCE`), and `workflow_finished` no longer trusts Dify's `outputs["text"]`, using only the streamed novel text instead. Read the **[Full Chatflow Summary — Dify Stream Output Pollution Fix (2026-08-19)](#full-chatflow-summary--dify-stream-output-pollution-fix-2026-08-19)** section at the bottom.
 
 ---
 
@@ -108,7 +116,7 @@ The app was originally created from the default Flutter template (`flutter_appli
 1. **Splash screen** → plays a horror sound effect and fades into the app.
 2. **Language selection** (new users) → 10 languages.
 3. **Lightweight authorization** (first use) → Google on Android, Sign in with Apple on iOS (or a local dev account).
-4. **Story setup wizard**: location → era → player character (gender + name) → partner (gender + name + traits).
+4. **Story setup wizard**: location → era → protagonist (name + personal traits).
 5. **AI moderation** on every submitted setting (via the audit gateway) before the story is unlocked.
 6. **Confirmation page** → server moderation passes → enter the main story page.
 7. **Main story page**: reading panel, action buttons, free-text input — all content is persisted locally.
@@ -1803,3 +1811,242 @@ A temporary fallback was added to store `core_content` whenever the three fields
 ## 6. Key contract reminder
 
 `core_content` = the **prompt** (code node), `core_type` = the type label (code node), and `case_core` = the newline-joined **LLM-generated** `victim_identity` / `death_scene` / `murder_method`. Never store `core_content` as `case_core`.
+
+---
+
+# Full Chatflow Summary — Removal of Gender, Partner & Suspect Settings (2026-08-24)
+
+> An English, desensitized summary of the 2026-08-24 chatflow: the protagonist's **gender option** and the entire **partner (supporting-character) setup** were removed from the app, the FastAPI server, and the database, and the seven **suspect-related** fields were also removed from the server schema and the database. The program is not yet launched, so no legacy-data compatibility or migration-safe code was preserved — the removal is complete and unconditional. **Desensitized** — no secrets, credentials, API keys, server addresses, container names, or real identifiers appear anywhere.
+
+## 1. App: protagonist gender option removed
+
+- [`player_setup_page.dart`](lib/widgets/player_setup_page.dart) now offers only **name + personal traits**. The gender segmented control was removed along with its state (`_playerGenderIndex`), the switch handler (`_onPlayerGenderChanged`), the localized gender labels, and the "don't overwrite typed input on gender switch" guards. The default name and default traits no longer vary by gender.
+- The wizard now reads: **language → location → era → protagonist (name + traits)**.
+
+## 2. App: partner (supporting character) setup page removed entirely
+
+- The partner setup page file was **deleted**. It was removed from the setup `PageView`, together with its registration in the flow and the `playerGenderIndex` it consumed from the protagonist page.
+- The protagonist page now jumps straight to the settings-confirmation page when complete.
+- The internal setup-step numbering was re-numbered to remove the vacated step (0-3 setup pages → confirmation page → main story page), and every reference was updated.
+
+## 3. App: settings confirmation page updated
+
+- [`setup_confirmation_page.dart`](lib/widgets/setup_confirmation_page.dart) no longer shows a **partner card** or the protagonist's **gender row**; the player card now lists name and personality traits only.
+- The moderation text sent for audit no longer includes player gender or any partner fields.
+- The back button returns to the protagonist page.
+
+## 4. App: data-layer cleanup
+
+- [`setup_draft.dart`](lib/logic/setup_draft.dart): removed `playerGender` and the `partnerName` / `partnerGender` / `partnerTraits` fields.
+- [`story_service.dart`](lib/logic/story_service.dart): the story-generation request no longer carries `player_gender` or any partner field in its parameters or payload.
+- [`home_content.dart`](lib/logic/home_content.dart): removed the partner page wiring and the `_playerGenderIndex` state.
+
+## 5. Server (FastAPI): gender & partner code removed
+
+All occurrences of the protagonist gender and the partner settings were removed from [`server/main.py`](server/main.py):
+
+- **Schema**: the `story_segments` `CREATE TABLE` no longer defines `player_gender`, `partner_gender`, `partner_name`, or `partner_traits`.
+- **Pydantic model** (`StoryInputData`): the four fields were removed.
+- **Persistence**: the `INSERT` into `story_segments` (column list, placeholders, and bound values, 20 → 16 items) was rewritten without them.
+- **Settings resolution** (`_resolve_story_settings`): the request dict, the "first round or continuation" detection list, and the continuation `SELECT` were all updated.
+- **Cost estimation**: the input-token estimate no longer concatenates these fields.
+- **Dify payload**: the workflow `inputs` no longer include `player_gender` or the partner keys.
+- **Debug endpoint** `/api/story/latest`: its `SELECT` was updated.
+
+## 6. Database: gender & partner columns dropped
+
+- Four columns — `player_gender`, `partner_gender`, `partner_name`, `partner_traits` — were **dropped** from `story_segments` (a backup was taken first).
+- `story_segments` keeps `location`, `era`, `player_name`, `player_traits`, and `language` as the setting snapshots.
+
+## 7. Server (FastAPI): suspect fields removed
+
+- The suspect fields were only declared in the schema (never read or written by any query), so removal was limited to the `CREATE TABLE`: `suspect_1_name`, `suspect_1_setting`, `suspect_2_name`, `suspect_2_setting`, `suspect_3_name`, `suspect_3_setting`, and `current_suspect_reason` were deleted from the schema definition.
+- `python3 -m py_compile` passes.
+
+## 8. Database: suspect columns dropped
+
+- The seven suspect columns above were **dropped** from `story_segments` (a backup was taken first); the table keeps `current_aura`.
+
+## 9. Flutter: no suspect references
+
+- A repository-wide search for `suspect` / `嫌疑人` / `current_suspect` found **zero** references in the Flutter app; no app changes were needed for the suspect removal.
+
+## 10. Deployment & verification
+
+- The updated server code was deployed to the running FastAPI container (hot reload via the deployment script) and verified **byte-identical** to the local source.
+- `/api/health` returned `200`; the container logs show a clean reload with no errors.
+- `flutter analyze` passes with no issues after the app-side changes.
+
+### Current `story_segments` columns (18)
+
+`id, user_id, seq, content, created_at, choice_1, choice_2, choice_3, user_choice, music_style, location, era, player_name, player_traits, language, case_type, case_core, current_aura`
+
+Gender, partner, and suspect settings are no longer part of the story schema on the server or in the app.
+
+---
+
+# Full Chatflow Summary — Session Updates (2026-08-24)
+
+> An English, desensitized summary of this session. It covers four areas: (1) extending the `story_segments` database schema with new story-metadata columns; (2) fixing a server bug where the freshly generated `case_type` / `case_core` were empty in the first-generation Dify payload; (3) an app feature that disables the story page's top-right menu button while the novel is being generated and restores it afterwards; and (4) a standalone Dify code-module script for two-layer random prompt-content selection. **Desensitized** — no secrets, credentials, API keys, server addresses, container names, or real identifiers appear anywhere.
+
+## 1. Database: `story_segments` schema extended
+
+- Added the following columns to `story_segments` (SQLite `ALTER TABLE`, all `TEXT DEFAULT ''`), applied directly to the live database and mirrored in the server's `CREATE TABLE` schema:
+  - `current_aura` — the atmosphere of the current story segment;
+  - `current_suspect_reason` — the current suspect direction and the reason for it;
+  - `suspect_1_name`, `suspect_1_setting`, `suspect_2_name`, `suspect_2_setting`, `suspect_3_name`, `suspect_3_setting` — up to three suspects' names and settings.
+- The schema definition in `server/main.py` was updated to match, then deployed in place into the running FastAPI container (health check returned HTTP 200).
+- Verified: all new columns present in the live table; existing rows untouched.
+
+## 2. Server: `case_type` / `case_core` no longer empty in the first-generation Dify payload
+
+- **Bug**: on a brand-new novel (round `seq == 0`), the Dify story-generation payload sent `case_type` and `case_core` as empty strings. The case was only generated *after* streaming finished, inside persistence, so the values never reached the story prompt.
+- **Fix** in `generate_story`:
+  - For any new-case round (`seq % CASE_ROUNDS == 0`), the server now generates the case **before** building the payload and writes it into `settings`, so the payload (and the debug-payload preview) carries the freshly generated values.
+  - The same pre-generated case is passed into `_persist_story_segment` via a new `case_meta` parameter, reusing it instead of calling the case workflow a second time (avoids two different generated cases / a wasted Dify call).
+- Deployed in place; `/api/health` returns `200`.
+
+## 3. App: top-right menu button disabled during story generation
+
+- Added a global `storyStreamingNotifier` in `home_content.dart` that mirrors the internal `_storyStreaming` flag; it is updated at every point where generation starts and ends (new-novel flow, continuation flow, and all terminal paths — `done`, `abort`, `error`, quota/limit, auth failure, empty output).
+- The story page's top-right menu button now listens to it:
+  - **During generation**: the button is **non-clickable** — tapping shows a brief auto-dismissing localized toast ("正在生成中，菜单暂不可用" / "Generating… menu unavailable" / etc.) instead of opening the menu. Its visual switches to a muted grey **lock icon** on a dimmed background to signal "busy/locked" at a glance.
+  - **After generation**: it returns to the normal blue hamburger icon and re-opens the menu sheet as before.
+- `flutter analyze` passes with no issues.
+
+## 4. Dify code-module script (two-layer random prompt-content selection)
+
+- A standalone Python script (workspace root, git-ignored via the root `.gitignore`) intended for a Dify **code node**, implementing:
+  - **Layer 1**: 5 categories, each a 5-element array; one element is picked per category with `random.choice`.
+  - **Layer 2**: 3 variables, each built as `"第二层第X类" + <layer-1 category X random value> + "内容一"`.
+  - **Final**: after the three layer-2 values are formed, one is randomly chosen as the result.
+- Exposes `script_1_round_0` … `script_1_round_10` (11 self-contained interface functions, each fully inlined so a round can be customized independently) plus a `main(seq: int) -> dict` dispatcher that runs the matching round (falling back to round 0 out of range) and returns `{"result": <string>}` for Dify's output variable.
+- **Decision**: kept in Dify for now (easiest to test on the canvas); may be migrated into FastAPI later. It remains a single self-contained file with no cross-file imports.
+- Also made two small housekeeping changes: a workspace `.vscode/settings.json` enabling editor word-wrap (display only), and a root `.gitignore` entry so the Dify script is not uploaded.
+
+---
+
+# Full Chatflow Summary — Dify Stream Output Pollution Fix (2026-08-19)
+
+> An English, desensitized summary of this chatflow: the Dify fiction-generation workflow **intermittently** appended the LLM② structured outputs — the two recommended-action paragraphs and the music-style value — to the end of the novel body text, and the polluted text was **persisted** into `story_segments` (so it could reappear after a restart or a cold-start sync). The fix is entirely **server-side**; no app (Flutter) changes were required. **Desensitized** — no credentials, API keys, server addresses, container names, or real node identifiers appear anywhere.
+
+## 1. Symptom
+
+- During story generation, the streaming novel body (the "typing stream") sometimes also printed the two recommended actions (`action_a` / `action_b`) and the music style (`music_style`) that belong to **LLM②'s structured output**.
+- The pollution was **intermittent** ("sometimes"), and the polluted text was written to `story_segments.content`, so it would reappear even after the live stream — via the cold-start sync that pulls segments from the database.
+- Confirmed in the database: the polluted rows end with `choice_2` (the `action_a` paragraph), `choice_3` (the `action_b` paragraph), and the `music_style` value, in sequence; clean rows contain none of them.
+
+## 2. Root cause
+
+- The app has a single body-window path: it renders exactly the `chunk` / `reveal` `text` the server sends, and the server relays Dify's streamed text verbatim (`text_chunk` → `full_text`).
+- The server accumulated **all** Dify `text_chunk` events into `full_text`, and at `workflow_finished` it preferred Dify's `outputs["text"]` as the authoritative body text.
+- The Dify workflow's final text output concatenated the novel with the action choices and the music style, so whenever that concatenated value (or the extra streamed text) reached the body path, the pollution appeared — and it was then persisted as the new segment.
+
+## 3. Fixes (server only, in [`server/main.py`](server/main.py))
+
+### 3.1 `text_chunk` source filtering ([`server/main.py`](server/main.py:2085))
+
+- Dify's `text_chunk` events carry `from_variable_selector` (the source node's variable path). A new environment variable `STORY_STREAM_SOURCE` configures the **novel node's variable-path prefix**; when set, the server only accumulates `text_chunk` text from that source and **drops text streamed by any other node** (e.g., the structured/answer node that leaks the action + music text into the stream).
+- When `from_variable_selector` is missing (older Dify / field absent), the server logs a warning and keeps the text (fail-open), so the pipeline still works.
+
+### 3.2 `workflow_finished` uses only the streamed text ([`server/main.py`](server/main.py:2117))
+
+- The authoritative body is now `_clean_story_text(full_text)` — the filtered, streamed novel text only. Dify's `outputs["text"]` is **no longer trusted** (it was the concatenated / polluted value), which fixes both the live display and the persistence path.
+
+### 3.3 Debug logging (added, then removed)
+
+- Temporary logging was added to enumerate every `text_chunk` source (`from_variable_selector`) and to confirm the final body length, in order to pinpoint which Dify node was leaking the text. Once the fix was verified, **all debug/test logging was removed**; only the functional filter and its minimal operational warnings remain.
+
+## 4. Deployment
+
+- The updated `server/main.py` was uploaded to the production host and verified **byte-identical** to the local source (MD5 match).
+- `STORY_STREAM_SOURCE` was set to the novel node's variable-path prefix in the server's environment file, and the FastAPI container was **recreated** so the new environment variable takes effect.
+- The container runs uvicorn with `--reload` over a bind-mounted `main.py`; verified up with a clean startup (no errors) and correct port mapping.
+
+## 5. Verification
+
+- After the fix, new story segments persisted with **clean body text** (no trailing action/music content); a generation run confirmed the final body length matches the streamed novel length only.
+- No app (Flutter) changes were required — the app already handled structured outputs correctly by filling the action input boxes from `choice_2` / `choice_3`.
+
+## 6. Notes
+
+- During the pre-launch debugging phase, **no historical-data migration or cleanup** was performed and **no backward-compatibility / legacy-protection code** was added, per the project's standing policy for this stage.
+- The fix is a server-side safety net; the most thorough cure remains in the Dify canvas itself — prevent the structured node from streaming, and stop embedding the action + music variables into the body text output.
+
+---
+
+# Full Chatflow Summary — Debug Payload Preview & Prompt-Cleanup (2026-08-18)
+
+> An English, desensitized summary of this chatflow. It covers five areas: (1) the **complete purge of the `outline` feature** from the live server code and database (no migration or legacy-compatibility code kept); (2) a **debug pre-send confirmation** flow that lets a developer inspect the exact Dify payload before it is actually sent; (3) sending the **full language name** (not a code) to Dify; (4) **removing the redundant `former_content` input** from the Dify payload; and (5) **renaming** the continuation-context variable `corrent_outlet` to `corrent_case_all_content`. **Desensitized** — no secrets, credentials, API keys, server addresses, container names, or real identifiers appear anywhere.
+
+## 1. The `outline` feature is purged from the live environment
+
+- The post-generation **outline** column and all related logic had already been removed from the committed server code in an earlier change; this session finished the job on the **live environment**:
+  - **Server code**: the deployed FastAPI `main.py` no longer contains any `outline` / `outlet` references (`grep` returns zero matches). The `_extract_story_meta()` no longer maps `outlet`/`outline`, `_has_inference_outputs()` gates persistence on the three inference values (`music_style`, `action_a`, `action_b`), and the debug endpoint `/api/story/latest` no longer selects `outline`.
+  - **Database**: the `story_segments.outline` column was dropped (`ALTER TABLE … DROP COLUMN outline`) from the **live database** and from **both backup database files**, so no trace of the column remains.
+  - No historical-data migration or legacy-compatibility code was kept, per the standing pre-launch policy.
+- Verification: local and deployed `main.py` are byte-identical (MD5 match); the health endpoint returns HTTP 200; the debug "latest DB row" dialog no longer shows an `[outline]` field.
+
+## 2. Debug pre-send confirmation (payload preview & confirm)
+
+A developer-facing gate was added so a generated Dify payload can be inspected before it is actually dispatched.
+
+- **Server** ([`server/main.py`](server/main.py)):
+  - A new flag `DEBUG_PAYLOAD_PREVIEW` (default **on** during development; set to `0` to disable) and `DEBUG_PAYLOAD_CONFIRM_TIMEOUT` (default 300 s) control the behavior.
+  - In the streaming generator of `POST /api/generate-story`, *before* calling Dify, the server now:
+    1. generates a `request_id`, registers an `asyncio.Event` in a pending-confirmations registry;
+    2. yields an SSE event `{"event": "debug_payload", "request_id": …, "payload": <the exact payload>}` back to the app;
+    3. waits for the app to confirm — sending a `debug_waiting` heartbeat every 15 s to keep the client's 40 s no-data stall detector from firing;
+    4. only after confirmation does it actually open the Dify stream; on timeout it cancels the generation with an error event.
+  - A new endpoint `POST /api/generate-story/confirm` accepts a `request_id`, validates the caller, and sets the matching event so the waiting stream proceeds.
+- **App** ([`story_service.dart`](lib/logic/story_service.dart), [`home_content.dart`](lib/logic/home_content.dart)):
+  - `generateStoryStream()` accepts a new `onDebugPayload(payload, requestId)` callback and handles the `debug_payload` and `debug_waiting` SSE events (the latter ignored).
+  - A new static `confirmPayload(requestId)` POSTs to `/api/generate-story/confirm`.
+  - Both generation entry points — the continue/time-tree flow (`_continueStory`) and the first-generation flow (`_onSetupConfirmed`) — register a debug dialog `_showDebugPayloadDialog` that shows the formatted payload JSON in a read-only selectable field with a **"确认发送" (Confirm & Send)** button; tapping it calls `confirmPayload` and lets the server proceed.
+- Effect: clicking any "generate new segment" button now pops up the payload for inspection; only after confirming is Dify actually invoked.
+
+## 3. `language` sent to Dify as a full name, not a code
+
+- Previously the Dify payload carried the app's language **code** (`zh`, `en`, `yue`, …). This session added a server-side mapping `_dify_language_name()` so the LLM receives an unambiguous full name:
+
+  | App code | Sent to Dify |
+  |---|---|
+  | `zh` | 简体中文 |
+  | `zh-TW` | 繁體中文 |
+  | `yue` | 粤语（广府话 / Cantonese） |
+  | `en` | English |
+  | `ja` | 日本語 |
+  | `ko` | 한국어 |
+  | `es` | Español |
+  | `fr` | Français |
+  | `de` | Deutsch |
+  | `pt` | Português |
+  | unknown / empty | 简体中文 (fallback) |
+
+- Only the Dify payload is affected; the `story_segments.language` snapshot column still stores the code (used by the app for language restoration), and the case-generation workflow (`inputs` is empty) is unaffected.
+
+## 4. `former_content` removed from the Dify payload
+
+- The `former_content` input (the latest segment's text, used as a short continuation hook) was deemed redundant now that the full case text is passed as `corrent_case_all_content`. It was removed completely:
+  - the `_get_former_content()` helper, its call site, and the `"former_content"` payload key were all deleted;
+  - the Dify payload's continuation context is now **only** `corrent_case_all_content`.
+- `grep former_content` returns zero matches in the server code.
+
+## 5. `corrent_outlet` renamed to `corrent_case_all_content`
+
+- The continuation-context input variable was renamed because its content changed (it no longer holds outlines but the full current-case story text).
+- **Server**: the variable assignment, the payload key, and all related comments were renamed to `corrent_case_all_content` (`grep corrent_outlet` returns zero matches).
+- **App**: `lib/` contains **no** reference to `corrent_outlet`/`corrent` (the app only displays the payload verbatim), so no app change was required.
+- **Caution**: `corrent_case_all_content` is an input **key sent to Dify** — the Dify workflow's Start node must use the same input variable name (`corrent_case_all_content`); if the canvas still declares `corrent_outlet`, it must be renamed in the Dify canvas or the field will not be received.
+
+## 6. Verification
+
+- `python3 -m py_compile server/main.py` passes; `flutter analyze lib/logic/story_service.dart lib/logic/home_content.dart` reports no issues.
+- Server deployed in place into the running FastAPI container; health endpoint returns `200`; local and deployed `main.py` MD5 match.
+- Live checks: `grep -c corrent_outlet /code/main.py` → `0`; `grep -c former_content /code/main.py` → `0`; `corrent_case_all_content` present in the payload; the `outline` column absent from the live database and backups; the `language` mapping function returns the expected full names.
+
+## 7. Notes
+
+- As this is the pre-launch debugging stage, **no historical-data migration, no backward-compatibility, and no legacy-protection code** were added for any of the changes above (per the project's standing policy).
+- The debug pre-send confirmation is **on by default** for development; remember to set `DEBUG_PAYLOAD_PREVIEW=0` before production.
+- The Dify canvas must be kept in sync for two things: the renamed input variable `corrent_case_all_content`, and the language field now carrying full names instead of codes.

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
@@ -14,7 +15,6 @@ import 'package:ai_saga/widgets/initialization_page.dart';
 import 'package:ai_saga/widgets/location_setup_page.dart';
 import 'package:ai_saga/widgets/era_setup_page.dart';
 import 'package:ai_saga/widgets/player_setup_page.dart';
-import 'package:ai_saga/widgets/character_setup_page.dart';
 
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
@@ -139,6 +139,10 @@ class _RenderSizeReporting extends RenderProxyBox {
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
 
+/// 是否正在生成小说正文（流式进行中）的通知器。
+/// 用于让右上角菜单按钮在生成期间禁用并给出视觉提示，生成完成后恢复可点击。
+final ValueNotifier<bool> storyStreamingNotifier = ValueNotifier<bool>(false);
+
 /// 正文中的用户选择节点（未来"时间树"返回功能的数据点）
 class _ChoiceRecord {
   /// 用户选择的内容
@@ -171,11 +175,8 @@ class _HomeContentState extends State<HomeContent>
       _CompensatingScrollController();
   late final PageController _pageController;
 
-  /// 主角性别: 0=男, 1=女, null=未设定（用于传递给搭档页面决定默认性别）
-  int? _playerGenderIndex;
-
-  /// 0=语言选择, 1=地点设定, 2=年代设定, 3=主角设定, 4=搭档设定,
-  /// 5=设置确认页（倒计时）, 6=正式主页面
+  /// 0=语言选择, 1=地点设定, 2=年代设定, 3=主角设定,
+  /// 4=设置确认页, 5=正式主页面
   int _setupStep = 0;
 
   /// 最近一次确认的语言（用于检测语言变化，从而重置后续设置页）
@@ -285,7 +286,7 @@ class _HomeContentState extends State<HomeContent>
     //   （含安卓/苹果老用户换新设备：账号稳定，仍能识别出有历史正文）；
     // - 服务器上没有存储任何小说正文 → 新用户，从头（语言页）重新开始设置。
     // 先进入主内容分支显示"同步/验证中"页面，同步完成后按服务器数据决定去向。
-    _setupStep = 6;
+    _setupStep = 5;
     showMenuNotifier.value = true;
     _startupSyncing = true;
     _performStartupSync();
@@ -520,7 +521,7 @@ class _HomeContentState extends State<HomeContent>
           // 推荐选择已就绪：标记为已有并激活输入区，最新段输入框可显示
           _hasRecommendedActions = true;
           _storyInputsShown = true;
-          _setupStep = 6;
+          _setupStep = 5;
         } else {
           // 新用户（服务器没有任何小说正文）：从语言页重新开始设置
           SetupDraft.instance.reset();
@@ -730,6 +731,7 @@ class _HomeContentState extends State<HomeContent>
     bool hadContent = false;
     setState(() {
       _storyStreaming = true;
+      storyStreamingNotifier.value = true;
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
       _generationStartLen = _storyTexts.length; // 记录本轮生成前的段数（用于"新内容未到达"占位）
@@ -793,6 +795,10 @@ class _HomeContentState extends State<HomeContent>
         rewriteFrom: rewriteFrom,
         onDeviceConflict: _onDeviceConflict,
         onStalled: _onStreamStalled,
+        // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
+        onDebugPayload: (payload, requestId) {
+          _showDebugPayloadDialog(payload, requestId);
+        },
         onChunk: (text) {
           if (!mounted) return;
           if (text.trim().isNotEmpty) hadContent = true;
@@ -843,6 +849,7 @@ class _HomeContentState extends State<HomeContent>
               }
               _storyTyped = true;
               _storyStreaming = false; // 弹窗关闭后恢复等待输入状态
+              storyStreamingNotifier.value = false;
             });
           });
         },
@@ -868,6 +875,7 @@ class _HomeContentState extends State<HomeContent>
           }
           setState(() {
             _storyStreaming = false; // 正文已全部接收完成
+            storyStreamingNotifier.value = false;
           });
           _applyRecommendedActions(outputs);
           if (!_hasRecommendedActions) {
@@ -1167,7 +1175,7 @@ class _HomeContentState extends State<HomeContent>
           transitionBuilder: (Widget child, Animation<double> animation) {
             return FadeTransition(opacity: animation, child: child);
           },
-          child: _setupStep < 5
+          child: _setupStep < 4
               ? KeyedSubtree(
                   key: const ValueKey('setup_pages'),
                   child: PageView(
@@ -1232,19 +1240,15 @@ class _HomeContentState extends State<HomeContent>
                           );
                         },
                       ),
-                      // 第3页：主角设定（性别 + 姓名）
+                      // 第3页：主角设定（姓名 + 特质）
                       PlayerSetupPage(
                         languageKey: StorageService.getLanguage(),
                         onComplete: () {
-                          final genderStr = SetupDraft.instance.playerGender;
                           setState(() {
-                            _playerGenderIndex = genderStr == '女' ? 1 : 0;
+                            // 主角设定完成 → 进入设置确认页（step 4）
+                            _setupStep = 4;
+                            showMenuNotifier.value = false;
                           });
-                          _pageController.animateToPage(
-                            4,
-                            duration: const Duration(milliseconds: 500),
-                            curve: Curves.easeInOut,
-                          );
                         },
                         onBack: () {
                           _pageController.animateToPage(
@@ -1254,35 +1258,16 @@ class _HomeContentState extends State<HomeContent>
                           );
                         },
                       ),
-                      // 第4页：搭档设定（性别 + 姓名 + 特质）
-                      CharacterSetupPage(
-                        playerGenderIndex: _playerGenderIndex,
-                        languageKey: StorageService.getLanguage(),
-                        onComplete: () {
-                          setState(() {
-                            // 审核通过 → 进入设置确认页（step 5）
-                            _setupStep = 5;
-                            showMenuNotifier.value = false;
-                          });
-                        },
-                        onBack: () {
-                          _pageController.animateToPage(
-                            3,
-                            duration: const Duration(milliseconds: 500),
-                            curve: Curves.easeInOut,
-                          );
-                        },
-                      ),
                     ],
                   ),
                 )
-              : _setupStep == 5
+              : _setupStep == 4
               ? KeyedSubtree(
                   key: const ValueKey('setup_confirmation'),
                   child: SetupConfirmationPage(
                     onEdit: _onEditSetting,
                     onConfirmed: _onSetupConfirmed,
-                    onBack: () => _onEditSetting(4),
+                    onBack: () => _onEditSetting(3),
                   ),
                 )
               : KeyedSubtree(
@@ -1480,6 +1465,7 @@ class _HomeContentState extends State<HomeContent>
       _blackoutActive = true;
       _blackoutController.value = 0; // 动画起点：覆盖层透明（下方设置确认页可见）
       _storyStreaming = true;
+      storyStreamingNotifier.value = true;
       _storyTyped = false;
       _hasRecommendedActions = false; // 本轮尚未收到推荐选择前不显示输入框
       _storyInputsShown = false; // 全新生成：输入区先隐藏，待首轮收到推荐后再激活
@@ -1501,7 +1487,7 @@ class _HomeContentState extends State<HomeContent>
     _transitionStepTimer = Timer(const Duration(seconds: 6), () {
       if (!mounted) return;
       setState(() {
-        _setupStep = 6;
+        _setupStep = 5;
         showMenuNotifier.value = true;
       });
     });
@@ -1525,14 +1511,14 @@ class _HomeContentState extends State<HomeContent>
         location: SetupDraft.instance.location,
         era: SetupDraft.instance.era,
         playerName: SetupDraft.instance.playerName,
-        playerGender: SetupDraft.instance.playerGender,
         playerTraits: SetupDraft.instance.playerTraits,
-        partnerName: SetupDraft.instance.partnerName,
-        partnerGender: SetupDraft.instance.partnerGender,
-        partnerTraits: SetupDraft.instance.partnerTraits,
         language: StorageService.getLanguage(),
         onDeviceConflict: _onDeviceConflict,
         onStalled: _onStreamStalled,
+        // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
+        onDebugPayload: (payload, requestId) {
+          _showDebugPayloadDialog(payload, requestId);
+        },
         onChunk: (text) {
           if (!mounted) return;
           if (text.trim().isNotEmpty) hadContent = true;
@@ -1569,9 +1555,10 @@ class _HomeContentState extends State<HomeContent>
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
-            _setupStep = 6;
+            _setupStep = 5;
             showMenuNotifier.value = true;
             _storyStreaming = false;
+            storyStreamingNotifier.value = false;
             _storyTyped = true;
           });
           _abortBlackoutTransition();
@@ -1586,6 +1573,7 @@ class _HomeContentState extends State<HomeContent>
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
             _storyStreaming = false;
+            storyStreamingNotifier.value = false;
             _storyTyped = true;
           });
           _abortBlackoutTransition();
@@ -1603,6 +1591,7 @@ class _HomeContentState extends State<HomeContent>
                 _storyTexts.removeRange(preStreamLen, _storyTexts.length);
               }
               _storyStreaming = false;
+              storyStreamingNotifier.value = false;
               _storyTyped = true;
             });
             _abortBlackoutTransition();
@@ -1611,6 +1600,7 @@ class _HomeContentState extends State<HomeContent>
           }
           setState(() {
             _storyStreaming = false; // 正文已全部接收完成
+            storyStreamingNotifier.value = false;
           });
           _applyRecommendedActions(outputs);
           if (!_hasRecommendedActions) {
@@ -1627,6 +1617,7 @@ class _HomeContentState extends State<HomeContent>
       if (!mounted) return;
       setState(() {
         _storyStreaming = false;
+        storyStreamingNotifier.value = false;
         _storyTyped = true;
       });
       _abortBlackoutTransition();
@@ -1636,6 +1627,7 @@ class _HomeContentState extends State<HomeContent>
       if (!mounted || retryDepth >= 2) {
         setState(() {
           _storyStreaming = false;
+          storyStreamingNotifier.value = false;
           _storyTyped = true;
         });
         _abortBlackoutTransition();
@@ -1646,6 +1638,7 @@ class _HomeContentState extends State<HomeContent>
       if (!reauthed || !mounted) {
         setState(() {
           _storyStreaming = false;
+          storyStreamingNotifier.value = false;
           _storyTyped = true;
         });
         _abortBlackoutTransition();
@@ -1661,6 +1654,7 @@ class _HomeContentState extends State<HomeContent>
       if (!mounted) return;
       setState(() {
         _storyStreaming = false;
+        storyStreamingNotifier.value = false;
         _storyTyped = true;
       });
       _abortBlackoutTransition();
@@ -2572,6 +2566,61 @@ class _HomeContentState extends State<HomeContent>
       buf.writeln('----------------');
     });
     return buf.toString();
+  }
+
+  /// 【调试】生成前确认弹窗：展示服务器即将发送给 Dify 的 payload JSON。
+  ///
+  /// 点击任一生成按钮后，服务器在真正调 Dify 之前先通过 SSE 事件 debug_payload
+  /// 把 payload 发回 App。这里用只读文本弹窗展示（可选中/复制），
+  /// 用户点"确认发送"后调用 [StoryService.confirmPayload] 通知服务器放行本次生成。
+  Future<void> _showDebugPayloadDialog(
+    Map<String, dynamic> payload,
+    String requestId,
+  ) async {
+    if (!mounted) return;
+    String body;
+    try {
+      body = const JsonEncoder.withIndent('  ').convert(payload);
+    } catch (_) {
+      body = payload.toString();
+    }
+    final TextEditingController ctrl = TextEditingController(text: body);
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('调试 · 待发送给 Dify 的 payload（确认后发送）'),
+        content: SizedBox(
+          width: 460,
+          height: 420,
+          child: CupertinoTextField(
+            controller: ctrl,
+            readOnly: true, // 只读：可选中/复制，不可编辑
+            maxLines: null,
+            minLines: null,
+            expands: true, // 填满 460x420 区域，超高内容内部滚动
+            keyboardType: TextInputType.multiline,
+            padding: const EdgeInsets.all(12),
+            decoration: null,
+            cursorColor: const Color(0x00000000),
+            style: const TextStyle(fontSize: 12),
+            enableInteractiveSelection: true,
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () async {
+              // 通知服务器放行本次生成（服务器收到后才真正调 Dify）
+              await StoryService.confirmPayload(requestId);
+              if (context.mounted) Navigator.of(context).pop();
+            },
+            child: const Text('确认发送'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
   }
 
   /// 生成失败弹窗：仅提供"重启 App"按钮。

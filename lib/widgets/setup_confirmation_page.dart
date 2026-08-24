@@ -12,11 +12,11 @@ import 'package:ai_saga/widgets/audit_dialog.dart';
 /// 跳回对应设置页；底部"确定"按钮先进行服务器审核，审核通过后
 /// 立即调用 [onConfirmed] 进入正式主页面。
 class SetupConfirmationPage extends StatefulWidget {
-  /// 各设置的"编辑"跳转回调：index 对应 0=语言,1=地点,2=年代,3=主角,4=搭档
+  /// 各设置的"编辑"跳转回调：index 对应 0=语言,1=地点,2=年代,3=主角
   final void Function(int index) onEdit;
   final VoidCallback onConfirmed;
 
-  /// 左上角"返回"回调：跳回上一页（搭档设定）
+  /// 左上角"返回"回调：跳回上一页（主角设定）
   final VoidCallback onBack;
 
   const SetupConfirmationPage({
@@ -57,68 +57,6 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
         return '简体中文';
       default:
         return code.isEmpty ? '—' : code;
-    }
-  }
-
-  /// 将存储的性别（'男'/'女'）转换为当前语言的显示文本
-  String _genderText(String gender) {
-    switch (gender) {
-      case '男':
-        return _getMaleText();
-      case '女':
-        return _getFemaleText();
-      default:
-        return gender.isEmpty ? '—' : gender;
-    }
-  }
-
-  /// 根据语言返回本地化的"男性"文本
-  String _getMaleText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '男';
-      case 'en':
-        return 'Male';
-      case 'es':
-        return 'Masculino';
-      case 'fr':
-        return 'Masculin';
-      case 'de':
-        return 'Männlich';
-      case 'pt':
-        return 'Masculino';
-      case 'ja':
-        return '男性';
-      case 'ko':
-        return '남성';
-      default:
-        return '男';
-    }
-  }
-
-  /// 根据语言返回本地化的"女性"文本
-  String _getFemaleText() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '女';
-      case 'en':
-        return 'Female';
-      case 'es':
-        return 'Femenino';
-      case 'fr':
-        return 'Féminin';
-      case 'de':
-        return 'Weiblich';
-      case 'pt':
-        return 'Feminino';
-      case 'ja':
-        return '女性';
-      case 'ko':
-        return '여성';
-      default:
-        return '女';
     }
   }
 
@@ -219,56 +157,6 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
         return '주인공';
       default:
         return '主角';
-    }
-  }
-
-  /// 根据语言返回本地化的"搭档"标签
-  String _getPartnerLabel() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '搭檔';
-      case 'en':
-        return 'Partner';
-      case 'es':
-        return 'Compañero/a';
-      case 'fr':
-        return 'Partenaire';
-      case 'de':
-        return 'Partner';
-      case 'pt':
-        return 'Parceiro/a';
-      case 'ja':
-        return 'パートナー';
-      case 'ko':
-        return '파트너';
-      default:
-        return '搭档';
-    }
-  }
-
-  /// 根据语言返回本地化的"性别"标签
-  String _getGenderLabel() {
-    switch (_language) {
-      case 'zh-TW':
-      case 'yue':
-        return '性別';
-      case 'en':
-        return 'Gender';
-      case 'es':
-        return 'Género';
-      case 'fr':
-        return 'Genre';
-      case 'de':
-        return 'Geschlecht';
-      case 'pt':
-        return 'Gênero';
-      case 'ja':
-        return '性別';
-      case 'ko':
-        return '성별';
-      default:
-        return '性别';
     }
   }
 
@@ -439,12 +327,8 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     final sb = StringBuffer();
     sb.writeln('Location: ${SetupDraft.instance.location}');
     sb.writeln('Era: ${SetupDraft.instance.era}');
-    sb.writeln('Player Gender: ${SetupDraft.instance.playerGender}');
     sb.writeln('Player Name: ${SetupDraft.instance.playerName}');
-    sb.writeln('Player Traits: ${SetupDraft.instance.playerTraits}');
-    sb.writeln('Partner Gender: ${SetupDraft.instance.partnerGender}');
-    sb.writeln('Partner Name: ${SetupDraft.instance.partnerName}');
-    sb.write('Partner Traits: ${SetupDraft.instance.partnerTraits}');
+    sb.write('Player Traits: ${SetupDraft.instance.playerTraits}');
     return sb.toString();
   }
 
@@ -453,7 +337,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     widget.onConfirmed();
   }
 
-  /// 左上角"返回"：跳回上一页（搭档设定）
+  /// 左上角"返回"：跳回上一页（主角设定）
   void _onBackPressed() {
     widget.onBack();
   }
@@ -538,18 +422,9 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
               _buildCharacterCard(
                 isDark,
                 label: _getPlayerLabel(),
-                gender: _genderText(SetupDraft.instance.playerGender),
                 name: SetupDraft.instance.playerName,
                 traits: SetupDraft.instance.playerTraits,
                 onEdit: () => widget.onEdit(3),
-              ),
-              _buildCharacterCard(
-                isDark,
-                label: _getPartnerLabel(),
-                gender: _genderText(SetupDraft.instance.partnerGender),
-                name: SetupDraft.instance.partnerName,
-                traits: SetupDraft.instance.partnerTraits,
-                onEdit: () => widget.onEdit(4),
               ),
               Padding(
                 padding: const EdgeInsets.only(top: 24),
@@ -632,11 +507,10 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     );
   }
 
-  /// 主角/搭档卡片：性别、姓名、性格设定逐项清晰展示
+  /// 主角卡片：姓名、性格设定逐项清晰展示
   Widget _buildCharacterCard(
     bool isDark, {
     required String label,
-    required String gender,
     required String name,
     required String? traits,
     required VoidCallback onEdit,
@@ -684,7 +558,6 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
             ],
           ),
           const SizedBox(height: 6),
-          _buildCharacterRow(isDark, _getGenderLabel(), gender),
           _buildCharacterRow(isDark, _getNameLabel(), name),
           if (traits != null && traits.isNotEmpty)
             _buildCharacterRow(isDark, _getTraitsLabel(), traits),

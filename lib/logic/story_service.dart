@@ -42,11 +42,7 @@ class StoryService {
     String location = '',
     String era = '',
     String playerName = '',
-    String playerGender = '',
     String playerTraits = '',
-    String partnerName = '',
-    String partnerGender = '',
-    String partnerTraits = '',
     String language = '',
     required void Function(String text) onChunk,
     required void Function(String text, Map<String, dynamic> outputs) onReveal,
@@ -54,6 +50,9 @@ class StoryService {
     required void Function(String message, {String? code}) onError,
     void Function()? onDeviceConflict,
     void Function()? onStalled,
+    // 【调试】生成前确认：服务器在调 Dify 前把 payload 发回 App（SSE 事件 debug_payload）。
+    // 回调负责弹窗展示 payload；用户点击"确认发送"后由回调调用 [confirmPayload] 通知服务器。
+    void Function(Map<String, dynamic> payload, String requestId)? onDebugPayload,
     required void Function(Map<String, dynamic> outputs) onDone,
   }) async {
     final url = _storyApiUrl;
@@ -92,11 +91,7 @@ class StoryService {
         'location': location,
         'era': era,
         'player_name': playerName,
-        'player_gender': playerGender,
         'player_traits': playerTraits,
-        'partner_name': partnerName,
-        'partner_gender': partnerGender,
-        'partner_traits': partnerTraits,
         'language': language,
         if (rewriteFrom != null) 'rewrite_from': rewriteFrom,
       });
@@ -153,6 +148,17 @@ class StoryService {
         }
         final event = evt['event'] as String?;
         switch (event) {
+          case 'debug_payload':
+            // 【调试】生成前确认：服务器调 Dify 前把 payload 发回 App。
+            // 由回调弹窗展示；用户点"确认发送"后由回调调用 confirmPayload 放行服务器。
+            onDebugPayload?.call(
+              (evt['payload'] as Map?)?.cast<String, dynamic>() ?? const {},
+              evt['request_id'] as String? ?? '',
+            );
+            break;
+          case 'debug_waiting':
+            // 服务器等待 App 确认期间的心跳，忽略（仅用于重置客户端卡死计时器）
+            break;
           case 'chunk':
             onChunk(evt['text'] as String? ?? '');
             break;
@@ -292,6 +298,33 @@ class StoryService {
       return null;
     } catch (_) {
       return null;
+    } finally {
+      client.close();
+    }
+  }
+
+  /// 【调试】通知服务器"确认发送"：放行正在等待的 /api/generate-story 流式请求，
+  /// 使服务器真正调用 Dify。请求体只需 request_id（服务器用其匹配 asyncio.Event）。
+  static Future<bool> confirmPayload(String requestId) async {
+    final story = _storyApiUrl; // 形如 http://host/api/generate-story
+    if (story.isEmpty || requestId.isEmpty) return false;
+    final String url = '$story/confirm';
+    final token = await AuthService.ensureToken();
+    final client = http.Client();
+    try {
+      final resp = await client
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({'request_id': requestId}),
+          )
+          .timeout(const Duration(seconds: 30));
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
     } finally {
       client.close();
     }

@@ -318,6 +318,27 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  /// 菜单在生成期间被禁用时的提示文案
+  String _getMenuLockedText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '正在生成中，選單暫不可用';
+      case 'en':
+      case 'es':
+      case 'fr':
+      case 'de':
+      case 'pt':
+        return 'Generating… menu unavailable';
+      case 'ja':
+        return '生成中です。メニューはご利用いただけません';
+      case 'ko':
+        return '생성 중입니다. 메뉴를 사용할 수 없습니다';
+      default:
+        return '正在生成中，菜单暂不可用';
+    }
+  }
+
   /// 订阅管理
   String _getSubscriptionText() {
     switch (StorageService.getLanguage()) {
@@ -514,6 +535,55 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
       ),
     );
+  }
+
+  /// 生成期间点击被禁用的菜单按钮时，显示一段短暂的提示（自动消失）
+  void _showMenuLockedToast() {
+    final isDark = themeBrightnessNotifier.value == Brightness.dark;
+    final OverlayState overlay = Overlay.of(context);
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (context) => Positioned(
+        top: MediaQuery.of(context).padding.top + 56,
+        left: 0,
+        right: 0,
+        child: IgnorePointer(
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: isDark
+                    ? AppTheme.fieldBackgroundDark
+                    : AppTheme.fieldBackgroundLight,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: CupertinoColors.black
+                        .withValues(alpha: isDark ? 0.4 : 0.12),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Text(
+                _getMenuLockedText(),
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  color: isDark
+                      ? AppTheme.secondaryTextDark
+                      : AppTheme.secondaryTextLight,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    overlay.insert(entry);
+    Future.delayed(const Duration(milliseconds: 1600), () {
+      if (entry.mounted) entry.remove();
+    });
   }
 
   void _toggleDarkMode() {
@@ -1186,34 +1256,50 @@ class _MyHomePageState extends State<MyHomePage> {
             bottom: false,
             child: HomeContent(key: ValueKey(_homeContentKey)),
           ),
-          // 右上角菜单按钮（设置过程中隐藏）
+          // 右上角菜单按钮（设置过程中隐藏；小说生成期间禁用并显示锁定状态）
           ValueListenableBuilder<bool>(
             valueListenable: showMenuNotifier,
             builder: (context, showMenu, child) {
               if (!showMenu) return const SizedBox.shrink();
-              return Positioned(
-                top: MediaQuery.of(context).padding.top + 8,
-                right: 16,
-                child: GestureDetector(
-                  onTap: _showMenuSheet,
-                  child: Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: isDark
-                          ? AppTheme.cardBackgroundDark
-                          : AppTheme.cardBackgroundLight,
-                      borderRadius: BorderRadius.circular(18),
+              return ValueListenableBuilder<bool>(
+                valueListenable: storyStreamingNotifier,
+                builder: (context, isStreaming, child) {
+                  return Positioned(
+                    top: MediaQuery.of(context).padding.top + 8,
+                    right: 16,
+                    child: GestureDetector(
+                      // 生成期间禁止打开菜单：点击只弹短暂提示，说明当前状态
+                      onTap: isStreaming ? _showMenuLockedToast : _showMenuSheet,
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: isDark
+                              ? (isStreaming
+                                    ? AppTheme.fieldBackgroundDark
+                                    : AppTheme.cardBackgroundDark)
+                              : (isStreaming
+                                    ? AppTheme.fieldBackgroundLight
+                                    : AppTheme.cardBackgroundLight),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Icon(
+                          isStreaming
+                              ? CupertinoIcons.lock_fill
+                              : CupertinoIcons.line_horizontal_3,
+                          color: isDark
+                              ? (isStreaming
+                                    ? AppTheme.buttonDisabledTextDark
+                                    : AppTheme.accentBlueDark)
+                              : (isStreaming
+                                    ? AppTheme.buttonDisabledTextLight
+                                    : AppTheme.accentBlueLight),
+                          size: isStreaming ? 16 : 18,
+                        ),
+                      ),
                     ),
-                    child: Icon(
-                      CupertinoIcons.line_horizontal_3,
-                      color: isDark
-                          ? AppTheme.accentBlueDark
-                          : AppTheme.accentBlueLight,
-                      size: 18,
-                    ),
-                  ),
-                ),
+                  );
+                },
               );
             },
           ),

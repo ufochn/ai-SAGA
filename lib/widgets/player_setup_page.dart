@@ -59,7 +59,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     _playerTraitsController.text = savedTraits.isNotEmpty
         ? savedTraits
         : buildDefaultTraits(
-            genderIndex: 0,
             language: _language,
             location: SetupDraft.instance.location,
           );
@@ -93,7 +92,6 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
         SetupDraft.instance.playerTraits = '';
         _playerNameController.text = _getDefaultName();
         _playerTraitsController.text = buildDefaultTraits(
-          genderIndex: 0,
           language: newLanguage,
           location: SetupDraft.instance.location,
         );

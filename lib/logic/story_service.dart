@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -74,7 +75,7 @@ class StoryService {
     final token = await AuthService.ensureToken();
 
     final client = http.Client();
-    // 流式"卡死"标记：40 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
+    // 流式"卡死"标记：30 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
     var stalled = false;
     try {
       final request = http.Request('POST', Uri.parse(url));
@@ -120,22 +121,27 @@ class StoryService {
       }
 
       var doneCalled = false;
+      // 打字机流超时：每次收到新数据都把等待时间重置为 30 秒，
+      // 超过 30 秒无任何数据到达即判定超时（调用 onStalled 提示重启）。
+      Timer? idleTimer;
+      void armIdleTimer() {
+        idleTimer?.cancel();
+        idleTimer = Timer(const Duration(seconds: 30), () {
+          if (!stalled) {
+            stalled = true;
+            onStalled?.call();
+          }
+        });
+      }
+
       final lines = response.stream
           .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .timeout(
-            const Duration(seconds: 40),
-            onTimeout: (sink) {
-              // 40 秒内没有任何数据到达（且未收到 done）：判定为网络异常/卡死，
-              // 通知上层弹出"请重启"警告，并结束本次流式读取，避免半截文本被误用。
-              if (!stalled) {
-                stalled = true;
-                onStalled?.call();
-              }
-              sink.close();
-            },
-          );
+          .transform(const LineSplitter());
+
+      armIdleTimer();
       await for (final line in lines) {
+        if (stalled) break; // 已判定超时：停止读取后续数据
+        armIdleTimer(); // 收到新数据 → 重置 30 秒等待时间
         final s = line.trim();
         if (!s.startsWith('data:')) continue;
         final raw = s.substring(5).trim();
@@ -158,6 +164,9 @@ class StoryService {
             break;
           case 'debug_waiting':
             // 服务器等待 App 确认期间的心跳，忽略（仅用于重置客户端卡死计时器）
+            break;
+          case 'heartbeat':
+            // 服务器换脚本/生成案件核心期间的心跳，忽略（每收到一行数据已重置 30s 计时器）
             break;
           case 'chunk':
             onChunk(evt['text'] as String? ?? '');
@@ -211,6 +220,7 @@ class StoryService {
             break;
         }
       }
+      idleTimer?.cancel();
       // 流式结束但未收到 done 事件：
       // - 若已判定卡死（stalled），已由 onStalled 处理，不再重复处理；
       // - 否则视为"未完整接收"，按错误处理（禁止基于残缺文本续写）

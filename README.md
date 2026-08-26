@@ -34,6 +34,8 @@
 > **⚠️ 2026-08-18 (debug & payload cleanup)**: the **outline** feature was completely purged from the live server code and database (the `story_segments.outline` column was dropped from the main database and its backups; no migration or legacy-compatibility code was kept, per the pre-launch policy). A **debug pre-send confirmation** flow was added — before calling Dify the server first streams the would-be payload to the app (SSE `debug_payload` event), the app shows it in a dialog, and only after the user confirms does the server actually call Dify (new `POST /api/generate-story/confirm`); a `debug_waiting` heartbeat keeps the connection alive while waiting, and the feature is toggled by `DEBUG_PAYLOAD_PREVIEW`. The `language` value sent to Dify switched from codes (`zh`/`en`/`yue`…) to **full names** (`简体中文`/`English`/`粤语（广府话 / Cantonese）`…) via a server-side mapping. The redundant `former_content` input was removed from the Dify payload (its helper function, call site and payload key were deleted). The legacy-named continuation-context variable `corrent_outlet` was renamed to `corrent_case_all_content` (server variable + Dify payload key; the app has no reference to it). Read the **[Full Chatflow Summary — Debug Payload Preview & Prompt-Cleanup (2026-08-18)](#full-chatflow-summary--debug-payload-preview--prompt-cleanup-2026-08-18)** section at the bottom.
 >
 > **⚠️ 2026-08-19 (Dify stream output pollution)**: the Dify fiction-generation workflow intermittently appended the LLM② structured outputs (`action_a` / `action_b` paragraphs and the `music_style` value) to the end of the novel body, and the polluted text was persisted to `story_segments`. Fixed **server-side only** — `text_chunk` events are now filtered by source-node variable path (`STORY_STREAM_SOURCE`), and `workflow_finished` no longer trusts Dify's `outputs["text"]`, using only the streamed novel text instead. Read the **[Full Chatflow Summary — Dify Stream Output Pollution Fix (2026-08-19)](#full-chatflow-summary--dify-stream-output-pollution-fix-2026-08-19)** section at the bottom.
+>
+> **⚠️ 2026-08-26 (script database, script switching & streaming robustness)**: this session (1) built a **script database** (`fiction_script`) as the chapter-script source and wired it into the generation pipeline (the case-core Dify call draws a script's `case_core_prompt`; the fiction call feeds that script's `chapter_script_N` + the chapter's choices; continuation advances the chapter); (2) implemented **script switching** when a chapter has no choices left — persist the finished segment, update `completed_script_ids` by the least-used rule, pick the least-used script (excluding the just-finished one unless it is the only one), and generate that new script's chapter 1, with both records persisted **atomically**; (3) inserted script #1 chapters 1–3 **verbatim** (no rewriting) into the script database; (4) rewrote the app's streaming **stall detection** from a fixed 40 s `Stream.timeout` to a **30 s idle timer that resets on every received event**; (5) added two server **heartbeats** around the script-switch case-core call so the app never misjudges a normal script switch as a stall; (6) tightened the **case-core Dify call** — timeout 60 s → 30 s, and every failure (timeout / non-200 / network error / empty core / empty script library) now raises `CaseCoreError` to terminate the whole request instead of falling back to an empty `case_core`; (7) changed the **setup-page audit verdict** so that a failed `action` parse (format / network / unknown) returns **no** `action` field — the app then shows a "check your network and retry" message instead of "please modify your settings"; and (8) made `choice_1` default to **blank** in every language (user input is kept; no input stays blank forever). Read the **[Full Chatflow Summary — Script Database, Script Switching & Streaming Robustness (2026-08-26)](#full-chatflow-summary--script-database-script-switching--streaming-robustness-2026-08-26)** section at the bottom.
 
 ---
 
@@ -2050,3 +2052,82 @@ A developer-facing gate was added so a generated Dify payload can be inspected b
 - As this is the pre-launch debugging stage, **no historical-data migration, no backward-compatibility, and no legacy-protection code** were added for any of the changes above (per the project's standing policy).
 - The debug pre-send confirmation is **on by default** for development; remember to set `DEBUG_PAYLOAD_PREVIEW=0` before production.
 - The Dify canvas must be kept in sync for two things: the renamed input variable `corrent_case_all_content`, and the language field now carrying full names instead of codes.
+
+---
+
+# Full Chatflow Summary — Script Database, Script Switching & Streaming Robustness (2026-08-26)
+
+> An English, desensitized summary of this chatflow. It covers: (1) the **script database** (`fiction_script`) as the chapter-script source for the novel-generation pipeline; (2) **script switching** when a chapter has no choices left, with the least-used-script selection rule and **atomic persistence**; (3) inserting script #1 chapters 1–3 **verbatim**; (4) the app's streaming **stall detection rewrite** (30 s idle timer reset on every event); (5) two server **heartbeats** around the script-switch case-core call; (6) **case-core hardening** (30 s timeout, `CaseCoreError` termination instead of empty fallback); (7) the **setup-page audit verdict** change (failed `action` parse → "check network & retry", not "modify settings"); and (8) `choice_1` defaulting to **blank** in every language. **Desensitized** — no credentials, API keys, server addresses, container names, or real node identifiers appear anywhere.
+
+## 1. Script database (`fiction_script`) as the chapter-script source
+
+A dedicated script database table `fiction_script` was created next to `story_segments` and wired into the generation pipeline as the authoritative source of chapter scripts:
+
+- **Schema** (per script row): `id` (PK) + `case_core_prompt` + 20 chapters × 3 columns (`chapter_script_N`, `chapter_script_N_choice_2`, `chapter_script_N_choice_3`). Column names were progressively renamed (`chapter_N` → `chapter_script_N`, `_choice_1` → `_choice_2`, `_choice_2` → `_choice_3`) and `case_core_prompt` was added as the second column.
+- **Wiring**:
+  - **First segment** (`user_input_counter == 0`): the case-core Dify call (`_generate_case_meta`) draws a **random** script row, sends its `case_core_prompt` to Dify, and returns the script id + chapter 1 text + chapter-1 choices; the fiction call then feeds that same row's `chapter_script_1` to Dify.
+  - **Continuation**: the previous segment's `current_script_id` ("script_id-chapter") is read, chapter + 1, and the corresponding `chapter_script_N` text + choices are loaded from the script database and fed to Dify. The two choices are displayed in the app's input boxes 2/3.
+  - `_generate_case_meta(chapter, script_id)` returns `{case_core, script_id, chapter, chapter_text, choice_2, choice_3}`; `_persist_story_segment` writes `current_script_id` in "script_id-chapter" format.
+
+## 2. Script switching & the least-used-script rule
+
+When a chapter's `choice_2`/`choice_3` are empty (script exhausted / last chapter):
+
+1. The finished segment is **staged** (not persisted yet).
+2. `completed_script_ids` is updated with the **catch-up-to-maximum rule**: when a script completes, if its tally is below the maximum it is raised to the maximum, otherwise +1.
+3. The **least-used script** is selected by comparing `completed_script_ids` tallies against the full script list; ties are broken randomly, and the just-finished script is **excluded** unless it is the only one available.
+4. The new script's **chapter 1** is generated (like a first segment: case-core call + chapter text), and the loop continues until a chapter with available choices produces a `done`.
+
+Two records (the staged finished segment + the new chapter) are persisted together **atomically** (`_persist_story_segments_atomic`) in a single transaction — either both exist or neither exists. A `switch_guard` (max 5) prevents infinite loops if every script has empty choices.
+
+## 3. Script #1 chapters inserted verbatim
+
+Chapters 1–3 of script #1 were inserted into `fiction_script` **verbatim** (exactly as the user provided, no rewriting / "no creative rewrite" policy). Chapter 1 and 2 include their two choices; chapter 3 has **blank** `choice_2`/`choice_3` (intentionally left empty, matching the exhaustion scenario that triggers script switching).
+
+## 4. App streaming stall detection rewritten (30 s idle timer)
+
+The previous 40 s `Stream.timeout` on the SSE stream was **completely removed** and replaced with a manual idle timer in `story_service.dart`:
+
+- A `Timer` (30 s) is armed before the stream starts and **re-armed on every received SSE line** — any data (chunk / reveal / heartbeat / etc.) resets the countdown.
+- If **30 s pass with no data**, the timer fires `onStalled` (the existing "restart app" prompt); otherwise a real stall is never misjudged.
+- The timer is cancelled when the stream ends. This fixes the script-switch scenario (two consecutive segments) where the previous fixed gap-timer could false-positive during the inter-segment pause.
+
+## 5. Two server heartbeats around the script-switch case-core call
+
+During a script switch, the server performs a **blocking** case-core Dify call (up to 30 s) during which no text events are sent to the app — a gap the old client could mistake for a stall. Two SSE `heartbeat` events now bracket that call:
+
+- **Heartbeat ①** just before the case-core call ("正在生成新案件核心") — right before `_generate_case_meta` is invoked.
+- **Heartbeat ②** right after it returns, before the new chapter's Dify stream starts ("案件核心已就绪，开始生成新章节").
+
+The app ignores the `heartbeat` event type (explicit `case 'heartbeat'` no-op) while the per-event idle timer is naturally reset by every received line, so a normal script switch never trips the 30 s stall detection.
+
+## 6. Case-core hardening (30 s timeout + terminate instead of empty fallback)
+
+A novel generated without a case core is considered **unqualified**, so the case-core call no longer falls back to an empty `case_core`:
+
+- **Timeout** reduced from 60 s to **30 s**.
+- A dedicated exception `CaseCoreError` was introduced. `_generate_case_meta` now **raises** it on every failure path — script library empty / script not found, non-200 response, HTTP timeout, generic network/parse exception, and a 200 response whose parsed core is empty — instead of returning an empty dict. The old `empty` fallback dict was removed.
+- **Both call sites terminate the whole request**: the first-segment call site raises `HTTPException(503)` ("案件核心生成失败，已终止本次生成"), and the script-switch call site yields an SSE `error` event and returns, ending `_stream()` (staged segments are not persisted, honoring the atomic rule). An empty `case_core` can never reach the database.
+
+## 7. Setup-page audit verdict: failed `action` parse → "check network & retry"
+
+The setup-page audit endpoint (`/api/audit-and-chat`) previously returned `action="block"` when the audit output could not be parsed, which the app interpreted as "content violating → modify your settings". This was changed:
+
+- When `action` **can** be parsed: `none` → approved (unchanged); non-`none` → "please modify" (unchanged).
+- When `action` **cannot** be obtained (format error / network down / unknown, any reason): `_build_audit_verdict` now returns a verdict **without an `action` field**. The app's `_parseAction` returns `null` and shows the localized **"network connection seems to have a problem, check and retry"** message instead of telling the user to modify their settings. The app required **no change** — it already treats a missing action as "no verdict, retry".
+
+## 8. `choice_1` defaults to blank in every language
+
+`choice_1` is the user's free-form input box. Its per-language fallback defaults ("继续当前行动，深入探索" / "Continue your current action…" etc.) were **removed** from `META_DEFAULTS` and `META_DEFAULTS_BY_LANG` — `choice_1` now defaults to an empty string in every language. User input is preserved when provided; when the user enters nothing it stays blank forever (nothing is pre-filled).
+
+## 9. Verification
+
+- Server: `python3 -m py_compile server/main.py` passes; server deployed in place into the running FastAPI container with a healthy HTTP `200` on `/api/health`.
+- App: `flutter analyze` reports no issues after the stall-detection rewrite and the `heartbeat` event case.
+- The `chapter_script_3` update script ran in the container and verified the chapter text was written verbatim (length check) with `choice_2`/`choice_3` empty.
+
+## 10. Notes
+
+- As this is the pre-launch debugging stage, **no historical-data migration, no backward-compatibility, and no legacy-protection code** were added for any of the changes above (per the project's standing policy).
+- Script choices for the app's input boxes 2/3 come from the script database (`chapter_script_N_choice_2/3`), not from Dify's outputs; Dify's action_a/action_b fields are no longer used.
+- The Dify canvas must use `case_core_prompt` (case workflow), `chapter_script` / `corrent_case_all_content` (fiction workflow), and the `heartbeat` SSE events are server-generated only (no canvas change needed).

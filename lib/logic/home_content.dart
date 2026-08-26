@@ -240,6 +240,10 @@ class _HomeContentState extends State<HomeContent>
   /// 由启动同步 / 上拉加载时与正文一起从服务器拉取，显示在对应段落的按钮/输入框中。
   final Map<int, List<String>> _segmentChoices = {};
 
+  /// 每段对应的脚本序号（"脚本id-章节"，如 "2-5"）：键为绝对下标（= 服务器 seq），
+  /// 由启动同步 / 上拉加载时从服务器拉取，用于判断某段是否为一个脚本的最后一章。
+  final Map<int, String> _segmentScriptIds = {};
+
   /// 本轮三个输入框的当前值（任一确认时随请求一并上传，作为本轮选择一/二/三快照）
   String _inputChoice1 = '';
   String _inputChoice2 = '';
@@ -416,6 +420,8 @@ class _HomeContentState extends State<HomeContent>
           _segmentChoices[earlier.startSeq + i] = (i < earlier.choices.length
               ? earlier.choices[i]
               : const <String>[]);
+          _segmentScriptIds[earlier.startSeq + i] =
+              (i < earlier.scriptIds.length ? earlier.scriptIds[i] : '');
         }
         // 恢复这批更早段的"用户本轮实际选择"节点（前插，保持按段序升序；未选择为空）
         final newChoices = <_ChoiceRecord>[];
@@ -484,10 +490,13 @@ class _HomeContentState extends State<HomeContent>
           _storyStartIndex = snap.startSeq;
           // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
           _segmentChoices.clear();
+          _segmentScriptIds.clear();
           for (int i = 0; i < snap.segments.length; i++) {
             _segmentChoices[_storyStartIndex + i] = (i < snap.choices.length
                 ? snap.choices[i]
                 : const <String>[]);
+            _segmentScriptIds[_storyStartIndex + i] =
+                (i < snap.scriptIds.length ? snap.scriptIds[i] : '');
           }
           // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）
           _choices.clear();
@@ -937,6 +946,29 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 该段是否为一个脚本的"最后一章"（脚本切换点）：
+  /// - 下一段存在且属于不同脚本 → 本段是其所在脚本的最后一章；
+  /// - 没有下一段（整本最后一段）→ 仅当本段是"空章节"（章节号 > 20）才视为最后一章。
+  bool _isScriptLast(int absSeq) {
+    String _scriptOf(String s) {
+      final i = s.indexOf('-');
+      return i < 0 ? s : s.substring(0, i);
+    }
+
+    final cur = _segmentScriptIds[absSeq];
+    if (cur == null || cur.isEmpty) return false;
+    final next = _segmentScriptIds[absSeq + 1];
+    if (next != null && next.isNotEmpty) {
+      return _scriptOf(next) != _scriptOf(cur);
+    }
+    final parts = cur.split('-');
+    if (parts.length == 2) {
+      final chapter = int.tryParse(parts[1]) ?? 0;
+      return chapter > 20;
+    }
+    return false;
+  }
+
   /// 构建正文区：按数组顺序逐段渲染故事文本（打字机揭示），
   /// 逐段渲染故事正文；每段统一按"段文本 → 该段输入框按钮（历史段卡片）→
   /// 该段之后用户所做的选择标记"排列，位置与"点击按钮生成新文本时占位区顶部"
@@ -951,6 +983,8 @@ class _HomeContentState extends State<HomeContent>
         streaming && _storyTexts.length > _generationStartLen;
     // 只渲染 [ _visibleStartIndex, _storyTexts.length ) 范围内的文本段，
     // 更早的历史段等用户向上滚动到顶部时才逐个加载
+    // 脚本最后一章的段落文本已并入下一段（连续文本框），跳过下一段的独立文本渲染
+    bool skipText = false;
     for (
       int segIndex = _visibleStartIndex;
       segIndex < _storyTexts.length;
@@ -964,27 +998,41 @@ class _HomeContentState extends State<HomeContent>
           hasStreamingSegment && segIndex == _storyTexts.length - 1;
       // 本次会话流式生成的新段用打字机揭示；重启恢复的历史段直接完整显示
       final useTypewriter = segIndex >= _sessionStreamStartIndex;
-      // 1) 段文本（整段一次渲染）
-      children.add(
-        useTypewriter
-            ? _buildStorySegment(segment, isLast: isLast, segIndex: segIndex)
-            : CharacterText(text: segment),
-      );
+      final int segAbs = _storyStartIndex + segIndex;
+      // 该段是否"脚本最后一章"：仅历史段（非本会话打字机段）才判定。
+      // 此类段落不显示选项卡片，并把本段与下一段文本合并到一个连续文本框显示。
+      final bool scriptLast =
+          !isStreamingSegment && !useTypewriter && _isScriptLast(segAbs);
+      // 1) 段文本：脚本最后一章时把下一段文本一并拼入同一文本框（连续显示，不分段）
+      String displayText = segment;
+      bool mergedNext = false;
+      if (!skipText && scriptLast && segIndex + 1 < _storyTexts.length) {
+        displayText = '$segment\n\n${_storyTexts[segIndex + 1]}';
+        mergedNext = true;
+      }
+      if (!skipText) {
+        children.add(
+          useTypewriter
+              ? _buildStorySegment(displayText, isLast: isLast, segIndex: segIndex)
+              : CharacterText(text: displayText),
+        );
+      }
+      skipText = mergedNext; // 下一段文本已并入本段，跳过其独立渲染
       // 2) 历史段落（非最新一段）下方：三个输入框 + "从这里重新开始"按钮（时间树）。
       //    与原始逻辑一致：最新一段下方不插入卡片，其下方的输入框由页面底部的三个承载。
       //    流式新段（数组末尾）即"最新一段"，故自动不渲染卡片；打字开始时它出现
       //    造成的高度变化由底部"生成区"的预留空白吸收，正文中不会留下空白。
-      final bool renderCard =
-          !isStreamingSegment && segIndex < _storyTexts.length - 1;
+      //    脚本最后一章：无配套选项，也不渲染卡片。
+      final bool renderCard = !isStreamingSegment &&
+          segIndex < _storyTexts.length - 1 &&
+          !scriptLast;
       if (renderCard) {
         children.add(
           StoryChoiceCard(
             // 绝对下标 = 服务器 seq：让本段按钮 ↔ 文本 ↔ 数据库行一一对应
-            segmentIndex: _storyStartIndex + segIndex,
+            segmentIndex: segAbs,
             // 显示本段对应的三个选项（choice_1/2/3，即用户选择那一瞬间保存的文本）
-            initialValues:
-                _segmentChoices[_storyStartIndex + segIndex] ??
-                const <String>[],
+            initialValues: _segmentChoices[segAbs] ?? const <String>[],
             buttonText: _getRestartHereButtonText(),
             inputPlaceholder: _getInputPlaceholder(),
             // 三个输入框的占位提示与正文底部一致（第 1 个=自由输入，第 2/3 个=推荐行动）
@@ -1004,13 +1052,14 @@ class _HomeContentState extends State<HomeContent>
       //    统一显示在本段文本 + 输入框按钮（历史段卡片）下方，与最终布局一致。
       //    流式新段的选择不在此显示；等待期（新段未到）最新一段的选择改由底部
       //    "生成区"在输入框与按钮下方显示（原始布局位置），此处不重复。
+      //    脚本最后一章：不显示提示与选择标记。
       final bool skipChoice =
           isStreamingSegment ||
+          scriptLast ||
           (_storyStreaming &&
               _storyTexts.length <= _generationStartLen &&
               segIndex == _storyTexts.length - 1);
       if (!skipChoice) {
-        final int segAbs = _storyStartIndex + segIndex;
         for (int i = 0; i < _choices.length; i++) {
           if (_choices[i].segmentIndex == segAbs) {
             // 在输入框/按钮卡片与"用户选择"文本之间恒留一行空行（与生成等待期的
@@ -1172,6 +1221,17 @@ class _HomeContentState extends State<HomeContent>
           duration: const Duration(milliseconds: 600),
           switchInCurve: const Cubic(0.22, 1.0, 0.36, 1.0),
           switchOutCurve: const Cubic(0.22, 1.0, 0.36, 1.0),
+          // 顶部对齐：避免切换时新页面（如设置确认页）先被垂直居中、旧页淡出后
+          // 再回弹到顶部，造成"先偏下、再上移一行"的跳动。
+          layoutBuilder: (currentChild, previousChildren) {
+            return Stack(
+              alignment: Alignment.topCenter,
+              children: [
+                ...previousChildren,
+                if (currentChild != null) currentChild,
+              ],
+            );
+          },
           transitionBuilder: (Widget child, Animation<double> animation) {
             return FadeTransition(opacity: animation, child: child);
           },
@@ -1817,25 +1877,25 @@ class _HomeContentState extends State<HomeContent>
   String _getEnteringWorldText() {
     switch (StorageService.getLanguage()) {
       case 'zh-TW':
-        return '即將進入您自己創造的、充滿了命案以及愛的世界';
+        return '即將進入您自己創造的、充滿了鬼命案以及愛的世界';
       case 'yue':
-        return '即將進入您自己創造嘅、充滿咗兇案同埋愛嘅世界';
+        return '即將進入您自己創造嘅、充滿咗鬼兇案同埋愛嘅世界';
       case 'en':
-        return 'You are about to enter the world you created — a world of murder and love';
+        return 'You are about to enter the world you created — a world of ghost murders and love';
       case 'es':
-        return 'Estás a punto de entrar en el mundo que creaste, lleno de asesinatos y amor';
+        return 'Estás a punto de entrar en el mundo que creaste, lleno de asesinatos fantasmales y amor';
       case 'fr':
-        return "Vous êtes sur le point d'entrer dans le monde que vous avez créé, rempli de meurtres et d'amour";
+        return "Vous êtes sur le point d'entrer dans le monde que vous avez créé, rempli de meurtres de fantômes et d'amour";
       case 'de':
-        return 'Du bist dabei, die Welt zu betreten, die du erschaffen hast – voller Mord und Liebe';
+        return 'Du bist dabei, die Welt zu betreten, die du erschaffen hast – voller Geistermorde und Liebe';
       case 'pt':
-        return 'Você está prestes a entrar no mundo que criou, cheio de assassinatos e amor';
+        return 'Você está prestes a entrar no mundo que criou, cheio de assassinatos fantasmagóricos e amor';
       case 'ja':
-        return 'あなたが創り上げた、殺人事件と愛に満ちた世界へまもなく入ります';
+        return 'あなたが創り上げた、鬼の殺人事件と愛に満ちた世界へまもなく入ります';
       case 'ko':
-        return '당신이 창조한 살인 사건과 사랑으로 가득한 세계로 곧 들어갑니다';
+        return '당신이 창조한 귀신 살인 사건과 사랑으로 가득한 세계로 곧 들어갑니다';
       default:
-        return '即将进入您自己创造的、充满了杀人案以及爱的世界';
+        return '即将进入您自己创造的、充满了鬼杀人事件以及爱的世界';
     }
   }
 
@@ -2052,6 +2112,7 @@ class _HomeContentState extends State<HomeContent>
       // 段 segmentIndex 本身的选择保留，由后续 _continueStory 用本次输入覆盖（时间树=方案B）
       _choices.removeWhere((c) => c.segmentIndex > segmentIndex);
       _segmentChoices.removeWhere((k, _) => k > segmentIndex);
+      _segmentScriptIds.removeWhere((k, _) => k > segmentIndex);
       _visibleStartIndex = _storyTexts.length - 1;
       _sessionStreamStartIndex = _storyTexts.length; // 之后的新段均为会话流式段（打字机）
     });

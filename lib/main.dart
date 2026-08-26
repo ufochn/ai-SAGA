@@ -1256,7 +1256,7 @@ class _MyHomePageState extends State<MyHomePage> {
             bottom: false,
             child: HomeContent(key: ValueKey(_homeContentKey)),
           ),
-          // 右上角菜单按钮（设置过程中隐藏；小说生成期间禁用并显示锁定状态）
+          // 右上角菜单按钮（设置过程中隐藏；小说生成期间禁用并置灰，不使用锁图标以免歧义）
           ValueListenableBuilder<bool>(
             valueListenable: showMenuNotifier,
             builder: (context, showMenu, child) {
@@ -1284,9 +1284,8 @@ class _MyHomePageState extends State<MyHomePage> {
                           borderRadius: BorderRadius.circular(18),
                         ),
                         child: Icon(
-                          isStreaming
-                              ? CupertinoIcons.lock_fill
-                              : CupertinoIcons.line_horizontal_3,
+                          // 始终显示正常菜单图标；生成期间不可点击时仅置灰提示不可用
+                          CupertinoIcons.line_horizontal_3,
                           color: isDark
                               ? (isStreaming
                                     ? AppTheme.buttonDisabledTextDark
@@ -1294,7 +1293,7 @@ class _MyHomePageState extends State<MyHomePage> {
                               : (isStreaming
                                     ? AppTheme.buttonDisabledTextLight
                                     : AppTheme.accentBlueLight),
-                          size: isStreaming ? 16 : 18,
+                          size: 18,
                         ),
                       ),
                     ),

@@ -14,6 +14,9 @@ typedef StorySnapshot = ({
   List<String> segments,
   List<List<String>> choices,
   List<String> userChoices,
+  /// 与 segments 一一对应的脚本序号（"脚本id-章节"，如 "2-5"；无则为空串），
+  /// 用于判断某段是否为一个脚本的最后一章。
+  List<String> scriptIds,
   int startSeq,
   int total,
   String language,
@@ -125,6 +128,7 @@ class SyncService {
         segments: const <String>[],
         choices: const <List<String>>[],
         userChoices: const <String>[],
+        scriptIds: const <String>[],
         startSeq: 0,
         total: 0,
         language: '',
@@ -210,6 +214,7 @@ class SyncService {
         segments: const <String>[],
         choices: const <List<String>>[],
         userChoices: const <String>[],
+        scriptIds: const <String>[],
         startSeq: 0,
         total: 0,
         language: '',
@@ -270,10 +275,15 @@ class SyncService {
     final total = (data['total'] as num?)?.toInt() ?? segments.length;
     // 服务器金标准语言（老用户换新设备时据此覆盖本地语言）
     final language = (data['language'] as String?) ?? '';
+    // 脚本序号（current_script_ids）与 segments 一一对应；缺失用空串
+    final rawScriptIds = (data['current_script_ids'] as List?) ?? const [];
+    final scriptIds =
+        rawScriptIds.map((e) => (e as String?) ?? '').toList();
     return (
       segments: segments,
       choices: choices,
       userChoices: userChoices,
+      scriptIds: scriptIds,
       startSeq: startSeq,
       total: total,
       language: language,

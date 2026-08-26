@@ -8,7 +8,7 @@ import 'package:ai_saga/widgets/audit_dialog.dart';
 
 /// 设置确认页。
 ///
-/// 主角/搭档设定审核通过后进入本页：列出全部设置项，每项带"编辑"快捷按钮
+/// 主角设定审核通过后进入本页：列出全部设置项，每项带"编辑"快捷按钮
 /// 跳回对应设置页；底部"确定"按钮先进行服务器审核，审核通过后
 /// 立即调用 [onConfirmed] 进入正式主页面。
 class SetupConfirmationPage extends StatefulWidget {
@@ -322,7 +322,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     );
   }
 
-  /// 汇总用户已设定的全部内容（地点、年代、主角、搭档）作为审核文本
+  /// 汇总用户已设定的全部内容（地点、年代、主角）作为审核文本
   String _buildAuditText() {
     final sb = StringBuffer();
     sb.writeln('Location: ${SetupDraft.instance.location}');
@@ -381,14 +381,6 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 12),
-              Icon(
-                CupertinoIcons.checkmark_seal_fill,
-                size: 56,
-                color: isDark
-                    ? AppTheme.accentBlueDark
-                    : AppTheme.accentBlueLight,
-              ),
-              const SizedBox(height: 16),
               Text(
                 _getTitleText(),
                 textAlign: TextAlign.center,
@@ -426,16 +418,23 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
                 traits: SetupDraft.instance.playerTraits,
                 onEdit: () => widget.onEdit(3),
               ),
-              Padding(
-                padding: const EdgeInsets.only(top: 24),
+              // 确认按钮：位于内容下方正常位置（跟随内容滚动，不被遮挡）
+              const SizedBox(height: 24),
+              SizedBox(
+                height: 48,
                 child: CupertinoButton.filled(
                   onPressed: _onConfirmPressed,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  borderRadius: BorderRadius.circular(12),
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  color: isDark
+                      ? AppTheme.buttonFillDark
+                      : AppTheme.buttonFillLight,
                   child: Text(
                     _getConfirmButtonText(),
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.w600,
+                      color: AppTheme.buttonText,
                     ),
                   ),
                 ),

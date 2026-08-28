@@ -36,6 +36,8 @@
 > **⚠️ 2026-08-19 (Dify stream output pollution)**: the Dify fiction-generation workflow intermittently appended the LLM② structured outputs (`action_a` / `action_b` paragraphs and the `music_style` value) to the end of the novel body, and the polluted text was persisted to `story_segments`. Fixed **server-side only** — `text_chunk` events are now filtered by source-node variable path (`STORY_STREAM_SOURCE`), and `workflow_finished` no longer trusts Dify's `outputs["text"]`, using only the streamed novel text instead. Read the **[Full Chatflow Summary — Dify Stream Output Pollution Fix (2026-08-19)](#full-chatflow-summary--dify-stream-output-pollution-fix-2026-08-19)** section at the bottom.
 >
 > **⚠️ 2026-08-26 (script database, script switching & streaming robustness)**: this session (1) built a **script database** (`fiction_script`) as the chapter-script source and wired it into the generation pipeline (the case-core Dify call draws a script's `case_core_prompt`; the fiction call feeds that script's `chapter_script_N` + the chapter's choices; continuation advances the chapter); (2) implemented **script switching** when a chapter has no choices left — persist the finished segment, update `completed_script_ids` by the least-used rule, pick the least-used script (excluding the just-finished one unless it is the only one), and generate that new script's chapter 1, with both records persisted **atomically**; (3) inserted script #1 chapters 1–3 **verbatim** (no rewriting) into the script database; (4) rewrote the app's streaming **stall detection** from a fixed 40 s `Stream.timeout` to a **30 s idle timer that resets on every received event**; (5) added two server **heartbeats** around the script-switch case-core call so the app never misjudges a normal script switch as a stall; (6) tightened the **case-core Dify call** — timeout 60 s → 30 s, and every failure (timeout / non-200 / network error / empty core / empty script library) now raises `CaseCoreError` to terminate the whole request instead of falling back to an empty `case_core`; (7) changed the **setup-page audit verdict** so that a failed `action` parse (format / network / unknown) returns **no** `action` field — the app then shows a "check your network and retry" message instead of "please modify your settings"; and (8) made `choice_1` default to **blank** in every language (user input is kept; no input stays blank forever). Read the **[Full Chatflow Summary — Script Database, Script Switching & Streaming Robustness (2026-08-26)](#full-chatflow-summary--script-database-script-switching--streaming-robustness-2026-08-26)** section at the bottom.
+>
+> **⚠️ 2026-08-28 (unified timeouts, dedup, deployment tooling & RAG memory retrieval)**: this session (1) standardized the whole generation path on a **unified 30 s idle timeout across all four hops** (app→server, server→Dify, Dify→server, server→app) that resets on any data/heartbeat, with a real timeout silently closing the current task and the client surfacing the localized "network suspected timeout, please restart" dialog; (2) made the server **continue its work after the client disconnects** (waiting for Dify, auditing, persisting) so a restarted app can sync the full chapter back; (3) added **near-distance duplicate-chapter deduplication** by script id — delete the older duplicate only when the seq gap ≤ 3, scoped to the pulled rows, backed by a covering index; (4) built **deployment tooling** (hot in-place deploy into the container, plus a local-only DB admin tool bound to 127.0.0.1); (5) **removed the `choice_2`/`choice_3` fallback defaults** so a script with no choices is correctly detected as ended and a new script auto-starts; (6) changed the settings-overview transition to a **slide** and hid the menu button during the "enter your world" blackout so it **fades in with the brighten phase**; and (7) designed and implemented **RAG memory retrieval** — per-chapter character-name extraction from the Dify return, 600/100 token chunking with a trailing-600 rule, an embeddings API (bge-m3 preferred → Hugging Face blocked by the server's network path → **Jina Embeddings v3**), a dual-channel retrieval (exact-name + semantic cosine ≥ 0.65) that excludes the current script and injects one whole chapter, with per-user trigger-wheel backfill, delete-sync, an application-level embed concurrency cap, and a 3 s retrieval fail-open timeout. Read the **[Full Chatflow Summary — Unified Timeouts, Dedup, Deployment Tooling & RAG Memory Retrieval (2026-08-28)](#full-chatflow-summary--unified-timeouts-dedup-deployment-tooling--rag-memory-retrieval-2026-08-28)** section at the bottom.
 
 ---
 
@@ -2131,3 +2133,118 @@ The setup-page audit endpoint (`/api/audit-and-chat`) previously returned `actio
 - As this is the pre-launch debugging stage, **no historical-data migration, no backward-compatibility, and no legacy-protection code** were added for any of the changes above (per the project's standing policy).
 - Script choices for the app's input boxes 2/3 come from the script database (`chapter_script_N_choice_2/3`), not from Dify's outputs; Dify's action_a/action_b fields are no longer used.
 - The Dify canvas must use `case_core_prompt` (case workflow), `chapter_script` / `corrent_case_all_content` (fiction workflow), and the `heartbeat` SSE events are server-generated only (no canvas change needed).
+
+# Full Chatflow Summary — Unified Timeouts, Dedup, Deployment Tooling & RAG Memory Retrieval (2026-08-28)
+
+> This section documents the whole 2026-08-28 session: the unified 4-hop timeout architecture, disconnect-tolerant generation, near-distance duplicate dedup, deployment tooling, a local DB admin tool, client-side menu/transition fixes, the complete removal of `choice_2/3` fallbacks, and the full RAG memory-retrieval design Q&A plus its final implementation. All credentials, hosts and container identifiers below are **placeholders** (`<SERVER_HOST>`, `<CONTAINER_NAME>`, `<EMBED_API_KEY>`, `~/.ssh/<deploy_key>`, …).
+
+## 1. Unified 30-second idle timeout across all four hops
+
+- **Problem.** Generation "always timed out" because the FastAPI→Dify hop had a fixed, short timeout while Dify can stream slowly.
+- **Decision.** All four transmission hops — app→server, server→Dify, Dify→server, server→app — use a **uniform 30 s idle timeout that resets on any data or heartbeat**. Blocking Dify calls emit a **15 s heartbeat** while waiting (which resets the client's rolling timer); a genuine >30 s silence fires `httpx.TimeoutException` and the server **silently closes its current task** (no fabricated error). The client's own 30 s rolling timer then surfaces the localized **"network suspected timeout, please restart"** dialog.
+- **Why.** One consistent rule instead of per-hop tuning; "received anything = alive" is the least surprising contract.
+
+## 2. Server continues after client disconnect
+
+- **Requirement.** If the client disconnects mid-stream, the server must **not** cancel its work — it keeps waiting for Dify, auditing, and persisting, so a restarted app can pull the completed chapter back on sync.
+- **Implementation.** The real generator runs inside a background task fed by a queue wrapper; the consumer tied to the socket can be cancelled on disconnect while the producer keeps working; a shared `client_gone` flag lets the producer skip client-only steps (e.g., the debug payload confirmation) without dropping audit/persist.
+
+## 3. Near-distance duplicate-chapter deduplication
+
+- **Problem.** The same script chapter (e.g., `"2-5"`) can be generated twice; on pull the app would show a duplicate.
+- **Decision.** Per user, at pull time, **scoped to the rows being pulled** (no full-table scan). For each `current_script_id`, delete the **older** occurrence only when the seq gap is **≤ 3**; a gap **≥ 4** means legitimate script reuse → keep both. A covering index `(user_id, current_script_id, seq)` supports targeted lookups in the window `[min-3, max+3]`.
+
+## 4. Deployment & tooling
+
+- **Hot deploy.** A helper script uploads `main.py` and writes it **in-place into the container's `/code/main.py`** (same inode) to trigger uvicorn `--reload`, then health-checks. *Why in-place:* `scp` rename replaces the inode that the bind-mount still points at; `cat >` avoids that trap.
+- **Secrets.** Env vars or `/code/.env` (read by `python-dotenv`); never hard-coded, never committed.
+- **Local DB admin tool.** A stdlib `ThreadingHTTPServer` bound to **127.0.0.1 only** (not internet-exposed) renders a table editor; writes run on the server via SSH `docker exec` with base64 payloads; per-row save buttons prevent mass-update accidents.
+- **Policy.** Pre-launch debugging stage — no old-user compatibility, migration, or legacy-protection code.
+
+## 5. Menu-button-stuck diagnostics (client instrumentation)
+
+- **Symptom.** The top-right menu button sometimes stays disabled after generation finishes.
+- **Work.** Added client diagnostics (`[story]`/`[home]`/`[menu]` logs) to distinguish "no `done` event received" from "`done` received but the button was not re-enabled"; the verdict is pending real-device reproduction logs.
+
+## 6. Settings slide transition & blackout menu fade-in
+
+- The settings overview page now **slides in from the right** (`SlideTransition`, begin `Offset(1,0)`) instead of fading/poping.
+- The menu button stays **hidden during the "enter your world" blackout** and fades in together with the screen's brighten phase (a `menuReveal` notifier driven by the blackout tick).
+
+## 7. Script-end detection — complete removal of `choice_2/3` fallbacks
+
+- **Root cause.** `META_DEFAULTS` and the extract/persist code filled empty `choice_2`/`choice_3` with non-empty defaults, so `choices_available` was always true and a finished script was never detected.
+- **Fix.** Every fallback text was removed; the script chapter's own choices are **authoritative** (empty stays empty); when they are empty the server persists the segment, updates `completed_script_ids` by the least-used rule, and auto-switches to a new script.
+
+## 8. RAG memory retrieval — design Q&A and final decisions
+
+### 8.1 Goals & flow
+- Distill **character names** per chapter (no 4-element summary — dropped as unnecessary). On each user action, run a **dual-channel retrieval over previous scripts only**; when a match is strong enough, inject the best-matching **whole chapter** into the generation LLM. The current script's own info is **excluded** from RAG (the generation LLM already has it) to avoid redundant/confusing context.
+
+### 8.2 Embedding provider — decision history
+| Candidate | Verdict |
+|---|---|
+| **bge-m3 (BAAI), local** | Best for Chinese/multilingual, but the 1 vCPU / 1 GB VPS cannot host a ~2.2 GB model → rejected (kept as a future self-hosted option). |
+| **bge-m3 via Hugging Face serverless** | Chosen, then **blocked at runtime**: `api-inference.huggingface.co` does not resolve on the server, and even with a pinned IP the **TLS handshake is dropped** by the network path (TCP connects, Client Hello gets no reply). `huggingface.co`/`router.huggingface.co` are reachable but the router exposes no `/embeddings` route. Not a token problem. |
+| **Cohere Embed Multilingual v3** | Reachable, but a **512-token input cap** would truncate the 600-token chunks (and the trailing rule) → rejected. |
+| **Jina Embeddings v3** ✅ | **Final choice.** Reachable, 1024-dim, 8192-token window, strong Chinese/English/Japanese, OpenAI-compatible, cheap with a free tier. |
+
+- **Implementation.** `_embed_texts()` auto-adapts HF-native (`{"inputs": [...]}` → `[[vec], ...]`) and OpenAI-compatible (Jina: `{"model": ..., "input": [...]}` → `{"data":[{embedding: [...]}]}`) payloads and response shapes, so the provider can be swapped via configuration only.
+
+### 8.3 Chunking
+- **600 tokens / 100 overlap + trailing-600 rule**: the last chunk is the final 600 tokens counted from the end, so a chapter's ending is never truncated (e.g., 1300 tokens → `0-600`, `500-1100`, `700-1300`; ≤600 → one chunk; end overlap may exceed 100 — accepted). Token counting is a local heuristic (CJK ≈ 1 char/token, Latin ≈ 4 chars/token), used only for chunk boundaries.
+
+### 8.4 Character names — source, format, latest-memory index
+- **Source.** The Dify generation workflow's LLM② return carries a `characters` field (same output that already carries `music_style`/aura) — **no extra LLM call, no added cost**.
+- **Format.** `、`/comma/semicolon/newline separated, or a JSON array string; entries < 2 chars dropped; duplicates removed.
+- **No identity merging** across chapters (e.g., `老周` vs `周叔` stay separate entries).
+- **Latest memory.** Each distinct name maps to exactly one chapter — its **most recent** occurrence; a new occurrence **overwrites** the old mapping (no same/different-script distinction, no script-number comparisons).
+
+### 8.5 Storage (existing SQLite file, 3 new tables)
+| Table | Purpose |
+|---|---|
+| `story_chapter_distill` | Per-chapter character list (JSON), the source of truth for names |
+| `story_chunk_vectors` | Original-text chunks + 1024×float32 embeddings stored as BLOBs |
+| `story_character_lookup` | Name → latest chapter (the name channel's entry point) |
+
+Vectors stay as BLOBs in the same SQLite file (transactional with the rest of the data). Retrieval loads the user's vectors and does a **pure-Python cosine top-k** (hundreds of vectors → milliseconds; no numpy/ANN needed at this scale).
+
+### 8.6 Dual-channel retrieval & injection
+- **Name channel**: exact substring of the user's action text against the user's name index (≥ 2 chars); no fuzzy/pinyin; no similarity threshold (a name hit is decisive).
+- **Semantic channel**: embed the user's action text, cosine over the user's chunk vectors, `top-k = 3`, only candidates **≥ 0.65**.
+- **Scope**: both channels **exclude the current script** (only previous scripts are candidates).
+- **Merge**: a hit injects the **whole matching chapter** (not a slice); both channels hitting different chapters → **semantic wins**; multiple semantic hits → **highest score** (ties random); **at most one chapter**; no hit → nothing (graceful).
+- **Injection**: the whole chapter is passed to the Dify generation workflow via a `rag_context` input.
+
+### 8.7 Resilience: concurrency, timeouts, pool separation
+- **Application-level embed concurrency cap** (default 5, skip-don't-queue): when 5 embeds are in flight a new embed is **skipped** (builds left for the backfill; retrieval simply has no RAG that round) — prevents pile-up when the embedding API is down.
+- **Retrieval timeout** (default 3 s): fail-open — on timeout the round proceeds without RAG instead of blocking generation.
+- **Separate httpx pools**: the embedding API gets its own client (pool cap 50) while Dify keeps its own (pool cap 100), so future bottlenecks can be attributed to one side.
+
+### 8.8 Backfill — trigger-wheel, sequential
+- Embedding failures leave chapters with names but no vectors. A **per-user trigger wheel** repairs them: when a chapter's `seq` is **≥ 5 and divisible by 5**, one background task first **awaits the current chapter's embed**; only on success does it check that user's missing-vector chapters and backfill them **one at a time** (max 5 per trigger, stop at the first failure). This is both a health gate and keeps the backfill path at **≤ 1 in-flight embed**. `_rag_build_job()` returns a boolean so the trigger can chain; a per-`(user, seq)` in-flight set prevents duplicate concurrent builds.
+
+### 8.9 Delete-sync (consistency)
+All 4 places that delete `story_segments` rows call a single purge helper **in the same transaction** (full reset, time-tree rewrite, near-distance dedup, whole-array replace) to remove the matching RAG rows and rebuild the name lookup. The build job also re-checks that the source `story_segments` row still exists before writing, so a delete/rewrite cannot race a stale embed.
+
+### 8.10 Dify integration requirements (platform-side)
+1. **LLM② output** adds a **`characters`** field (the chapter's names, `、`/`,` separated).
+2. The generation workflow exposes a **`rag_context`** input wired into LLM②'s context so the server can inject a retrieved whole chapter.
+
+## 9. Capacity-planning notes (order-of-magnitude)
+
+- The first wall at scale is the **Dify connection pool (100)** — roughly ~100 users generating simultaneously ≈ pool saturation, mapping to roughly **5k–20k registered users** depending on activity (peak concurrent generating ≈ 0.5–2% of registered). Next: OS file descriptors (raise `ulimit -n`), then the 1 vCPU / 1 GB box itself (add workers / upgrade).
+- The **embedding API is not a wall** at these scales (the app-level cap of 5 far exceeds demand; the provider's own rate limits are the practical ceiling).
+- **Dify billing** is per LLM-token usage (built-in-model credits, or your own DeepSeek key via BYOK); self-hosting Dify (Community Edition) later removes the platform markup and can host bge-m3 locally.
+
+## 10. Verification
+
+- Server: `python3 -m py_compile` passes; deployed in place into the running container; health HTTP `200`.
+- Chunking unit-verified: `1300 → 0-600 / 500-1100 / 700-1300`; `≤600 →` single chunk.
+- Embedding end-to-end verified inside the container: RAG enabled, `_embed_texts` returns 1024-dim vectors via Jina (HTTP 200).
+
+## 11. Notes
+
+- Pre-launch debugging stage — no historical-data migration / backward-compat / legacy-protection code.
+- **Desensitized**: all credentials, hosts and container identifiers in this section are placeholders.
+- **Outstanding**: (1) the two Dify workflow changes (`characters` output + `rag_context` input) — platform-side, required for full RAG; (2) verify retrieval with real user data; (3) optional later switch back to local bge-m3 on a larger self-hosted machine (config-only change).

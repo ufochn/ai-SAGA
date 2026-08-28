@@ -17,6 +17,9 @@ final ValueNotifier<Brightness> themeBrightnessNotifier =
       StorageService.getIsDarkMode() ? Brightness.dark : Brightness.light,
     );
 
+/// 【诊断】右上角菜单按钮上次渲染的流式状态（用于观察按钮是否被 done 恢复）
+bool _lastMenuStreaming = false;
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // 设备完整性检测：返回设备是否疑似被 root / 越狱；
@@ -1264,39 +1267,53 @@ class _MyHomePageState extends State<MyHomePage> {
               return ValueListenableBuilder<bool>(
                 valueListenable: storyStreamingNotifier,
                 builder: (context, isStreaming, child) {
-                  return Positioned(
-                    top: MediaQuery.of(context).padding.top + 8,
-                    right: 16,
-                    child: GestureDetector(
-                      // 生成期间禁止打开菜单：点击只弹短暂提示，说明当前状态
-                      onTap: isStreaming ? _showMenuLockedToast : _showMenuSheet,
-                      child: Container(
-                        width: 36,
-                        height: 36,
-                        decoration: BoxDecoration(
-                          color: isDark
-                              ? (isStreaming
-                                    ? AppTheme.fieldBackgroundDark
-                                    : AppTheme.cardBackgroundDark)
-                              : (isStreaming
-                                    ? AppTheme.fieldBackgroundLight
-                                    : AppTheme.cardBackgroundLight),
-                          borderRadius: BorderRadius.circular(18),
+                  // 【诊断】记录菜单按钮流式状态变化（判断 done 是否恢复按钮）
+                  if (_lastMenuStreaming != isStreaming) {
+                    _lastMenuStreaming = isStreaming;
+                    debugPrint('[menu] isStreaming -> $isStreaming');
+                  }
+                  return ValueListenableBuilder<double>(
+                    valueListenable: menuRevealNotifier,
+                    builder: (context, reveal, child) {
+                      return Positioned(
+                        top: MediaQuery.of(context).padding.top + 8,
+                        right: 16,
+                        child: Opacity(
+                          // 进入世界黑屏期间随亮度一起淡入；正常时恒为 1
+                          opacity: reveal,
+                          child: GestureDetector(
+                            // 生成期间禁止打开菜单：点击只弹短暂提示，说明当前状态
+                            onTap: isStreaming ? _showMenuLockedToast : _showMenuSheet,
+                            child: Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                color: isDark
+                                    ? (isStreaming
+                                          ? AppTheme.fieldBackgroundDark
+                                          : AppTheme.cardBackgroundDark)
+                                    : (isStreaming
+                                          ? AppTheme.fieldBackgroundLight
+                                          : AppTheme.cardBackgroundLight),
+                                borderRadius: BorderRadius.circular(18),
+                              ),
+                              child: Icon(
+                                // 始终显示正常菜单图标；生成期间不可点击时仅置灰提示不可用
+                                CupertinoIcons.line_horizontal_3,
+                                color: isDark
+                                    ? (isStreaming
+                                          ? AppTheme.buttonDisabledTextDark
+                                          : AppTheme.accentBlueDark)
+                                    : (isStreaming
+                                          ? AppTheme.buttonDisabledTextLight
+                                          : AppTheme.accentBlueLight),
+                                size: 18,
+                              ),
+                            ),
+                          ),
                         ),
-                        child: Icon(
-                          // 始终显示正常菜单图标；生成期间不可点击时仅置灰提示不可用
-                          CupertinoIcons.line_horizontal_3,
-                          color: isDark
-                              ? (isStreaming
-                                    ? AppTheme.buttonDisabledTextDark
-                                    : AppTheme.accentBlueDark)
-                              : (isStreaming
-                                    ? AppTheme.buttonDisabledTextLight
-                                    : AppTheme.accentBlueLight),
-                          size: 18,
-                        ),
-                      ),
-                    ),
+                      );
+                    },
                   );
                 },
               );

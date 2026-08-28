@@ -143,6 +143,10 @@ final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
 /// 用于让右上角菜单按钮在生成期间禁用并给出视觉提示，生成完成后恢复可点击。
 final ValueNotifier<bool> storyStreamingNotifier = ValueNotifier<bool>(false);
 
+/// 【进入世界动画】右上角菜单按钮的不透明度（0=黑屏期间隐藏，1=正常）。
+/// 新用户首次生成时，菜单按钮随"渐亮"阶段与屏幕一起淡入，不破坏全黑沉浸。
+final ValueNotifier<double> menuRevealNotifier = ValueNotifier<double>(1.0);
+
 /// 正文中的用户选择节点（未来"时间树"返回功能的数据点）
 class _ChoiceRecord {
   /// 用户选择的内容
@@ -325,6 +329,7 @@ class _HomeContentState extends State<HomeContent>
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _pageController.dispose();
+    _blackoutController.removeListener(_onBlackoutTick);
     _blackoutController.dispose();
     _transitionStepTimer?.cancel();
     _restoreSystemBars();
@@ -495,8 +500,9 @@ class _HomeContentState extends State<HomeContent>
             _segmentChoices[_storyStartIndex + i] = (i < snap.choices.length
                 ? snap.choices[i]
                 : const <String>[]);
-            _segmentScriptIds[_storyStartIndex + i] =
-                (i < snap.scriptIds.length ? snap.scriptIds[i] : '');
+            _segmentScriptIds[_storyStartIndex + i] = (i < snap.scriptIds.length
+                ? snap.scriptIds[i]
+                : '');
           }
           // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）
           _choices.clear();
@@ -875,6 +881,11 @@ class _HomeContentState extends State<HomeContent>
         },
         onDone: (outputs) async {
           if (!mounted) return;
+          // 【诊断】done 到达（续写轮）——判断"收到 done 但按钮未恢复"
+          debugPrint(
+            '[home] onDone #1 hadContent=$hadContent '
+            'hasActions=$_hasRecommendedActions',
+          );
           if (!hadContent) {
             // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：不在弹窗前改动
             // 布局状态——保持当前流式布局在弹窗背后原样冻结（见 onError 说明），
@@ -1013,7 +1024,11 @@ class _HomeContentState extends State<HomeContent>
       if (!skipText) {
         children.add(
           useTypewriter
-              ? _buildStorySegment(displayText, isLast: isLast, segIndex: segIndex)
+              ? _buildStorySegment(
+                  displayText,
+                  isLast: isLast,
+                  segIndex: segIndex,
+                )
               : CharacterText(text: displayText),
         );
       }
@@ -1023,7 +1038,8 @@ class _HomeContentState extends State<HomeContent>
       //    流式新段（数组末尾）即"最新一段"，故自动不渲染卡片；打字开始时它出现
       //    造成的高度变化由底部"生成区"的预留空白吸收，正文中不会留下空白。
       //    脚本最后一章：无配套选项，也不渲染卡片。
-      final bool renderCard = !isStreamingSegment &&
+      final bool renderCard =
+          !isStreamingSegment &&
           segIndex < _storyTexts.length - 1 &&
           !scriptLast;
       if (renderCard) {
@@ -1233,7 +1249,15 @@ class _HomeContentState extends State<HomeContent>
             );
           },
           transitionBuilder: (Widget child, Animation<double> animation) {
-            return FadeTransition(opacity: animation, child: child);
+            // 设置页之间（含 主角设定 → 设置总览）用"左拉"滑动切换，
+            // 与 PageView 内各页的左右滑动一致，取代原来的淡入淡出（弹出）效果。
+            return SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(1.0, 0.0), // 新页面从右侧滑入（视觉上整页左移）
+                end: Offset.zero,
+              ).animate(animation),
+              child: child,
+            );
           },
           child: _setupStep < 4
               ? KeyedSubtree(
@@ -1535,8 +1559,13 @@ class _HomeContentState extends State<HomeContent>
     // 期间 LLM 照常生成（onChunk 等只负责正文数据与打字机，不干预黑屏动画）。
     // 动画期间把系统状态栏/导航栏设为深色，避免纯黑背景下系统栏露出亮条。
     _applyBlackoutSystemBars();
+    // 黑屏期间隐藏右上角菜单按钮，随"渐亮"阶段与屏幕一起淡入（不破坏全黑沉浸）
+    menuRevealNotifier.value = 0.0;
+    _blackoutController.addListener(_onBlackoutTick);
     _blackoutController.forward().whenComplete(() {
       if (!mounted) return;
+      _blackoutController.removeListener(_onBlackoutTick);
+      menuRevealNotifier.value = 1.0;
       _restoreSystemBars();
       setState(() {
         _blackoutActive = false;
@@ -1644,6 +1673,11 @@ class _HomeContentState extends State<HomeContent>
         },
         onDone: (outputs) async {
           if (!mounted) return;
+          // 【诊断】done 到达（首次生成）——判断"收到 done 但按钮未恢复"
+          debugPrint(
+            '[home] onDone #2 hadContent=$hadContent '
+            'hasActions=$_hasRecommendedActions',
+          );
           if (!hadContent) {
             // 本次未收到任何有效正文（如 LLM 额度用尽返回空白）：结束加载状态并弹窗警告
             setState(() {
@@ -1724,11 +1758,21 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 黑屏动画每帧回调：在"渐亮"阶段（最后 4s，v 从 11/15 → 1）把右上角菜单按钮
+  /// 的不透明度同步到内容亮度，随屏幕一起淡入。
+  void _onBlackoutTick() {
+    final double v = _blackoutController.value;
+    final double t = ((v - 11 / 15) / (4 / 15)).clamp(0.0, 1.0);
+    menuRevealNotifier.value = Curves.easeInOut.transform(t).clamp(0.0, 1.0);
+  }
+
   /// 中止"进入你的世界"动画（出错/违规/卡死时立即结束黑屏，不再等完整 15s 走完）。
   /// 取消切页计时、停止黑屏动画、恢复系统栏样式，并移除黑屏覆盖层。
   void _abortBlackoutTransition() {
     _transitionStepTimer?.cancel();
     _transitionStepTimer = null;
+    _blackoutController.removeListener(_onBlackoutTick);
+    menuRevealNotifier.value = 1.0;
     if (_blackoutController.isAnimating) {
       _blackoutController.stop();
     }

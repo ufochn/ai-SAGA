@@ -19,11 +19,13 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import re
 import secrets
 import sqlite3
+import struct
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -66,6 +68,21 @@ CASE_DIFY_API_KEY = os.environ.get("CASE_DIFY_API_KEY", "")
 CASE_DIFY_API_URL = os.environ.get("CASE_DIFY_API_URL", DIFY_API_URL)
 # 输出 token 上限（Dify max_tokens，需在 Dify 画布 LLM 节点绑定 max_tokens 输入变量）
 DIFY_MAX_TOKENS = int(os.environ.get("DIFY_MAX_TOKENS", "4000"))
+# ---- 统一超时策略（默认 30 秒）----
+# 四段传输（App→FastAPI、FastAPI→Dify、Dify→FastAPI、FastAPI→App）一律 30 秒
+# 空闲超时，且"收到任何数据或心跳即重置 30 秒"。服务器在等待阻塞式 Dify 调用期间
+# 会持续推送心跳（15s 一次），避免慢 Dify 被误判超时；一旦真的超过 30 秒
+# （任一端无数据/心跳），FastAPI 直接关闭当前任务不再等待，客户端 30 秒无数据
+# 自然弹出"网络疑似超时，请重启重试"提示。
+# 生产环境可用环境变量覆盖（默认均为 30）：
+#   DIFY_HTTP_TIMEOUT         共享客户端默认（connect/read/write/pool）
+#   CASE_DIFY_TIMEOUT         案件核心生成（blocking 工作流）
+#   AUDIT_DIFY_TIMEOUT        内容审核（blocking 工作流）
+#   STORY_DIFY_STREAM_TIMEOUT 小说正文流式读取（read 阶段，收数据即重置）
+DIFY_HTTP_TIMEOUT = float(os.environ.get("DIFY_HTTP_TIMEOUT", "30"))
+CASE_DIFY_TIMEOUT = float(os.environ.get("CASE_DIFY_TIMEOUT", "30"))
+AUDIT_DIFY_TIMEOUT = float(os.environ.get("AUDIT_DIFY_TIMEOUT", "30"))
+STORY_DIFY_STREAM_TIMEOUT = float(os.environ.get("STORY_DIFY_STREAM_TIMEOUT", "30"))
 # 输入 token 估算上限（入口硬拦，估算在花钱之前）
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "5000"))
 # 输入字符数兜底上限（防止极端长文本撑爆估算）
@@ -74,6 +91,32 @@ MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
 # 小说文本由用户付费生成，默认一亿字≈无实际限制；仅作兜底，防止异常超大
 # payload 打爆内存/磁盘或触发反向代理请求体限制。
 MAX_STORY_TOTAL_CHARS = int(os.environ.get("MAX_STORY_TOTAL_CHARS", "100000000"))
+
+# ---- RAG 记忆检索（嵌入 API：当前用 Jina v3，可切回 HF bge-m3）----
+# 小说正文切块后经嵌入 API 编码（1024 维）。变量名沿用 HF_*（历史命名），
+# 现在实际指向任意 OpenAI 兼容嵌入服务（如 Jina），_embed_texts 自动适配两种返回格式。
+# 未配置 HF_TOKEN 时 RAG 整体优雅降级（跳过嵌入/检索，不影响原有生成流程）。
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "jina-embeddings-v3").strip()
+HF_EMBED_URL = os.environ.get("HF_EMBED_URL", "https://api.jina.ai/v1/embeddings").strip()
+HF_EMBED_TIMEOUT = float(os.environ.get("HF_EMBED_TIMEOUT", "30"))
+# 切块参数：600 token / 重复 100；结尾倒推 600（最后一块保证覆盖章节结尾）
+RAG_CHUNK_TOKENS = int(os.environ.get("RAG_CHUNK_TOKENS", "600"))
+RAG_CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "100"))
+# 语义检索：cosine top-k，只发射 ≥ 阈值的候选
+RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
+RAG_SEMANTIC_THRESHOLD = float(os.environ.get("RAG_SEMANTIC_THRESHOLD", "0.65"))
+# ---- RAG 补建与并发调优 ----
+# 触发轮补建：非零且 seq 被 RAG_BACKFILL_EVERY(5) 整除时，先取当前章节向量，
+# 成功后检测该用户缺向量的章节，按"补一条成功再续一条"顺序补，最多 RAG_BACKFILL_BATCH(5) 条。
+RAG_BACKFILL_EVERY = int(os.environ.get("RAG_BACKFILL_EVERY", "5"))
+RAG_BACKFILL_BATCH = int(os.environ.get("RAG_BACKFILL_BATCH", "5"))
+# 检索（用户行动）等待向量返回的超时：RAG_RETRIEVE_TIMEOUT(3) 秒内拿不到就无感降级、放弃本轮 RAG。
+RAG_RETRIEVE_TIMEOUT = float(os.environ.get("RAG_RETRIEVE_TIMEOUT", "3"))
+# 应用层并发上限：同时最多 RAG_MAX_INFLIGHT(5) 个嵌入请求在飞，满了直接跳过（留给补建），不排队。
+RAG_MAX_INFLIGHT = int(os.environ.get("RAG_MAX_INFLIGHT", "5"))
+# HF 专用连接池上限（与 Dify 分离，便于定位瓶颈）：物理兜底。
+HF_MAX_CONNECTIONS = int(os.environ.get("HF_MAX_CONNECTIONS", "50"))
 
 DATA_DIR = os.environ.get("DATA_DIR", "/code/data")
 TOKEN_EXPIRY_DAYS = int(os.environ.get("TOKEN_EXPIRY_DAYS", "7"))
@@ -221,6 +264,10 @@ CREATE TABLE IF NOT EXISTS story_segments (
     UNIQUE(user_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_segments_user_seq ON story_segments(user_id, seq);
+-- 按脚本号去重的覆盖索引：支撑每次拉取时按 (user_id, current_script_id) 定点查
+-- MAX(seq)，避免对整份小说做全表扫描。
+CREATE INDEX IF NOT EXISTS idx_segments_user_script_seq
+    ON story_segments(user_id, current_script_id, seq);
 
 -- 注册挑战（一次性、短时有效）
 CREATE TABLE IF NOT EXISTS challenges (
@@ -334,6 +381,41 @@ CREATE TABLE IF NOT EXISTS fiction_script (
     chapter_script_20 TEXT DEFAULT '',
     chapter_script_20_choice_2 TEXT DEFAULT '',
     chapter_script_20_choice_3 TEXT DEFAULT ''
+);
+
+-- RAG 记忆检索：人名登记（每章一份）+ 原文切块向量 + 名字→最新章节反查。
+-- 人名来自 Dify 生成工作流 LLM② 返回量（并入氛围/背景音乐那一路，不新增 LLM 调用）。
+CREATE TABLE IF NOT EXISTS story_chapter_distill (
+    user_id      TEXT NOT NULL,
+    segment_seq  INTEGER NOT NULL,          -- 对应 story_segments.seq
+    current_script_id TEXT DEFAULT '',      -- "脚本id-章节"
+    characters   TEXT NOT NULL DEFAULT '[]',-- JSON 数组：本章人物名单
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (user_id, segment_seq)
+);
+
+-- 原文切块向量：600/100 切块（结尾倒推 600），bge-m3 1024 维 float32 BLOB
+CREATE TABLE IF NOT EXISTS story_chunk_vectors (
+    user_id      TEXT NOT NULL,
+    chunk_id     TEXT NOT NULL,             -- f"{segment_seq}-{offset}"
+    segment_seq  INTEGER NOT NULL,
+    current_script_id TEXT DEFAULT '',
+    text         TEXT NOT NULL,             -- 该块原文
+    embedding    BLOB NOT NULL,             -- 1024 * float32
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (user_id, chunk_id)
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_vec_user_seq
+    ON story_chunk_vectors(user_id, segment_seq);
+
+-- 名字反查：每个名字只保留"最新记忆"（最靠后出现的章节 seq）。
+-- 重名时用新章节覆盖旧条目（不区分脚本），删除老记忆。
+CREATE TABLE IF NOT EXISTS story_character_lookup (
+    user_id     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    segment_seq INTEGER NOT NULL,           -- 该名字最新出现的章节 seq
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (user_id, name)
 );
 """
 
@@ -462,12 +544,21 @@ def _extract_guardrail_output(dify_data: Any) -> str:
     return ""
 
 
-async_http_client = httpx.AsyncClient(timeout=60.0)
+async_http_client = httpx.AsyncClient(timeout=DIFY_HTTP_TIMEOUT)
+# HF 嵌入专用客户端：与 Dify 连接池分离，便于日后定位"哪边不够用"。
+hf_http_client = httpx.AsyncClient(
+    timeout=HF_EMBED_TIMEOUT,
+    limits=httpx.Limits(
+        max_connections=HF_MAX_CONNECTIONS,
+        max_keepalive_connections=max(5, HF_MAX_CONNECTIONS // 5),
+    ),
+)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await async_http_client.aclose()
+    await hf_http_client.aclose()
 
 
 # ================= 令牌工具 =================
@@ -1275,17 +1366,20 @@ def _parse_audit_json(out: str) -> Optional[str]:
 
 
 class ModerationOutcome(Enum):
-    """审核结果三态：区分"明确违规"与"审核不可用"。
+    """审核结果：区分"明确违规"、"审核不可用"与"审核超时"。
 
     - PASS：明确判定通过（action == "none"）。
     - REJECT：审核成功并返回非 none 的 action（明确判定违规）。
     - UNAVAILABLE：审核不可用（配额超限 / 网络失败 / 非 200 / 输出无法解析）。
       这是审核链路自身的问题，不代表内容违规，调用方应作为可重试错误处理，
       而不是弹出"内容违规"警告（避免弱网/审核服务抖动被误判为用户违规）。
+    - TIMEOUT：Dify 审核 30 秒无返回（超时）。按统一超时规则，流式层据此
+      直接关闭当前流，客户端 30 秒无数据自然弹"网络疑似超时，请重启重试"。
     """
     PASS = "pass"
     REJECT = "reject"
     UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
 
 
 def _build_audit_verdict(out: str) -> dict:
@@ -1344,7 +1438,7 @@ async def _moderate_story(text: str) -> ModerationOutcome:
     }
     try:
         resp = await async_http_client.post(
-            DIFY_API_URL, json=payload, headers=headers, timeout=60.0
+            DIFY_API_URL, json=payload, headers=headers, timeout=AUDIT_DIFY_TIMEOUT
         )
         if resp.status_code != 200:
             return ModerationOutcome.UNAVAILABLE
@@ -1355,8 +1449,12 @@ async def _moderate_story(text: str) -> ModerationOutcome:
             # 审核成功但无有效 action 判定：视为审核链路异常（可重试），非违规
             return ModerationOutcome.UNAVAILABLE
         return ModerationOutcome.PASS if action == "none" else ModerationOutcome.REJECT
+    except httpx.TimeoutException:
+        # Dify 审核 30 秒无返回：按统一超时规则标记为 TIMEOUT（非内容违规），
+        # 由流式层据此直接关闭当前流，客户端 30 秒无数据弹"重启"提示。
+        return ModerationOutcome.TIMEOUT
     except Exception:
-        # 网络 / 超时 / 解析异常：审核不可用（可重试），非违规
+        # 网络 / 解析异常：审核不可用（可重试），非违规
         return ModerationOutcome.UNAVAILABLE
 
 
@@ -1445,7 +1543,7 @@ async def _generate_case_meta(chapter: int = 1, script_id: Optional[int] = None)
     }
     try:
         resp = await async_http_client.post(
-            CASE_DIFY_API_URL, json=payload, headers=headers, timeout=30.0
+            CASE_DIFY_API_URL, json=payload, headers=headers, timeout=CASE_DIFY_TIMEOUT
         )
         if resp.status_code != 200:
             logger.warning("案件工作流返回非 200：%s，终止本次生成", resp.status_code)
@@ -1490,10 +1588,10 @@ async def _generate_case_meta(chapter: int = 1, script_id: Optional[int] = None)
         # 已构造好的案件核心失败信息：直接向上抛出，由调用方终止整个生成请求
         raise
     except httpx.TimeoutException:
-        # 案件核心生成超时：没有案件核心生成的小说不合格，直接向上抛出，
-        # 由调用方终止整个生成请求（不落库、不再继续后续生成）。
-        logger.warning("案件工作流调用超时（30 秒），终止本次生成")
-        raise CaseCoreError("案件工作流调用超时（30 秒）")
+        # 案件核心生成 30 秒超时：按统一超时规则把 httpx.TimeoutException 原样上抛，
+        # 流式层捕获后直接关闭当前流（不发送错误事件），客户端 30 秒无数据弹"重启"提示。
+        logger.warning("案件工作流调用超时（%s 秒），终止本次生成", CASE_DIFY_TIMEOUT)
+        raise
     except Exception as e:
         logger.warning("案件工作流调用失败", exc_info=True)
         raise CaseCoreError(f"案件工作流调用失败：{e}")
@@ -1678,75 +1776,28 @@ def _get_current_case_story(user_id: str, seq: int) -> str:
         conn.close()
 
 
-# 后续变量保底默认值：任一原因取不到时写入数据库的兜底值
-# choice_1 恒为空白（用户想输入就输入，不输入就永远空白，不预填任何默认文案）；
-# choice_2/3 即 LLM② 推荐的下一轮行动（统一用 choices_2/3），默认行动选项按用户语言
-# （App 随请求上传 / 最新段快照的 language）选择对应语言版本；未知语言回退简体中文。
+# 后续变量默认值：choice_1 恒为空白（用户想输入就输入，不输入就永远空白，不预填文案）。
+# 【重要】choice_2/choice_3 一律不做任何兜底默认值：空即空，由脚本库当前章节提供；
+# 脚本章节没有选择即为脚本结束（触发换脚本）。任何"取不到就用通用文案托底"的逻辑
+# 都会让 choice_2/3 永不为空，导致"老脚本结束→换新脚本继续"永不触发，已彻底删除。
 # music_style 是 Dify 工作流结构化枚举（白名单 MUSIC_STYLE_VALUES），
 # 为保持与画布兼容，各语言统一用白名单内取值，不做本地化。
 META_DEFAULTS = {
     "choice_1": "",
-    "choice_2": "停下脚步，先观察四周再行动",
-    "choice_3": "换一个方向，探索其它可能",
     "music_style": "悬疑",
     "case_core": "",   # 当前案件核心（Dify core_content；无则保底为空）
 }
 META_DEFAULTS_BY_LANG = {
     "zh": META_DEFAULTS,
-    "zh-TW": {
-        "choice_1": "",
-        "choice_2": "停下腳步，先觀察四周再行動",
-        "choice_3": "換一個方向，探索其他可能",
-        "music_style": "悬疑",
-    },
-    "yue": {
-        "choice_1": "",
-        "choice_2": "停低腳步，先睇下四周再行動",
-        "choice_3": "轉另一個方向，探索其他可能",
-        "music_style": "悬疑",
-    },
-    "en": {
-        "choice_1": "",
-        "choice_2": "Pause, observe your surroundings before acting",
-        "choice_3": "Change direction and explore other possibilities",
-        "music_style": "悬疑",
-    },
-    "es": {
-        "choice_1": "",
-        "choice_2": "Detente, observa tu entorno antes de actuar",
-        "choice_3": "Cambia de dirección y explora otras posibilidades",
-        "music_style": "悬疑",
-    },
-    "fr": {
-        "choice_1": "",
-        "choice_2": "Arrêtez-vous, observez les alentours avant d'agir",
-        "choice_3": "Changez de direction et explorez d'autres possibilités",
-        "music_style": "悬疑",
-    },
-    "de": {
-        "choice_1": "",
-        "choice_2": "Halte inne und beobachte zuerst deine Umgebung",
-        "choice_3": "Schlage eine andere Richtung ein und erkunde weitere Möglichkeiten",
-        "music_style": "悬疑",
-    },
-    "pt": {
-        "choice_1": "",
-        "choice_2": "Pare, observe ao redor antes de agir",
-        "choice_3": "Mude de direção e explore outras possibilidades",
-        "music_style": "悬疑",
-    },
-    "ja": {
-        "choice_1": "",
-        "choice_2": "立ち止まり、まず周囲を観察してから行動する",
-        "choice_3": "方向を変えて、他の可能性を探る",
-        "music_style": "悬疑",
-    },
-    "ko": {
-        "choice_1": "",
-        "choice_2": "멈추고, 먼저 주변을 관찰한 뒤 행동한다",
-        "choice_3": "방향을 바꿔 다른 가능성을 탐색한다",
-        "music_style": "悬疑",
-    },
+    "zh-TW": {"choice_1": "", "music_style": "悬疑"},
+    "yue": {"choice_1": "", "music_style": "悬疑"},
+    "en": {"choice_1": "", "music_style": "悬疑"},
+    "es": {"choice_1": "", "music_style": "悬疑"},
+    "fr": {"choice_1": "", "music_style": "悬疑"},
+    "de": {"choice_1": "", "music_style": "悬疑"},
+    "pt": {"choice_1": "", "music_style": "悬疑"},
+    "ja": {"choice_1": "", "music_style": "悬疑"},
+    "ko": {"choice_1": "", "music_style": "悬疑"},
 }
 
 
@@ -1787,13 +1838,27 @@ def _extract_story_meta(
                 return v.strip()
         return ""
 
+    def _pick_raw(*names: str) -> Any:
+        for n in names:
+            v = src.get(n)
+            if v is not None and v != "":
+                return v
+        return None
+
+    # 人物名单：来自 Dify 生成工作流 LLM② 返回量（并入氛围/背景音乐那一路，不新增调用）。
+    # 兼容 JSON 数组字符串 / 真列表 / 逗号顿号换行分隔文本；缺失为空列表（人名登记跳过）。
+    characters = _parse_character_names(
+        _pick_raw("characters", "character_names", "characters_list", "人物名单", "人物")
+    )
+
     meta = {
         "choice_1": "",  # 默认空白，由用户后续自行填写
-        # choice_2/choice_3 仅保底默认值；由脚本库当前章节选择在流式段覆盖
-        "choice_2": defaults["choice_2"],
-        "choice_3": defaults["choice_3"],
+        # choice_2/choice_3 不做任何兜底：空即空，由脚本库当前章节在流式段覆盖
+        "choice_2": "",
+        "choice_3": "",
         "music_style": _s("music", "music_style") or defaults["music_style"],
         "case_core": _s("case_core", "core_content", "content") or defaults["case_core"],
+        "characters": characters,
     }
     if meta["music_style"] not in MUSIC_STYLE_VALUES:
         meta["music_style"] = defaults["music_style"]
@@ -1841,14 +1906,12 @@ async def _persist_story_segment(
         return
     now = int(time.time())
     settings = settings or {}
-    # 直接用上层已提取好的后续变量（choice_1/2/3/music_style），只对缺失字段用保底补齐。
-    # choice_2/choice_3 已改由脚本库提供（流式段已按脚本当前章节的选择覆盖），
-    # 这里不再从 Dify 提取（action_a/action_b 已删除）。
+    # 直接用上层已提取好的后续变量（choice_1/2/3/music_style）。
+    # 仅对 music_style 用保底；choice_1/2/3 不做任何托底（空即空，由脚本库/用户提供）。
     m = dict(meta or {})
     _defaults = _meta_defaults(settings.get("language"))
-    for _k in ("choice_1", "choice_2", "choice_3", "music_style"):
-        if not m.get(_k):
-            m[_k] = _defaults.get(_k, "")
+    if not m.get("music_style"):
+        m["music_style"] = _defaults.get("music_style", "")
     meta = m
     conn = _db()
     try:
@@ -1909,6 +1972,18 @@ async def _persist_story_segment(
             ),
         )
         conn.commit()
+        # ---- RAG：人名登记 + 后台原文切块嵌入（异步，不阻塞生成流）----
+        # 触发轮（非零且 seq%5==0）：当前章节构建成功后顺序补建缺失；普通轮：fire-and-forget。
+        if _is_rag_trigger_seq(next_seq):
+            _schedule_rag_trigger_build(
+                user_id, next_seq, current_script_id,
+                new_segment, meta.get("characters") or [],
+            )
+        else:
+            _schedule_rag_build(
+                user_id, next_seq, current_script_id,
+                new_segment, meta.get("characters") or [],
+            )
     finally:
         conn.close()
 
@@ -1931,6 +2006,7 @@ def _persist_story_segments_atomic(
             (user_id,),
         ).fetchone()
         base_seq = row["m"] + 1
+        rag_items: list = []
         for offset, item in enumerate(segments):
             new_segment, settings, meta, case_meta, completed_script_ids = item
             if not new_segment or not new_segment.strip():
@@ -1938,9 +2014,9 @@ def _persist_story_segments_atomic(
             settings = settings or {}
             m = dict(meta or {})
             _defaults = _meta_defaults(settings.get("language"))
-            for _k in ("choice_1", "choice_2", "choice_3", "music_style"):
-                if not m.get(_k):
-                    m[_k] = _defaults.get(_k, "")
+            # 仅对 music_style 用保底；choice_1/2/3 不做任何托底（空即空）
+            if not m.get("music_style"):
+                m["music_style"] = _defaults.get("music_style", "")
             meta = m
             next_seq = base_seq + offset
             # 案件设定：case_meta 非 None 直接用；否则复制上一行
@@ -1990,12 +2066,19 @@ def _persist_story_segments_atomic(
                     completed_script_ids,
                 ),
             )
+            rag_items.append((next_seq, current_script_id, new_segment, meta.get("characters") or []))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    # ---- RAG：成对落库后，为每段后台构建人名登记 + 原文切块嵌入 ----
+    for _seq, _sid, _content, _names in rag_items:
+        if _is_rag_trigger_seq(_seq):
+            _schedule_rag_trigger_build(user_id, _seq, _sid, _content, _names)
+        else:
+            _schedule_rag_build(user_id, _seq, _sid, _content, _names)
 
 
 def _resolve_story_settings(user_id: str, data: StoryInputData) -> dict:
@@ -2065,6 +2148,8 @@ def _reset_story(user_id: str) -> None:
     conn = _db()
     try:
         conn.execute("DELETE FROM story_segments WHERE user_id=?", (user_id,))
+        # RAG 同步删除：清空该用户全部 RAG（distill/vectors/lookup）
+        _purge_rag_for_user(user_id, conn)
         conn.commit()
     finally:
         conn.close()
@@ -2143,6 +2228,510 @@ def _clean_story_text(raw: str) -> str:
     if not cleaned or not cleaned.strip():
         cleaned = _unwrap_wrapped(raw or "")
     return cleaned
+
+
+# ================= RAG 记忆检索（HF 托管 bge-m3） =================
+# 设计（已与产品确认）：
+#   - 每章落库后后台异步：人名登记（最新记忆）+ 原文切块(600/100, 结尾倒推600) 嵌入。
+#   - 每次用户行动指引做双通道检索（名字精确子串 + 语义 cosine top-3 ≥ 0.65）。
+#   - 检索【排除当前正在生成的脚本】（只对比之前脚本的人名和向量）。
+#   - 任一命中 → 注入整个章节原文；语义优先；多章≥阈值取最高分、并列随机；最多注入一章。
+#   - 未配置 HF_TOKEN 时 RAG 整体优雅降级（人名登记照常，嵌入/语义跳过）。
+
+
+def _rag_enabled() -> bool:
+    return bool(HF_TOKEN) and bool(EMBED_MODEL)
+
+
+def _parse_character_names(raw: Any) -> list:
+    """把 Dify 返回的「人物名单」解析为名字字符串列表（去空白/去空/去重，仅收 ≥2 字）。
+    兼容 JSON 数组字符串、真列表、逗号/顿号/换行分隔文本。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                v = json.loads(s)
+                items = v if isinstance(v, list) else [s]
+            except Exception:
+                items = [s]
+        else:
+            items = re.split(r"[、,，;；\n]+", s)
+    else:
+        items = [str(raw)]
+    out: list = []
+    for it in items:
+        if not isinstance(it, str):
+            continue
+        t = it.strip().strip("《》「」\"'（）()【】")
+        if len(t) >= 2 and t not in out:
+            out.append(t)
+    return out
+
+
+def _chunk_text(
+    text: str,
+    chunk_tokens: int = RAG_CHUNK_TOKENS,
+    overlap_tokens: int = RAG_CHUNK_OVERLAP,
+) -> list:
+    """原文切块：chunk_tokens / overlap_tokens，结尾倒推 chunk_tokens。
+    例（1300 token）：0-600、500-1100、700-1300（倒推 600）。总长 ≤ chunk → 整段一块。
+    近似 token：中日韩/全角单字符≈1 token，拉丁/数字词按 ~4 字符/token。"""
+    if not text or not text.strip():
+        return []
+    n = len(text)
+    starts: list = []   # 每个 token 起点的字符下标
+    toks: list = []     # 每个起点之后的近似 token 数
+    i = 0
+    while i < n:
+        ch = text[i]
+        if (
+            ("\u4e00" <= ch <= "\u9fff")
+            or ("\u3400" <= ch <= "\u4dbf")
+            or ("\u3040" <= ch <= "\u30ff")
+            or ("\uac00" <= ch <= "\ud7af")
+            or ("\uff00" <= ch <= "\uffef")
+        ):
+            starts.append(i)
+            toks.append(1)
+            i += 1
+        elif ch.isalnum():
+            j = i
+            while j < n and text[j].isalnum():
+                j += 1
+            starts.append(i)
+            toks.append(max(1, (j - i + 3) // 4))
+            i = j
+        else:
+            starts.append(i)
+            toks.append(1)
+            i += 1
+    total = sum(toks)
+    if total <= chunk_tokens:
+        return [text]
+    pref = [0]
+    for t in toks:
+        pref.append(pref[-1] + t)
+
+    def char_at_token(c: int) -> int:
+        if c <= 0:
+            return 0
+        if c >= total:
+            return n
+        lo, hi = 0, len(pref) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if pref[mid] >= c:
+                hi = mid
+            else:
+                lo = mid + 1
+        return starts[min(lo, len(starts) - 1)]
+
+    chunks: list = []
+    step = max(1, chunk_tokens - overlap_tokens)
+    start_t = 0
+    while start_t < total:
+        end_t = start_t + chunk_tokens
+        if end_t > total:
+            # 结尾倒推：最后一块 = 末尾往前 chunk_tokens
+            start_t = total - chunk_tokens
+            if start_t < 0:
+                start_t = 0
+            end_t = total
+        piece = text[char_at_token(start_t):char_at_token(end_t)]
+        if piece and (not chunks or piece != chunks[-1]):
+            chunks.append(piece)
+        if end_t >= total:
+            break
+        start_t = max(0, end_t - overlap_tokens)
+    return chunks
+
+
+def _normalize(v: list) -> list:
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]
+
+
+def _dot(a: list, b: list) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _pack_vec(v: list) -> bytes:
+    return struct.pack("<%df" % len(v), *v)
+
+
+def _unpack_vec(b: bytes) -> list:
+    return list(struct.unpack("<%df" % (len(b) // 4), b))
+
+
+# 应用层并发上限：同时最多 RAG_MAX_INFLIGHT 个嵌入请求在飞（满了跳过，不排队）。
+_rag_inflight = 0
+_rag_inflight_lock = asyncio.Lock()
+
+
+def _is_openai_compat_embed_url(url: str) -> bool:
+    """判断嵌入接口是否为 OpenAI 兼容格式（Jina 等）vs HF 原生格式。"""
+    return ("jina.ai" in url) or ("/v1/embeddings" in url) or ("openai" in url.lower())
+
+
+async def _embed_texts(texts: list) -> Optional[list]:
+    """调用嵌入 API（当前 Jina v3，可切回 HF bge-m3）。返回归一化向量列表；失败返回 None。
+    自动适配两种格式：
+      - HF 原生：POST {"inputs":[...]} → 返回 [[vec], ...]
+      - OpenAI 兼容（Jina）：POST {"model":..., "input":[...]} → 返回 {"data":[{embedding:...}, ...]}
+    应用层并发上限（RAG_MAX_INFLIGHT）：满了直接跳过（返回 None），不排队等待。"""
+    global _rag_inflight  # 函数内做了 +=1/-=1，需声明为模块级，避免被当作局部变量
+    if not _rag_enabled():
+        return None
+    if not texts:
+        return []
+    async with _rag_inflight_lock:
+        if _rag_inflight >= RAG_MAX_INFLIGHT:
+            logger.info("RAG 嵌入并发已满(%d)，跳过本次", RAG_MAX_INFLIGHT)
+            return None
+        _rag_inflight += 1
+    try:
+        if _is_openai_compat_embed_url(HF_EMBED_URL):
+            payload = {"model": EMBED_MODEL, "input": texts}
+        else:
+            payload = {"inputs": texts, "options": {"wait_for_model": True}}
+        resp = await hf_http_client.post(
+            HF_EMBED_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            timeout=HF_EMBED_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "RAG embed HTTP %d: %s", resp.status_code, (await resp.aread())[:300]
+            )
+            return None
+        data = resp.json()
+        vecs = None
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            vecs = [d.get("embedding") for d in data["data"]]  # OpenAI/Jina 格式
+        elif isinstance(data, list):
+            vecs = data  # HF 原生格式
+        if vecs is None or len(vecs) != len(texts):
+            logger.warning("RAG embed 返回结构异常: %s", type(data))
+            return None
+        out = []
+        for v in vecs:
+            if not isinstance(v, list) or not v:
+                return None
+            out.append(_normalize(v))
+        return out
+    except httpx.TimeoutException:
+        logger.warning("RAG embed 超时")
+        return None
+    except httpx.RequestError as e:
+        logger.warning("RAG embed 请求失败: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("RAG embed 异常: %s", e, exc_info=True)
+        return None
+    finally:
+        async with _rag_inflight_lock:
+            _rag_inflight -= 1
+
+
+def _register_character_names(user_id: str, conn, segment_seq: int, names: list) -> None:
+    """人名登记：每个名字只保留"最新记忆"（重名时新章节覆盖旧条目，不区分脚本）。"""
+    now = int(time.time())
+    for name in names:
+        conn.execute(
+            """INSERT INTO story_character_lookup (user_id, name, segment_seq, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id, name) DO UPDATE SET
+                 segment_seq=excluded.segment_seq, updated_at=excluded.updated_at""",
+            (user_id, name, segment_seq, now),
+        )
+
+
+async def _rag_build_job(
+    user_id: str, segment_seq: int, script_id: str, content: str, names=None, key=None
+) -> bool:
+    """后台 RAG 构建：原文切块 → 嵌入 → 写 story_chunk_vectors；人名登记最新记忆。
+    names=None（触发轮补建）时以已入库的 story_chapter_distill.characters 为准，不覆盖。
+    写入前反查源段落是否存在（防"删了又写回"）。返回 True=嵌入成功/无需嵌入；False=嵌入失败。"""
+    emb_ok = True
+    try:
+        chunks = _chunk_text(content)
+        vecs: list = []
+        if chunks and _rag_enabled():
+            got = await _embed_texts(chunks)
+            if got is None:
+                got = []
+                emb_ok = False  # HF 不可用/并发满/超时：跳过向量，留给补建
+            vecs = got
+        conn = _db()
+        try:
+            src = conn.execute(
+                "SELECT 1 FROM story_segments WHERE user_id=? AND seq=?",
+                (user_id, segment_seq),
+            ).fetchone()
+            if not src:
+                return False  # 源段落已删除/重写，丢弃本次构建
+            if names is None:
+                existing = conn.execute(
+                    "SELECT characters FROM story_chapter_distill WHERE user_id=? AND segment_seq=?",
+                    (user_id, segment_seq),
+                ).fetchone()
+                names = []
+                if existing:
+                    try:
+                        names = json.loads(existing["characters"] or "[]")
+                    except Exception:
+                        names = []
+            now = int(time.time())
+            conn.execute(
+                """INSERT OR REPLACE INTO story_chapter_distill
+                     (user_id, segment_seq, current_script_id, characters, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, segment_seq, script_id, json.dumps(names, ensure_ascii=False), now),
+            )
+            for offset, (piece, vec) in enumerate(zip(chunks, vecs)):
+                chunk_id = f"{segment_seq}-{offset}"
+                conn.execute(
+                    """INSERT OR REPLACE INTO story_chunk_vectors
+                         (user_id, chunk_id, segment_seq, current_script_id,
+                          text, embedding, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, chunk_id, segment_seq, script_id, piece, _pack_vec(vec), now),
+                )
+            _register_character_names(user_id, conn, segment_seq, names)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("RAG build 异常: %s", e, exc_info=True)
+        emb_ok = False
+    finally:
+        if key is not None:
+            _rag_building.discard(key)
+    return emb_ok
+
+
+def _schedule_rag_build(user_id: str, segment_seq: int, script_id: str, content: str, names=None) -> None:
+    key = (user_id, segment_seq)
+    if key in _rag_building:
+        return
+    try:
+        _rag_building.add(key)
+        asyncio.get_running_loop().create_task(
+            _rag_build_job(user_id, segment_seq, script_id, content, names, key)
+        )
+    except RuntimeError:
+        _rag_building.discard(key)
+
+
+def _script_id_of(current_script_id: Any) -> str:
+    return str(current_script_id or "").split("-")[0]
+
+
+async def _retrieve_rag(user_id: str, query: str, current_script_id: Any) -> Optional[str]:
+    """双通道检索：名字精确子串 + 语义 cosine（排除当前正在生成的脚本）。
+    命中 → 返回整个章节正文；否则 None。语义优先；多章≥阈值取最高分，并列随机；最多一章。"""
+    if not query or not query.strip() or not _rag_enabled():
+        return None
+    cur_sid = _script_id_of(current_script_id)
+    conn = _db()
+    try:
+        # ---- 语义通道 ----
+        sem_seq: Optional[int] = None
+        q_vec_raw = await _embed_texts([query.strip()])
+        if q_vec_raw:
+            q_vec = q_vec_raw[0]
+            rows = conn.execute(
+                "SELECT segment_seq, current_script_id, embedding FROM story_chunk_vectors WHERE user_id=?",
+                (user_id,),
+            ).fetchall()
+            scored = []
+            for r in rows:
+                if cur_sid and _script_id_of(r["current_script_id"]) == cur_sid:
+                    continue
+                sim = _dot(q_vec, _unpack_vec(r["embedding"]))
+                scored.append((sim, r["segment_seq"]))
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            above = [x for x in scored if x[0] >= RAG_SEMANTIC_THRESHOLD]
+            if above:
+                top_sim = above[0][0]
+                ties = [x for x in above if abs(x[0] - top_sim) < 1e-9]
+                sem_seq = random.choice(ties)[1]
+
+        # ---- 名字通道（精确子串，100% 命中才引用；不做模糊/拼音）----
+        name_seq: Optional[int] = None
+        q = query.strip()
+        names = conn.execute(
+            "SELECT name, segment_seq FROM story_character_lookup WHERE user_id=?",
+            (user_id,),
+        ).fetchall()
+        hits = []
+        for r in names:
+            nm = (r["name"] or "").strip()
+            if len(nm) >= 2 and nm in q:
+                hits.append(r["segment_seq"])
+        if hits:
+            cand = []
+            for seq in set(hits):
+                row = conn.execute(
+                    "SELECT current_script_id FROM story_segments WHERE user_id=? AND seq=?",
+                    (user_id, seq),
+                ).fetchone()
+                if row is None:
+                    continue
+                if cur_sid and _script_id_of(row["current_script_id"]) == cur_sid:
+                    continue
+                cand.append(seq)
+            if cand:
+                name_seq = max(cand)  # 最新记忆
+
+        # ---- 合并：语义优先；双命中不同章只传语义章 ----
+        pick_seq = sem_seq if sem_seq is not None else name_seq
+        if pick_seq is None:
+            return None
+        row = conn.execute(
+            "SELECT content FROM story_segments WHERE user_id=? AND seq=?",
+            (user_id, pick_seq),
+        ).fetchone()
+        return row["content"] if row else None
+    finally:
+        conn.close()
+
+
+def _purge_rag_for_user(user_id: str, conn, seqs=None, min_seq=None) -> None:
+    """同一事务内删除该用户 RAG 数据（distill + chunk_vectors，按 seq），
+    并重建名字反查表（只保留仍存在于 distill 的名字、指向最新 seq）。
+    seqs=None 且 min_seq=None → 全删；min_seq → 删 segment_seq > min_seq。"""
+    if seqs is None and min_seq is None:
+        conn.execute("DELETE FROM story_chapter_distill WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM story_chunk_vectors WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM story_character_lookup WHERE user_id=?", (user_id,))
+        return
+    if seqs is not None:
+        if not seqs:
+            return
+        marks = ",".join("?" * len(seqs))
+        conn.execute(
+            f"DELETE FROM story_chapter_distill WHERE user_id=? AND segment_seq IN ({marks})",
+            [user_id, *seqs],
+        )
+        conn.execute(
+            f"DELETE FROM story_chunk_vectors WHERE user_id=? AND segment_seq IN ({marks})",
+            [user_id, *seqs],
+        )
+    else:
+        conn.execute(
+            "DELETE FROM story_chapter_distill WHERE user_id=? AND segment_seq > ?",
+            (user_id, min_seq),
+        )
+        conn.execute(
+            "DELETE FROM story_chunk_vectors WHERE user_id=? AND segment_seq > ?",
+            (user_id, min_seq),
+        )
+    # 重建名字反查：只保留仍存在于 distill 的名字，且指向最新 seq
+    conn.execute("DELETE FROM story_character_lookup WHERE user_id=?", (user_id,))
+    rows = conn.execute(
+        "SELECT segment_seq, characters FROM story_chapter_distill WHERE user_id=?",
+        (user_id,),
+    ).fetchall()
+    latest: dict = {}
+    for r in rows:
+        try:
+            names = json.loads(r["characters"] or "[]")
+        except Exception:
+            names = []
+        for nm in names:
+            if isinstance(nm, str):
+                nm = nm.strip()
+                if len(nm) >= 2 and (nm not in latest or r["segment_seq"] > latest[nm]):
+                    latest[nm] = r["segment_seq"]
+    now = int(time.time())
+    for nm, seq in latest.items():
+        conn.execute(
+            """INSERT INTO story_character_lookup (user_id, name, segment_seq, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, nm, seq, now),
+        )
+
+
+# 名字通道靠人名登记（掉线时也会登记），这里只补语义向量；人名以 distill 已有为准。
+# 触发轮补建：非零且 seq 被 5 整除时，先取当前章节向量，成功后再顺序补缺失（一条接一条，最多 5 条）。
+_rag_building: set = set()  # 正在构建的 (user_id, seq)，避免并发重复
+
+
+def _is_rag_trigger_seq(seq: int) -> bool:
+    return RAG_BACKFILL_EVERY > 0 and seq >= RAG_BACKFILL_EVERY and seq % RAG_BACKFILL_EVERY == 0
+
+
+async def _rag_trigger_build_task(
+    user_id: str, current_seq: int, script_id: str, content: str, names, key
+) -> None:
+    """触发轮：先构建当前章节向量（await）；成功后再检测该用户缺向量的章节，
+    按"补一条成功再续一条"的顺序补，最多 RAG_BACKFILL_BATCH(5) 条；任一条失败即停。
+    全程在同一后台任务里串行 → 补建路径同一时刻最多 1 个嵌入请求在飞。"""
+    try:
+        ok = await _rag_build_job(user_id, current_seq, script_id, content, names, key)
+        if not ok:
+            logger.warning("RAG 触发轮：当前章节向量获取失败，跳过历史补建（HF 可能不健康）")
+            return
+        conn = _db()
+        try:
+            rows = conn.execute(
+                """SELECT segment_seq, content, current_script_id
+                   FROM story_segments
+                   WHERE user_id=?
+                     AND content IS NOT NULL AND trim(content) != ''
+                     AND segment_seq NOT IN (
+                         SELECT segment_seq FROM story_chunk_vectors WHERE user_id=?
+                     )
+                   ORDER BY segment_seq DESC
+                   LIMIT ?""",
+                (user_id, user_id, RAG_BACKFILL_BATCH),
+            ).fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            bkey = (user_id, r["segment_seq"])
+            if bkey in _rag_building:
+                continue
+            _rag_building.add(bkey)
+            try:
+                bok = await _rag_build_job(
+                    user_id, r["segment_seq"], r["current_script_id"] or "", r["content"], None, bkey
+                )
+            except Exception:
+                bok = False
+            if not bok:
+                logger.warning("RAG 补建失败，停止本轮顺序补建（HF 可能不健康）")
+                break
+    except Exception as e:
+        logger.warning("RAG 触发轮异常: %s", e, exc_info=True)
+    finally:
+        _rag_building.discard(key)
+
+
+def _schedule_rag_trigger_build(user_id: str, segment_seq: int, script_id: str, content: str, names) -> None:
+    """触发轮入口：seq 非零且被 5 整除时，当前章节构建 + 顺序补建合并在一个后台任务里。"""
+    if not _is_rag_trigger_seq(segment_seq):
+        return
+    if not _rag_enabled():
+        return
+    key = (user_id, segment_seq)
+    if key in _rag_building:
+        return
+    try:
+        _rag_building.add(key)
+        asyncio.get_running_loop().create_task(
+            _rag_trigger_build_task(user_id, segment_seq, script_id, content, names, key)
+        )
+    except RuntimeError:
+        _rag_building.discard(key)
 
 
 # ================= 路由：小说生成（流式：每满 400 字增量审核 → 通过即 chunk/reveal 显示） =================
@@ -2227,6 +2816,8 @@ async def generate_story(data: StoryInputData, request: Request):
                     "DELETE FROM story_segments WHERE user_id=? AND seq > ?",
                     (user_id, data.rewrite_from),
                 )
+                # RAG 同步删除：截断 seq > rewrite_from 的向量/人名/提纯
+                _purge_rag_for_user(user_id, conn, min_seq=data.rewrite_from)
                 conn.commit()
             finally:
                 conn.close()
@@ -2256,29 +2847,11 @@ async def generate_story(data: StoryInputData, request: Request):
 
     # 小说生成的唯一硬限为全局 STORY_DAILY_LIMIT（默认 1000 次/天，见 _check_story_quota）。
 
-    # 案件前置生成：首段（全新故事，无前文）时，在构建 Dify payload 之前先调用
-    # "案件生成"工作流生成 case_core 并随机抽取新脚本，使小说生成的 Dify 请求
-    # 自带刚生成的案件设定；pre_case_meta 同时传给 _persist_story_segment 直接复用。
-    # 续写轮：读上一段脚本序号（"脚本id-章节"），章节 +1，读脚本库对应章节正文/选择。
+    # pre_case_meta（案件核心 / 脚本章节）统一在 _stream 内解析：
+    # - 首段：案件核心是阻塞式 Dify 调用，必须放在流内配合 15s 心跳，让 SSE 响应头
+    #   立刻返回、客户端马上开始 30s 滚动计时，避免慢 Dify 在"响应头阶段"就被误判超时；
+    # - 续写轮：读上一段脚本序号（"脚本id-章节"），章节 +1（纯 DB 读，不阻塞）。
     pre_case_meta = None
-    if user_input_counter == 0:
-        # 首段：随机抽取新脚本，章节为第 1 章
-        try:
-            pre_case_meta = await _generate_case_meta(1)
-        except CaseCoreError as ce:
-            # 案件核心生成失败（超时 / 非 200 / 网络异常 / 空核心）：
-            # 没有核心的小说不合格，直接终止整个请求
-            logger.warning("首段案件核心生成失败，终止本次生成: %s", ce)
-            raise HTTPException(
-                status_code=503,
-                detail="案件核心生成失败，已终止本次生成，请稍后重试",
-            )
-        settings["case_core"] = pre_case_meta.get("case_core") or ""
-    else:
-        # 续写轮：读上一段脚本序号（"脚本id-章节"），章节 +1，读脚本库对应章节正文/选择
-        pre_case_meta = _load_next_script_chapter(user_id, user_input_counter)
-        if pre_case_meta is not None:
-            settings["case_core"] = pre_case_meta.get("case_core") or ""
 
     # Dify 开始节点 required 变量必须非空，空值用占位符兜底
     def _fill(v: str) -> str:
@@ -2288,36 +2861,88 @@ async def generate_story(data: StoryInputData, request: Request):
         "Authorization": f"Bearer {STORY_DIFY_API_KEY}",
         "Content-Type": "application/json",
     }
-    dify_payload = {
-        "inputs": {
-            # 用户设定
-            "location": _fill(settings.get("location") or ""),
-            "era": _fill(settings.get("era") or ""),
-            "player_name": _fill(settings.get("player_name") or ""),
-            # 语言用完整名称（如 简体中文/繁體中文/粤语（广府话 / Cantonese）/English...），
-            # 不用 zh/yue/en 缩写，避免 LLM 歧义
-            "language": _dify_language_name(settings.get("language") or ""),
-            "player_traits": _fill(settings.get("player_traits") or ""),
-            # 本轮信息
-            "seq": user_input_counter,
-            # 续写上下文：只传 corrent_case_all_content（当前案件正文原文）
-            "corrent_case_all_content": corrent_case_all_content,
-            "user_choice": data.user_input or "",
-            # 当前案件（续写时从快照读取；首轮为空）
-            "case_core": settings.get("case_core") or "",
-            # 当前章节脚本正文（来自与 case_core_prompt 同一随机脚本条目；续写轮无新选取则为空）
-            "chapter_script": (pre_case_meta or {}).get("chapter_text") or "",
-        },
-        "response_mode": "streaming",
-        "user": user_id,
-    }
 
-    async def _stream():
+    # 客户端断联标记（后台生成任务仍会继续执行，仅用于跳过需要用户交互的环节，
+    # 如"生成前确认"等待——客户端已断开就不会再点确认了）。
+    _conn_state = {"client_gone": False}
+
+    async def _generate_sse():
         nonlocal pre_case_meta, user_input_counter
         try:
+            # ---- 首段：案件核心在流内生成（SSE 响应头立刻返回）----
+            # 等待 Dify 期间每 15s 推一次心跳重置客户端 30s 滚动计时；
+            # 一旦真实超时（Dify 30s 无返回）或失败，按统一规则直接关闭当前流，
+            # 客户端 30s 无数据自然弹出"网络疑似超时，请重启重试"。
+            if user_input_counter == 0:
+                yield _sse({"event": "heartbeat", "message": "正在生成案件核心"})
+                case_task = asyncio.create_task(_generate_case_meta(1))
+                while True:
+                    done, _ = await asyncio.wait({case_task}, timeout=15)
+                    if case_task in done:
+                        try:
+                            pre_case_meta = case_task.result()
+                        except httpx.TimeoutException:
+                            logger.warning("STREAM 首段案件核心 Dify 超时（30 秒），关闭流")
+                            return
+                        except CaseCoreError as ce:
+                            logger.warning("STREAM 首段案件核心生成失败，关闭流: %s", ce)
+                            yield _sse({"event": "error", "message": "案件核心生成失败，已终止本次生成，请稍后重试"})
+                            return
+                        break
+                    yield _sse({"event": "heartbeat", "message": "正在生成案件核心"})
+                settings["case_core"] = pre_case_meta.get("case_core") or ""
+            else:
+                # 续写轮：读上一段脚本序号（"脚本id-章节"），章节 +1
+                pre_case_meta = _load_next_script_chapter(user_id, user_input_counter)
+                if pre_case_meta is not None:
+                    settings["case_core"] = pre_case_meta.get("case_core") or ""
+
+            # ---- RAG 检索：用户行动指引对【之前脚本】做双通道匹配，命中注入整章 ----
+            # 排除当前正在生成的脚本（当前脚本的 LLM 已能拿到自身信息，不重复喂）。
+            # 检索加了 RAG_RETRIEVE_TIMEOUT(3s) 兜底超时：拿不到就无感降级、放弃本轮 RAG。
+            rag_context = ""
+            if _rag_enabled() and (data.user_input or "").strip():
+                try:
+                    rag_context = (
+                        await asyncio.wait_for(
+                            _retrieve_rag(
+                                user_id,
+                                data.user_input,
+                                (pre_case_meta or {}).get("script_id") or "",
+                            ),
+                            timeout=RAG_RETRIEVE_TIMEOUT,
+                        )
+                        or ""
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("RAG retrieve 超时（%ss），跳过注入", RAG_RETRIEVE_TIMEOUT)
+                    rag_context = ""
+                except Exception as rag_e:
+                    logger.warning("RAG retrieve 异常，跳过注入: %s", rag_e)
+
+            # Dify 开始节点 required 变量必须非空，空值用占位符兜底（debug 预览用 payload）
+            dify_payload = {
+                "inputs": {
+                    "location": _fill(settings.get("location") or ""),
+                    "era": _fill(settings.get("era") or ""),
+                    "player_name": _fill(settings.get("player_name") or ""),
+                    "language": _dify_language_name(settings.get("language") or ""),
+                    "player_traits": _fill(settings.get("player_traits") or ""),
+                    "seq": user_input_counter,
+                    "corrent_case_all_content": corrent_case_all_content,
+                    "user_choice": data.user_input or "",
+                    "case_core": settings.get("case_core") or "",
+                    "chapter_script": (pre_case_meta or {}).get("chapter_text") or "",
+                    # RAG：之前脚本的整章记忆（无命中为空串）
+                    "rag_context": rag_context or "",
+                },
+                "response_mode": "streaming",
+                "user": user_id,
+            }
+
             # 【调试】生成前确认：调 Dify 之前先把 payload 发回 App 弹窗，
             # 等 App 用户点击确认后（POST /api/generate-story/confirm）才真正调 Dify。
-            # 等待期间每 15s 发一个 debug_waiting 心跳，防止客户端 40s 无数据判定卡死。
+            # 等待期间每 15s 发一个 debug_waiting 心跳，重置客户端 30s 滚动计时。
             if DEBUG_PAYLOAD_PREVIEW:
                 request_id = secrets.token_hex(16)
                 confirm_ev = asyncio.Event()
@@ -2330,6 +2955,11 @@ async def generate_story(data: StoryInputData, request: Request):
                     })
                     waited = 0.0
                     while not confirm_ev.is_set():
+                        # 客户端已断联：不会再点确认，跳过等待直接继续生成
+                        # （服务器照常执行自己的操作并落库）。
+                        if _conn_state["client_gone"]:
+                            logger.info("STREAM 客户端已断联，跳过 App 确认直接继续生成")
+                            break
                         if waited >= DEBUG_PAYLOAD_CONFIRM_TIMEOUT:
                             yield _sse({"event": "error", "message": "等待 App 确认超时，已取消本次生成"})
                             return
@@ -2371,13 +3001,16 @@ async def generate_story(data: StoryInputData, request: Request):
                         "case_core": settings.get("case_core") or "",
                         # 当前章节脚本正文（来自与 case_core_prompt 同一脚本条目；续写轮无新选取则为空）
                         "chapter_script": (pre_case_meta or {}).get("chapter_text") or "",
+                        # RAG：之前脚本的整章记忆（无命中为空串）
+                        "rag_context": rag_context or "",
                     },
                     "response_mode": "streaming",
                     "user": user_id,
                 }
 
                 async with async_http_client.stream(
-                    "POST", STORY_DIFY_API_URL, json=seg_payload, headers=headers
+                    "POST", STORY_DIFY_API_URL, json=seg_payload, headers=headers,
+                    timeout=STORY_DIFY_STREAM_TIMEOUT,
                 ) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", errors="replace")
@@ -2392,23 +3025,24 @@ async def generate_story(data: StoryInputData, request: Request):
                     displayed_len = 0       # 已发送给 App 的字符数
                     audit_no = 1            # 下一次审核序号 k（窗口 [STEP*(k-1)-OVERLAP, STEP*k)）
                     sent_first = False      # 是否已发送过首段 chunk
+                    audit_aborted = False   # 本次审核是否以 abort/error/超时终止（调用方据此 return）
                     outputs = {}
                     think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
                     meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/music_style）；workflow_finished 时更新，失败用保底默认
 
                     async def _audit_pipeline(text_arg: str, final: bool, final_outputs: Optional[dict] = None):
-                        """增量审核管道：把当前累计正文按审核窗口逐批送审，审核通过后
-                        把新确认的正文以 chunk/reveal 事件回发 App。
+                        """增量审核管道（async generator）：把当前累计正文按审核窗口逐批送审，
+                        逐个 yield 待发送的 SSE 事件（chunk/reveal）。
 
-                        - 正文每满 STEP 的整倍数（400、800、1200...）触发一次审核，
-                          把对应整窗口送审（final=False 时也只做这一步）；
-                        - final=True 时，再把末尾不足 STEP 整倍数的剩余部分整体审一次
-                          （窗口前仍带 OVERLAP 回溯，防边界漏网），并携带真实 outputs。
-                        返回 (events, fail)：events 为待发送事件列表；fail 非 None 表示
-                        审核未通过/不可用，应立即发送 fail 并终止。
+                        - 每窗口审核是阻塞式 Dify 调用（最长 AUDIT_DIFY_TIMEOUT 秒），等待期间
+                          每 15s yield 一个 heartbeat，重置客户端 30s 滚动计时；
+                        - REJECT（违规）→ yield abort；UNAVAILABLE（不可用）→ yield error；
+                          TIMEOUT（Dify 审核 30s 无返回）→ 不 yield 任何事件直接结束（关闭流），
+                          客户端 30s 无数据自然弹"网络疑似超时，请重启重试"；
+                        - 发生任一终止时置 audit_aborted=True，调用方据此 return 关闭整段流。
                         """
-                        nonlocal audit_no, displayed_len, sent_first
-                        events: list = []
+                        nonlocal audit_no, displayed_len, sent_first, audit_aborted
+                        audit_aborted = False
                         while len(text_arg) >= STORY_AUDIT_STEP * audit_no:
                             k = audit_no
                             win_end = STORY_AUDIT_STEP * k
@@ -2418,15 +3052,27 @@ async def generate_story(data: StoryInputData, request: Request):
                                 0, STORY_AUDIT_STEP * (k - 1) - STORY_AUDIT_OVERLAP
                             )
                             audit_text = text_arg[win_start:win_end]
-                            mr = await _moderate_story(audit_text)
+                            audit_task = asyncio.create_task(_moderate_story(audit_text))
+                            while True:
+                                done, _ = await asyncio.wait({audit_task}, timeout=15)
+                                if audit_task in done:
+                                    mr = audit_task.result()
+                                    break
+                                yield {"event": "heartbeat", "message": "内容审核中"}
+                            if mr is ModerationOutcome.TIMEOUT:
+                                logger.warning("STREAM audit Dify 超时（30 秒），关闭流")
+                                audit_aborted = True
+                                return
                             fail = _moderation_failure_sse(mr)
                             if fail is not None:
-                                return events, fail
+                                audit_aborted = True
+                                yield fail
+                                return
                             new_text = text_arg[displayed_len:win_end]
                             if not sent_first:
-                                events.append({"event": "chunk", "text": new_text})
+                                yield {"event": "chunk", "text": new_text}
                             else:
-                                events.append({"event": "reveal", "text": new_text, "outputs": {}})
+                                yield {"event": "reveal", "text": new_text, "outputs": {}}
                             logger.warning(
                                 "STREAM audit k=%d OK win=[%d,%d) disp=[%d,%d)",
                                 k, win_start, win_end, displayed_len, win_end,
@@ -2439,29 +3085,66 @@ async def generate_story(data: StoryInputData, request: Request):
                                 0, STORY_AUDIT_STEP * (audit_no - 1) - STORY_AUDIT_OVERLAP
                             )
                             audit_text = text_arg[win_start:]
-                            mr = await _moderate_story(audit_text)
+                            audit_task = asyncio.create_task(_moderate_story(audit_text))
+                            while True:
+                                done, _ = await asyncio.wait({audit_task}, timeout=15)
+                                if audit_task in done:
+                                    mr = audit_task.result()
+                                    break
+                                yield {"event": "heartbeat", "message": "内容审核中"}
+                            if mr is ModerationOutcome.TIMEOUT:
+                                logger.warning("STREAM audit tail Dify 超时（30 秒），关闭流")
+                                audit_aborted = True
+                                return
                             fail = _moderation_failure_sse(mr)
                             if fail is not None:
-                                return events, fail
+                                audit_aborted = True
+                                yield fail
+                                return
                             new_text = text_arg[displayed_len:]
                             if not sent_first:
-                                events.append({"event": "chunk", "text": new_text})
+                                yield {"event": "chunk", "text": new_text}
                             else:
                                 ev: dict = {"event": "reveal", "text": new_text}
                                 if final_outputs:
                                     ev["outputs"] = final_outputs
-                                events.append(ev)
+                                yield ev
                             logger.warning(
                                 "STREAM audit tail OK win_start=%d disp=[%d,%d)",
                                 win_start, displayed_len, len(text_arg),
                             )
                             displayed_len = len(text_arg)
                             sent_first = True
-                        return events, None
 
                     # 本段是否已完整收到 workflow_finished（用于区分"换脚本继续"与"流意外结束"）
                     segment_ended = False
-                    async for line in resp.aiter_lines():
+                    # Dify 流式读取配 15s 心跳看门狗：Dify 长时间不推 text_chunk
+                    # （慢生成/思考停顿，实测可达 30~50s）时给客户端发心跳重置其 30s
+                    # 滚动计时，避免慢 Dify 被误判卡死。read 在后台任务里继续跑，httpx
+                    # 30s read 超时仍会触发（真实挂起时统一关闭流，不无限发心跳）。
+                    async def _dify_lines_with_heartbeat():
+                        _it = resp.aiter_lines().__aiter__()
+                        while True:
+                            read_task = asyncio.create_task(_it.__anext__())
+                            try:
+                                while True:
+                                    done, _ = await asyncio.wait({read_task}, timeout=15)
+                                    if read_task in done:
+                                        try:
+                                            line = read_task.result()
+                                        except StopAsyncIteration:
+                                            return
+                                        yield line
+                                        break
+                                    yield None  # 心跳标记（15s 无新行）
+                            finally:
+                                if not read_task.done():
+                                    read_task.cancel()
+
+                    async for line in _dify_lines_with_heartbeat():
+                        if line is None:
+                            yield _sse({"event": "heartbeat", "message": "正在生成中"})
+                            continue
                         if not line.strip().startswith("data:"):
                             continue
                         raw = line.strip()[5:].strip()
@@ -2499,12 +3182,11 @@ async def generate_story(data: StoryInputData, request: Request):
                             txt = _strip_think(edata.get("text", "") or "", think_state)
                             if txt:
                                 full_text += txt
-                                events, fail = await _audit_pipeline(full_text, final=False)
-                                if fail is not None:
-                                    yield _sse(fail)
-                                    return
-                                for ev in events:
+                                # 增量审核（async generator，等待 Dify 期间自带 15s 心跳）
+                                async for ev in _audit_pipeline(full_text, final=False):
                                     yield _sse(ev)
+                                if audit_aborted:
+                                    return
 
                         elif etype == "workflow_finished":
                             outputs = edata.get("outputs") or {}
@@ -2512,14 +3194,14 @@ async def generate_story(data: StoryInputData, request: Request):
                                 outputs, settings.get("language")
                             )
                             # choice_2/choice_3 不再用 Dify 返回值（action_a/action_b），
-                            # 改用脚本库当前章节的选择；续写轮无新抽取脚本时保留保底默认值。
+                            # 改用脚本库当前章节的选择。脚本章节的选择是【权威】的：
+                            # 有就是有、没有就是空（空 = 该脚本章节走完 → 触发换脚本）。
+                            # 关键：不能用 `or meta.get(...)` 回退到 META_DEFAULTS 的非空兜底
+                            # 文案，否则 choice_2/3 永不为空、choices_available 恒为 True，
+                            # "老脚本结束→换新脚本继续"的逻辑永远不会触发。
                             if pre_case_meta is not None:
-                                meta["choice_2"] = (
-                                    pre_case_meta.get("choice_2") or meta.get("choice_2") or ""
-                                )
-                                meta["choice_3"] = (
-                                    pre_case_meta.get("choice_3") or meta.get("choice_3") or ""
-                                )
+                                meta["choice_2"] = pre_case_meta.get("choice_2") or ""
+                                meta["choice_3"] = pre_case_meta.get("choice_3") or ""
                             # 权威全文：只用"流式累计正文"（text_chunk 已按来源过滤，只含
                             # 小说节点文本）。不再信任 Dify 结束节点的 outputs["text"]——
                             # 它可能被 Dify 画布拼入 LLM② 的 music_style
@@ -2530,20 +3212,17 @@ async def generate_story(data: StoryInputData, request: Request):
                                 return
                             final_segment = out_text
                             # 增量送审（含末尾兜底），通过后把剩余正文 reveal 给 App。
-                            events, fail = await _audit_pipeline(
+                            async for ev in _audit_pipeline(
                                 out_text,
                                 final=True,
                                 final_outputs={
                                     **outputs,
                                     **meta,
                                 },
-                            )
-                            if fail is not None:
-                                logger.warning("STREAM audit FAILED: %s", fail)
-                                yield _sse(fail)
-                                return
-                            for ev in events:
+                            ):
                                 yield _sse(ev)
+                            if audit_aborted:
+                                return
                             # 是否有可用的下一轮选择（脚本当前章节 choice2/3 非空）
                             choices_available = bool(meta.get("choice_2") or meta.get("choice_3"))
                             # 计算本段应写入的 completed_script_ids：
@@ -2613,21 +3292,30 @@ async def generate_story(data: StoryInputData, request: Request):
                                 # 脚本库为空：无法继续，直接发送 done（无可用选择，暂存段不落库）
                                 yield _sse({"event": "done", "outputs": {**outputs, **fmeta}})
                                 return
-                            # 换脚本心跳①：开始向 Dify 申请新脚本的案件核心（case_core）前，
-                            # 先给 App 一个心跳，重置客户端 30s 无数据计时，避免阻塞式案件生成被误判卡死
+                            # 换脚本：像首段一样为新脚本准备（第 1 章 + 生成 case_core）。
+                            # 阻塞式 Dify 调用在等待期间每 15s 推心跳，重置客户端 30s 计时；
+                            # 真实超时（Dify 30s 无返回）按统一规则直接关闭当前流。
                             yield _sse({"event": "heartbeat", "message": "正在生成新案件核心"})
-                            # 像首段一样为新脚本准备（第 1 章 + 生成 case_core）
-                            try:
-                                pre_case_meta = await _generate_case_meta(1, script_id=new_script_id)
-                            except CaseCoreError as ce:
-                                # 案件核心生成失败（超时 / 非 200 / 网络异常 / 空核心）：
-                                # 没有核心的小说不合格，终止整个生成流程
-                                # （本段脚本已暂存未落库，遵循"成对存在/成对不存在"原子规则）
-                                logger.warning("STREAM 案件核心生成失败，终止本次生成（暂存段不落库）: %s", ce)
-                                yield _sse({"event": "error", "message": "案件核心生成失败，已终止本次生成，请稍后重试"})
-                                return
+                            case_task = asyncio.create_task(_generate_case_meta(1, script_id=new_script_id))
+                            while True:
+                                done, _ = await asyncio.wait({case_task}, timeout=15)
+                                if case_task in done:
+                                    try:
+                                        pre_case_meta = case_task.result()
+                                    except httpx.TimeoutException:
+                                        logger.warning("STREAM 换脚本案件核心 Dify 超时（30 秒），关闭流")
+                                        return
+                                    except CaseCoreError as ce:
+                                        # 案件核心生成失败（非超时 / 非 200 / 网络异常 / 空核心）：
+                                        # 没有核心的小说不合格，终止整个生成流程
+                                        # （本段脚本已暂存未落库，遵循"成对存在/成对不存在"原子规则）
+                                        logger.warning("STREAM 案件核心生成失败，终止本次生成（暂存段不落库）: %s", ce)
+                                        yield _sse({"event": "error", "message": "案件核心生成失败，已终止本次生成，请稍后重试"})
+                                        return
+                                    break
+                                yield _sse({"event": "heartbeat", "message": "正在生成新案件核心"})
                             settings["case_core"] = pre_case_meta.get("case_core") or ""
-                            # 换脚本心跳②：案件核心已收到，开始向 Dify 申请新小说开头前，再给 App 一个心跳
+                            # 案件核心已就绪，开始向 Dify 申请新小说开头前，再给 App 一个心跳
                             yield _sse({"event": "heartbeat", "message": "案件核心已就绪，开始生成新章节"})
                             break  # 结束本段 Dify 流，外层 while 继续生成下一段
 
@@ -2638,12 +3326,10 @@ async def generate_story(data: StoryInputData, request: Request):
                     # 流意外结束（未收到 workflow_finished）：兜底，剩余内容仍须先审核再 reveal
                     if not segment_ended:
                         if full_text:
-                            events, fail = await _audit_pipeline(full_text, final=True)
-                            if fail is not None:
-                                yield _sse(fail)
-                                return
-                            for ev in events:
+                            async for ev in _audit_pipeline(full_text, final=True):
                                 yield _sse(ev)
+                            if audit_aborted:
+                                return
                             # 未收到 workflow_finished（无氛围等推演输出），按新规则不落库，仅推送正文
                             logger.warning("STREAM fallback skip persist (无氛围) final_len=%d", len(full_text))
                             yield _sse({"event": "done", "outputs": {**outputs, **meta}})
@@ -2651,12 +3337,48 @@ async def generate_story(data: StoryInputData, request: Request):
                             logger.warning("STREAM fallback empty_output full_len=%d sent_first=%s", len(full_text), sent_first)
                             yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
                         return
+        except httpx.TimeoutException as exc:
+            # Dify 任意一端 30 秒无数据/心跳：按统一规则直接关闭当前流，不再等待。
+            # 客户端自身 30 秒滚动计时会触发"网络疑似超时，请重启重试"提示。
+            logger.warning("STREAM Dify 超时（30 秒），关闭流: %s", exc)
+            return
         except httpx.RequestError as exc:
             logger.warning("STREAM RequestError: %s", exc, exc_info=True)
             yield _sse({"event": "error", "message": f"与 Dify 通信异常: {str(exc)}"})
         except Exception as e:
             logger.warning("STREAM Exception: %s", e, exc_info=True)
             yield _sse({"event": "error", "message": f"网关异常: {str(e)}"})
+
+    # 对外暴露的 SSE 生成器：把真正的生成逻辑（_generate_sse）放到后台任务里跑，
+    # 与客户端连接生命周期解耦。客户端断联只取消本 consumer，后台任务继续执行
+    # 自身操作（等待 Dify、审核、落库），保证用户重启 App 后同步能拉回完整数据。
+    async def _stream():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _pump():
+            try:
+                try:
+                    async for sse_line in _generate_sse():
+                        await queue.put(sse_line)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("STREAM 后台生成任务异常: %s", exc, exc_info=True)
+            finally:
+                await queue.put(None)
+
+        worker = asyncio.create_task(_pump())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            # 客户端断联：标记并【不取消】后台 worker，让服务器继续完成 Dify 收尾与落库。
+            _conn_state["client_gone"] = True
+            if not worker.done():
+                logger.info("STREAM 客户端断联，后台生成任务继续执行（不取消）")
 
     return StreamingResponse(
         _stream(),
@@ -2866,6 +3588,67 @@ async def device_activate(data: ActivateData, request: Request):
 
 
 # ================= 小说正文云存储（每段一行，与客户端 List<String> 数组对应） =================
+def _dedup_story_segments_by_script(user_id: str, rows: list) -> list:
+    """按脚本号（current_script_id，如 "2-5"）对【本次拉取到的 rows】做"近距"去重。
+
+    同一脚本号近期可能被脚本库合法复用（循环使用），所以不能见重复就删。只有当
+    "距离很近"的两个同脚本号才是并发重复生成（客户端断联后后台任务仍在跑、同时又有
+    新一轮请求并发写入同一脚本号）：
+      - seq 差 ≤ 3（中间至多隔 3 行，如 1-1,1-1；1-1,1-2,1-1；1-1,1-2,1-3,1-1）
+        → 删除较老的那个；
+      - seq 差 ≥ 4（如 1-1,1-2,1-3,1-4,1-1）→ 视为合法复用，两个都保留。
+
+    只对本次拉取窗口里出现的脚本号做定点查询，且只查"窗口 seq ±3"内的出现次数
+    （近距判定只需这些，走 (user_id, current_script_id, seq) 覆盖索引），不扫整份小说。
+    被判定为较老重复的行从数据库删除，并从返回中剔除（App 端不显示）。
+    返回去重后的 rows（类型、顺序与传入一致）。
+    """
+    conn = _db()
+    try:
+        # 本次窗口里出现的非空脚本号（冷启动 3 个 / 懒加载 10 个）
+        sids = []
+        for r in rows:
+            sid = r["current_script_id"]
+            if isinstance(sid, str) and sid and sid not in sids:
+                sids.append(sid)
+        if not sids:
+            return rows
+        # 近距判定只需窗口附近的行：窗口 seq 范围 ±3 即覆盖"间隔≤3"的所有可能重复
+        lo = min(r["seq"] for r in rows) - 3
+        hi = max(r["seq"] for r in rows) + 3
+        doomed: set = set()  # 判定为"较老重复章"待删除的 seq
+        for sid in sids:
+            occ = [
+                x[0]
+                for x in conn.execute(
+                    """SELECT seq FROM story_segments
+                       WHERE user_id=? AND current_script_id=?
+                         AND seq BETWEEN ? AND ?
+                       ORDER BY seq""",
+                    (user_id, sid, lo, hi),
+                ).fetchall()
+            ]
+            # 相邻两次出现：seq 差 ≤ 3 → 删除较老的那个（近距重复）；
+            # seq 差 ≥ 4 → 合法复用，两个都保留。
+            for i in range(1, len(occ)):
+                if occ[i] - occ[i - 1] <= 3:
+                    doomed.add(occ[i - 1])
+        if doomed:
+            for s in doomed:
+                conn.execute(
+                    "DELETE FROM story_segments WHERE user_id=? AND seq=?",
+                    (user_id, s),
+                )
+            # RAG 同步删除：被去重删除的章节，其向量/人名/提纯一并删除并重建名字反查
+            _purge_rag_for_user(user_id, conn, seqs=sorted(doomed))
+            conn.commit()
+            logger.warning("STORY 近距去重：删除较老的重复章节 seqs=%s", sorted(doomed))
+        # 从返回中剔除被删除的行
+        return [r for r in rows if r["seq"] not in doomed]
+    finally:
+        conn.close()
+
+
 @app.get("/api/story")
 async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     """获取该用户的小说正文数组（每段一行，seq 即数组下标）。
@@ -2909,6 +3692,9 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
                    WHERE user_id=? ORDER BY seq ASC""",
                 (user_id,),
             ).fetchall()
+        # 按脚本号去重（只针对本次拉取的少量行做定点查询，不扫全表）：同一脚本号
+        # 本次拉到的若不是全库最新一段，即较老的重复章 → 删库并剔除，App 端不显示。
+        rows = _dedup_story_segments_by_script(user_id, rows)
         updated_at = conn.execute(
             """SELECT COALESCE(MAX(created_at), 0) AS u FROM story_segments WHERE user_id=?""",
             (user_id,),
@@ -3045,6 +3831,8 @@ async def story_put(data: StoryData, request: Request):
             conn.close()
             return {"status": "ok", "applied": False}
         conn.execute("DELETE FROM story_segments WHERE user_id=?", (user_id,))
+        # RAG 同步删除：整组覆盖 → 清空该用户全部 RAG，由后台按新正文重建
+        _purge_rag_for_user(user_id, conn)
         conn.executemany(
             """INSERT INTO story_segments (user_id, seq, content, created_at)
                VALUES (?, ?, ?, ?)""",

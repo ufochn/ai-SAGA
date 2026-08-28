@@ -1,11 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
+
+/// 发送请求的最长等待（用户 App → FastAPI 这一段，统一 30 秒）。
+/// 服务器现在首段也会立刻返回 SSE 响应头（案件核心在流内生成并配心跳），
+/// 因此 30 秒足够覆盖建立连接 + 拿到响应头。
+const Duration kStorySendTimeout = Duration(seconds: 30);
+
+/// 流式"卡死"判定（两次数据到达之间的最长静默，统一 30 秒）。
+/// 四段传输（App→FastAPI、FastAPI→Dify、Dify→FastAPI、FastAPI→App）一律 30 秒
+/// 空闲超时，且收到任何数据或心跳即重置。服务器在阻塞式 Dify 调用（案件核心 /
+/// 内容审核）期间每 15s 推心跳，因此正常慢 Dify 不会误判；只有真正超过 30 秒
+/// 无任何数据/心跳才判定超时，触发"网络疑似超时，请重启重试"提示。
+const Duration kStoryIdleTimeout = Duration(seconds: 30);
 
 /// 小说生成服务（流式）：把用户设定发送到 FastAPI 网关，网关每满 400 字增量审核
 /// （窗口 [0,400)、[350,800)、[750,1200)... 重叠防漏网）、通过后以 SSE 流式返回
@@ -75,7 +88,8 @@ class StoryService {
     final token = await AuthService.ensureToken();
 
     final client = http.Client();
-    // 流式"卡死"标记：30 秒内没有任何数据到达（且未收到 done）时置 true，由 onStalled 处理
+    // 流式"卡死"标记：kStoryIdleTimeout 内没有任何数据到达（且未收到 done）时置 true，
+    // 由 onStalled 处理。取值见 kStoryIdleTimeout 注释（须大于服务器阻塞式 Dify 调用窗口）。
     var stalled = false;
     try {
       final request = http.Request('POST', Uri.parse(url));
@@ -99,7 +113,7 @@ class StoryService {
 
       final response = await client
           .send(request)
-          .timeout(const Duration(seconds: 180));
+          .timeout(kStorySendTimeout);
       if (response.statusCode != 200) {
         final body = await response.stream.bytesToString();
         String detail = 'HTTP ${response.statusCode}';
@@ -121,12 +135,15 @@ class StoryService {
       }
 
       var doneCalled = false;
-      // 打字机流超时：每次收到新数据都把等待时间重置为 30 秒，
-      // 超过 30 秒无任何数据到达即判定超时（调用 onStalled 提示重启）。
+      var terminatedByEvent = false; // 已通过 error/abort 事件终止（避免重复弹窗）
+      // 打字机流超时：每次收到新数据（含心跳）都把等待时间重置为 kStoryIdleTimeout，
+      // 超过该时长无任何数据到达即判定超时（调用 onStalled 提示重启）。
+      // 服务器在流中做阻塞式 Dify 调用时会每 15s 推心跳重置计时，只有真正超过
+      // 30 秒无任何数据/心跳才判定卡死（见 kStoryIdleTimeout 注释）。
       Timer? idleTimer;
       void armIdleTimer() {
         idleTimer?.cancel();
-        idleTimer = Timer(const Duration(seconds: 30), () {
+        idleTimer = Timer(kStoryIdleTimeout, () {
           if (!stalled) {
             stalled = true;
             onStalled?.call();
@@ -178,6 +195,7 @@ class StoryService {
             );
             break;
           case 'abort':
+            terminatedByEvent = true;
             onAbort(evt['reason'] as String? ??
                 StorageService.localizedText(
                   zhCN: '生成内容包含违规信息',
@@ -193,6 +211,7 @@ class StoryService {
                 ));
             break;
           case 'error':
+            terminatedByEvent = true;
             onError(
               evt['message'] as String? ??
                   StorageService.localizedText(
@@ -211,6 +230,8 @@ class StoryService {
             );
             break;
           case 'done':
+            // 【诊断】收到服务器 done 事件
+            debugPrint('[story] received done event');
             doneCalled = true;
             onDone(
               (evt['outputs'] as Map?)?.cast<String, dynamic>() ?? const {},
@@ -221,26 +242,46 @@ class StoryService {
         }
       }
       idleTimer?.cancel();
+      // 【诊断】流结束时的状态（用于判断"没收到 done"是否发生）
+      debugPrint('[story] stream ended: doneCalled=$doneCalled '
+          'stalled=$stalled terminatedByEvent=$terminatedByEvent');
       // 流式结束但未收到 done 事件：
-      // - 若已判定卡死（stalled），已由 onStalled 处理，不再重复处理；
-      // - 否则视为"未完整接收"，按错误处理（禁止基于残缺文本续写）
-      if (!doneCalled && !stalled) {
-        onError(StorageService.localizedText(
-          zhCN: '生成未完整接收（未收到服务器结束信号），请检查网络后重试',
-          zhTW: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後重試',
-          en: 'Generation was incomplete (no server completion signal). Please check your network and try again.',
-          yue: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後再試',
-          es: 'La generación fue incompleta (no se recibió la señal de finalización del servidor). Compruebe su red e inténtelo de nuevo.',
-          fr: 'La génération est incomplète (aucun signal de fin du serveur). Vérifiez votre réseau et réessayez.',
-          de: 'Die Generierung war unvollständig (kein Abschlusssignal vom Server). Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.',
-          pt: 'A geração ficou incompleta (nenhum sinal de conclusão do servidor). Verifique sua rede e tente novamente.',
-          ja: '生成が不完全でした（サーバーからの終了信号がありません）。ネットワークを確認して、もう一度お試しください。',
-          ko: '생성이 불완전했습니다(서버 종료 신호 없음). 네트워크를 확인하고 다시 시도해 주세요.',
-        ));
+      // - 已判定卡死（stalled）：已由 onStalled 处理，不再重复处理；
+      // - 已收到 error/abort 事件（terminatedByEvent）：已由对应回调处理；
+      // - 否则：服务器无结束信号直接关闭（通常即服务器侧超时关闭了流），
+      //   复用现有"网络疑似超时，请重启重试"弹窗（onStalled），禁止基于残缺文本续写。
+      if (!doneCalled && !stalled && !terminatedByEvent) {
+        debugPrint('[story] post-loop -> onStalled (no done received)');
+        stalled = true;
+        final stall = onStalled;
+        if (stall != null) {
+          stall();
+        } else {
+          onError(StorageService.localizedText(
+            zhCN: '生成未完整接收（未收到服务器结束信号），请检查网络后重试',
+            zhTW: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後重試',
+            en: 'Generation was incomplete (no server completion signal). Please check your network and try again.',
+            yue: '生成未完整接收（未收到伺服器結束訊號），請檢查網路後再試',
+            es: 'La generación fue incompleta (no se recibió la señal de finalización del servidor). Compruebe su red e inténtelo de nuevo.',
+            fr: 'La génération est incomplète (aucun signal de fin du serveur). Vérifiez votre réseau et réessayez.',
+            de: 'Die Generierung war unvollständig (kein Abschlusssignal vom Server). Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.',
+            pt: 'A geração ficou incompleta (nenhum sinal de conclusão do servidor). Verifique sua rede e tente novamente.',
+            ja: '生成が不完全でした（サーバーからの終了信号がありません）。ネットワークを確認して、もう一度お試しください。',
+            ko: '생성이 불완전했습니다(서버 종료 신호 없음). 네트워크를 확인하고 다시 시도해 주세요.',
+          ));
+        }
       }
     } catch (e) {
       if (stalled) return; // 卡死已由 onStalled 处理，不再重复报错
       if (e.toString().contains('TimeoutException')) {
+        // 用户等待 FastAPI 超时（30 秒无数据）：复用现有"网络疑似超时，请重启重试"
+        // 弹窗（onStalled）；未注册 onStalled 时退回通用错误文案。
+        stalled = true;
+        final stall = onStalled;
+        if (stall != null) {
+          stall();
+          return;
+        }
         onError(StorageService.localizedText(
           zhCN: '生成超时，请稍后重试',
           zhTW: '生成逾時，請稍後重試',

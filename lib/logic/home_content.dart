@@ -3,7 +3,8 @@ import 'dart:convert';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
-import 'package:flutter/services.dart' show SystemChrome, SystemUiOverlayStyle;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, SystemChrome, SystemUiOverlayStyle;
 import 'package:ai_saga/widgets/account_limit_warning.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
 import 'package:ai_saga/widgets/character_text.dart';
@@ -850,13 +851,26 @@ class _HomeContentState extends State<HomeContent>
           });
           _applyRecommendedActions(outputs);
         },
-        onAbort: (_) {
+        onTruncate: (keep) {
+          if (!mounted) return;
+          // 违规自动修正：服务器已把违规段覆盖为改写文本，先把当前段回滚到
+          // keep 字符（违规窗口起点），随后续 reveal 继续打字，避免重叠区重复。
+          setState(() {
+            if (_storyTexts.isNotEmpty) {
+              final seg = _storyTexts[_storyTexts.length - 1];
+              if (keep >= seg.length) return;
+              _storyTexts[_storyTexts.length - 1] = seg.substring(0, keep);
+              _storyTyped = false;
+            }
+          });
+        },
+        onAbort: (_, snippet) {
           if (!mounted) return;
           // 违规中止：弹窗期间保持当前流式布局（用户选择 + 残缺段 + 预留空白）在
           // 弹窗背后原样冻结，不在弹窗前改动任何布局状态；弹窗关闭后再删掉本次
           // 可能已由打字机打出的残缺段落、恢复等待输入状态，避免弹窗背后的页面跳动
           // （在弹窗前删段/切"生成区"分支会让按钮弹出、选择文本与按钮错位）。
-          _showViolationDialog().then((_) {
+          _showViolationDialog(snippet: snippet).then((_) {
             if (!mounted) return;
             setState(() {
               if (_storyTexts.length > preStreamLen) {
@@ -1636,22 +1650,37 @@ class _HomeContentState extends State<HomeContent>
           });
           _applyRecommendedActions(outputs);
         },
-        onAbort: (_) {
+        onTruncate: (keep) {
           if (!mounted) return;
-          // 违规中止：删掉本次可能已由打字机打出的残缺段落，恢复等待输入状态，
-          // 再弹"内容违规，请重新输入提示词"对话框（唯一"重新输入"按钮）
+          // 违规自动修正：服务器已把违规段覆盖为改写文本，先把当前段回滚到
+          // keep 字符（违规窗口起点），随后续 reveal 继续打字，避免重叠区重复。
+          setState(() {
+            if (_storyTexts.isNotEmpty) {
+              final seg = _storyTexts[_storyTexts.length - 1];
+              if (keep >= seg.length) return;
+              _storyTexts[_storyTexts.length - 1] = seg.substring(0, keep);
+              _storyTyped = false;
+            }
+          });
+        },
+        onAbort: (_, snippet) {
+          if (!mounted) return;
+          // 违规中止：删掉本次可能已由打字机打出的残缺段落。
+          // 第一章场景：正文为空时主页面没有输入框，点"重新输入"会白屏挂死，
+          // 所以先退回"设置确认页"（_setupStep=4），按钮改为"回到最终审核设置页面"，
+          // 让用户调整设定后再重新生成。
           setState(() {
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
-            _setupStep = 5;
-            showMenuNotifier.value = true;
+            _setupStep = 4;
+            showMenuNotifier.value = false;
             _storyStreaming = false;
             storyStreamingNotifier.value = false;
             _storyTyped = true;
           });
           _abortBlackoutTransition();
-          _showViolationDialog();
+          _showViolationDialog(snippet: snippet, backToSetup: true);
         },
         onError: (message, {code}) {
           if (!mounted) return;
@@ -2560,6 +2589,32 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 违规弹窗附加提示：引导用户检查输入是否含敏感元素（本地化）
+  String _getViolationGuidanceText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '請您注意您的輸入是否含有來自於影視劇、圖書、漫畫、卡通的著名人物角色、情節、地點，或涉及宗教、種族、地域、風俗歧視等內容，或含有血腥、暴力、色情等元素，如有的話請調整。';
+      case 'yue':
+        return '請您留意您嘅輸入係咪含有嚟自影視劇、圖書、漫畫、卡通嘅著名人物角色、情節、地點，或者涉及宗教、種族、地域、風俗歧視等內容，或者含有血腥、暴力、色情等元素，如果有嘅話請調整。';
+      case 'en':
+        return 'Please note whether your input contains famous characters, plots, or places from films/TV, books, comics, or cartoons, or content involving religion, ethnicity, region, customs, or discrimination, or contains elements of gore, violence, or pornography — if so, please adjust it.';
+      case 'es':
+        return 'Tenga en cuenta si su entrada contiene personajes, tramas o lugares famosos de películas/series, libros, cómics o dibujos animados, o contenido relacionado con religión, etnia, región, costumbres o discriminación, o elementos sangrientos, violentos o pornográficos; en ese caso, ajuste su texto.';
+      case 'fr':
+        return 'Veuillez noter si votre saisie contient des personnages, intrigues ou lieux célèbres issus de films/séries, livres, bandes dessinées ou dessins animés, ou un contenu lié à la religion, l’ethnie, la région, les coutumes ou la discrimination, ou des éléments sanglants, violents ou pornographiques ; si c’est le cas, veuillez l’ajuster.';
+      case 'de':
+        return 'Bitte beachten Sie, ob Ihre Eingabe berühmte Figuren, Handlungen oder Orte aus Filmen/Serien, Büchern, Comics oder Cartoons enthält, oder Inhalte zu Religion, Ethnie, Region, Sitten oder Diskriminierung, oder blutige, gewalttätige oder pornografische Elemente; falls ja, passen Sie sie bitte an.';
+      case 'pt':
+        return 'Tenha em atenção se a sua entrada contém personagens, enredos ou locais famosos de filmes/séries, livros, banda desenhada ou desenhos animados, ou conteúdo relacionado com religião, etnia, região, costumes ou discriminação, ou elementos sangrentos, violentos ou pornográficos; se sim, ajuste o seu texto.';
+      case 'ja':
+        return '入力に映画・ドラマ・書籍・漫画・アニメに登場する著名なキャラクター、筋書き、場所、または宗教、民族、地域、風俗、差別に関する内容、あるいは残酷・暴力的・性的な要素が含まれていないかご確認ください。含まれる場合は修正してください。';
+      case 'ko':
+        return '입력에 영화·드라마·서적·만화·애니메이션에 등장하는 유명한 캐릭터, 줄거리, 장소, 또는 종교, 민족, 지역, 풍습, 차별과 관련된 내용, 또는 잔혹·폭력·음란한 요소가 포함되어 있는지 확인하세요. 포함되어 있다면 수정해 주세요.';
+      default:
+        return '请您注意您的输入是否含有来自于影视剧、图书、漫画、卡通的著名人物角色、情节、地点，或涉及宗教，种族，地域、风俗歧视等内容，或含有血腥、暴力、色情等元素，如有的话请调整。';
+    }
+  }
+
   /// 违规弹窗唯一按钮"重新输入"（本地化）
   String _getReenterText() {
     switch (StorageService.getLanguage()) {
@@ -2585,25 +2640,143 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 违规弹窗：无标题，提示当前生成内容疑似违规，需重新输入提示词；
-  /// 只有一个"重新输入"按钮。点击后残缺段落已在 onAbort 中删除，
-  /// 页面已恢复为等待输入状态，此处仅关闭弹窗。
-  Future<void> _showViolationDialog() async {
+  /// 违规弹窗在"第一章首次生成"场景下的按钮文案（本地化）：回到最终审核设置页。
+  /// 第一章正文为空时没有输入框，无法"重新输入"，需返回设置确认页调整设定后再生成。
+  String _getBackToSetupText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '回到最終審核設定頁面';
+      case 'en':
+        return 'Back to final setup page';
+      case 'es':
+        return 'Volver a la página de configuración final';
+      case 'fr':
+        return 'Retour à la page de configuration finale';
+      case 'de':
+        return 'Zurück zur endgültigen Einrichtungsseite';
+      case 'pt':
+        return 'Voltar à página de configuração final';
+      case 'ja':
+        return '最終設定ページに戻る';
+      case 'ko':
+        return '최종 설정 페이지로 돌아가기';
+      default:
+        return '回到最终审核设置页面';
+    }
+  }
+
+  /// 违规弹窗"复制片段"按钮文案（本地化）
+  String _getCopySnippetText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '複製片段';
+      case 'en':
+        return 'Copy snippet';
+      case 'es':
+        return 'Copiar fragmento';
+      case 'fr':
+        return 'Copier le fragment';
+      case 'de':
+        return 'Ausschnitt kopieren';
+      case 'pt':
+        return 'Copiar trecho';
+      case 'ja':
+        return '断片をコピー';
+      case 'ko':
+        return '조각 복사';
+      default:
+        return '复制片段';
+    }
+  }
+
+  /// 违规弹窗：无标题，提示当前生成内容疑似违规，需重新输入提示词。
+  /// - 普通续写（backToSetup=false）：只有一个"重新输入"按钮。点击后残缺段落
+  ///   已在 onAbort 中删除，页面已恢复为等待输入状态，此处仅关闭弹窗。
+  /// - 第一章首次生成（backToSetup=true）：正文为空时主页面没有输入框，无法
+  ///   "重新输入"，按钮改为"回到最终审核设置页面"，点击后返回设置确认页
+  ///   （[SetUpConfirmationPage] 流程），让用户调整设定后再重新生成。
+  /// 调试辅助：snippet 为审核未通过的片段原文，可长按选中复制，或点"复制片段"按钮。
+  Future<void> _showViolationDialog({
+    String snippet = '',
+    bool backToSetup = false,
+  }) async {
     if (!mounted) return;
     await showCupertinoDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => CupertinoAlertDialog(
-        content: Text(_getViolationMessageText()),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_getViolationMessageText()),
+            const SizedBox(height: 8),
+            Text(
+              _getViolationGuidanceText(),
+              style: const TextStyle(fontSize: 12),
+            ),
+            // 调试辅助：把审核未通过的片段原文也显示出来，便于判断是真违规还是误判。
+            if (snippet.trim().isNotEmpty) ...[
+              const SizedBox(height: 12),
+              const Text(
+                '—— 审核未通过的片段 ——',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 160),
+                child: SingleChildScrollView(
+                  child: Text(snippet, style: const TextStyle(fontSize: 12)),
+                ),
+              ),
+            ],
+          ],
+        ),
         actions: [
+          if (snippet.trim().isNotEmpty)
+            CupertinoDialogAction(
+              onPressed: () => Clipboard.setData(ClipboardData(text: snippet)),
+              child: Text(_getCopySnippetText()),
+            ),
           CupertinoDialogAction(
             isDefaultAction: true,
-            onPressed: () => Navigator.of(context).pop(),
-            child: Text(_getReenterText()),
+            onPressed: () {
+              Navigator.of(context).pop();
+              // 第一章违规：关闭弹窗后回到设置确认页（重设设定后再生成），
+              // 避免停留在无输入框的空主页面白屏挂死。
+              if (backToSetup) {
+                _returnToSetupConfirmation();
+              }
+            },
+            child:
+                Text(backToSetup ? _getBackToSetupText() : _getReenterText()),
           ),
         ],
       ),
     );
+  }
+
+  /// 第一章生成违规后：回到"设置确认页"（_setupStep=4），清空本次空正文残留状态，
+  /// 隐藏菜单按钮，让用户调整设定后重新进入生成流程。
+  void _returnToSetupConfirmation() {
+    if (!mounted) return;
+    _abortBlackoutTransition();
+    setState(() {
+      _storyTexts.clear();
+      _choices.clear();
+      _segmentChoices.clear();
+      _segmentScriptIds.clear();
+      _storyStartIndex = 0;
+      _visibleStartIndex = 0;
+      _sessionStreamStartIndex = 0;
+      _storyStreaming = false;
+      storyStreamingNotifier.value = false;
+      _storyTyped = true;
+      _hasRecommendedActions = false;
+      _setupStep = 4;
+      showMenuNotifier.value = false;
+    });
   }
 
   /// 【调试】弹窗打印数据库（story_segments）最新一条生成条目的全部字段。

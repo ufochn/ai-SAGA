@@ -185,28 +185,28 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     }
   }
 
-  /// 根据语言返回本地化的"性格设定"标签
+  /// 根据语言返回本地化的"人设"标签
   String _getTraitsLabel() {
     switch (_language) {
       case 'zh-TW':
       case 'yue':
-        return '性格設定';
+        return '人設';
       case 'en':
-        return 'Personality';
+        return 'Persona';
       case 'es':
-        return 'Personalidad';
+        return 'Personaje';
       case 'fr':
-        return 'Personnalité';
+        return 'Personnage';
       case 'de':
-        return 'Persönlichkeit';
+        return 'Persona';
       case 'pt':
-        return 'Personalidade';
+        return 'Personagem';
       case 'ja':
-        return '性格設定';
+        return 'キャラ設定';
       case 'ko':
-        return '성격 설정';
+        return '캐릭터 설정';
       default:
-        return '性格设定';
+        return '人设';
     }
   }
 
@@ -506,7 +506,7 @@ class _SetupConfirmationPageState extends State<SetupConfirmationPage> {
     );
   }
 
-  /// 主角卡片：姓名、性格设定逐项清晰展示
+  /// 主角卡片：姓名、人设逐项清晰展示
   Widget _buildCharacterCard(
     bool isDark, {
     required String label,

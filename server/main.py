@@ -83,6 +83,18 @@ DIFY_HTTP_TIMEOUT = float(os.environ.get("DIFY_HTTP_TIMEOUT", "30"))
 CASE_DIFY_TIMEOUT = float(os.environ.get("CASE_DIFY_TIMEOUT", "30"))
 AUDIT_DIFY_TIMEOUT = float(os.environ.get("AUDIT_DIFY_TIMEOUT", "30"))
 STORY_DIFY_STREAM_TIMEOUT = float(os.environ.get("STORY_DIFY_STREAM_TIMEOUT", "30"))
+# ---- 违规自动修正工作流（可选）----
+# 审核 REJECT 后，服务器自动把"违规文本 + guardrail 判定 JSON"发给本工作流改写，
+# 改写文本重新送审，通过后覆盖原违规段继续打字；未配置 REVISE_DIFY_API_KEY 时
+# 保持原行为（直接 abort 弹窗"重新输入"）。
+REVISE_DIFY_API_KEY = os.environ.get("REVISE_DIFY_API_KEY", "")
+REVISE_DIFY_API_URL = os.environ.get("REVISE_DIFY_API_URL", DIFY_API_URL)
+REVISE_DIFY_TIMEOUT = float(os.environ.get("REVISE_DIFY_TIMEOUT", "30"))
+# 修正-重审循环上限：一次违规最多连续修正 REVISE_MAX_ATTEMPTS 轮（每轮=改一遍+重审一遍），
+# 仍违规则回退到现有 abort 弹窗，防止无限烧钱/死循环。
+REVISE_MAX_ATTEMPTS = int(os.environ.get("REVISE_MAX_ATTEMPTS", "3"))
+# 修正工作流输出 token 上限（改写文本不得超过，防止越写越长）。
+REVISE_MAX_TOKENS = int(os.environ.get("REVISE_MAX_TOKENS", "1500"))
 # 输入 token 估算上限（入口硬拦，估算在花钱之前）
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "5000"))
 # 输入字符数兜底上限（防止极端长文本撑爆估算）
@@ -1413,20 +1425,22 @@ def _build_audit_verdict(out: str) -> dict:
     }
 
 
-async def _moderate_story(text: str) -> ModerationOutcome:
-    """调用审核工作流，返回三态判定（见 ModerationOutcome）。
+async def _moderate_story(text: str) -> tuple:
+    """调用审核工作流，返回 (三态判定, guardrail 判定 dict)。
 
     只把"审核成功且明确判为违规"当作 REJECT；配额超限、网络失败、
     非 200、输出无法解析等一律返回 UNAVAILABLE（可重试，非违规）。
+    第二元为 guardrail 结构化判定（action/category/confidence/reason），
+    供"违规修正"工作流使用；无有效判定时为 None。
     """
     if not text or not text.strip():
-        return ModerationOutcome.PASS
+        return ModerationOutcome.PASS, None
     # 审核工作流全局配额（所有用户合计 AUDIT_DAILY_LIMIT 次/天）：
     # 超限时不调用 Dify，视为"审核不可用"（可重试），而非"内容违规"。
     try:
         _check_audit_quota(int(time.time()))
     except HTTPException:
-        return ModerationOutcome.UNAVAILABLE
+        return ModerationOutcome.UNAVAILABLE, None
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
@@ -1441,30 +1455,98 @@ async def _moderate_story(text: str) -> ModerationOutcome:
             DIFY_API_URL, json=payload, headers=headers, timeout=AUDIT_DIFY_TIMEOUT
         )
         if resp.status_code != 200:
-            return ModerationOutcome.UNAVAILABLE
+            return ModerationOutcome.UNAVAILABLE, None
         data = resp.json()
         out = _extract_guardrail_output(data)
+        verdict = _build_audit_verdict(out)
         action = _parse_audit_json(out)
         if action is None:
             # 审核成功但无有效 action 判定：视为审核链路异常（可重试），非违规
-            return ModerationOutcome.UNAVAILABLE
-        return ModerationOutcome.PASS if action == "none" else ModerationOutcome.REJECT
+            return ModerationOutcome.UNAVAILABLE, None
+        return (
+            ModerationOutcome.PASS if action == "none" else ModerationOutcome.REJECT,
+            verdict,
+        )
     except httpx.TimeoutException:
         # Dify 审核 30 秒无返回：按统一超时规则标记为 TIMEOUT（非内容违规），
         # 由流式层据此直接关闭当前流，客户端 30 秒无数据弹"重启"提示。
-        return ModerationOutcome.TIMEOUT
+        return ModerationOutcome.TIMEOUT, None
     except Exception:
         # 网络 / 解析异常：审核不可用（可重试），非违规
-        return ModerationOutcome.UNAVAILABLE
+        return ModerationOutcome.UNAVAILABLE, None
 
 
-def _moderation_failure_sse(mr: ModerationOutcome) -> Optional[dict]:
+async def _revise_story(text: str, verdict: dict, language: str = "") -> Optional[str]:
+    """调用"违规修正"工作流，返回改写后的文本；失败返回 None。
+
+    工作流输入变量：novel_text（违规文本）、guardrail_json（guardrail 判定 JSON）、
+    language（完整语言名，如"简体中文"，防止 LLM 改写时串用其它语言）。
+    未配置 REVISE_DIFY_API_KEY 时直接返回 None（调用方回退到 abort 弹窗）。
+    输出变量名依次尝试 revised_text / text / novel_text / output_text / result。
+    """
+    if not REVISE_DIFY_API_KEY:
+        return None
+    headers = {
+        "Authorization": f"Bearer {REVISE_DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "inputs": {
+            "novel_text": text,
+            "guardrail_json": json.dumps(verdict, ensure_ascii=False),
+            "language": language or "简体中文",
+            "max_tokens": REVISE_MAX_TOKENS,
+        },
+        "response_mode": "blocking",
+        "user": "story-revise",
+    }
+    try:
+        resp = await async_http_client.post(
+            REVISE_DIFY_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=REVISE_DIFY_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning("REVISE 工作流返回非 200：%s", resp.status_code)
+            return None
+        data = resp.json()
+        data_block = data.get("data") if isinstance(data, dict) else None
+        outputs = (
+            data_block.get("outputs")
+            if isinstance(data_block, dict)
+            and isinstance(data_block.get("outputs"), dict)
+            else {}
+        )
+        for key in ("revised_text", "text", "novel_text", "output_text", "result"):
+            v = outputs.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        logger.warning(
+            "REVISE 工作流返回 200 但未取到修正文本 outputs=%s",
+            list(outputs.keys()),
+        )
+        return None
+    except httpx.TimeoutException:
+        logger.warning("REVISE 工作流超时（%s 秒）", REVISE_DIFY_TIMEOUT)
+        return None
+    except Exception as e:
+        logger.warning("REVISE 工作流调用失败: %s", e, exc_info=True)
+        return None
+
+
+def _moderation_failure_sse(mr: ModerationOutcome, snippet: str = "") -> Optional[dict]:
     """把非 PASS 的审核结果映射为应发送的 SSE 事件；PASS 返回 None。
 
-    REJECT → abort（违规，弹"内容违规"）；UNAVAILABLE → error（可重试，网络式警告）。
+    REJECT → abort（违规，弹"内容违规"，并附带审核未通过的片段原文 snippet，
+            便于排查是真违规还是误判）；UNAVAILABLE → error（可重试，网络式警告）。
     """
     if mr is ModerationOutcome.REJECT:
-        return {"event": "abort", "reason": "生成内容包含违规信息，已中止"}
+        return {
+            "event": "abort",
+            "reason": "生成内容包含违规信息，已中止",
+            "snippet": snippet,
+        }
     if mr is ModerationOutcome.UNAVAILABLE:
         return {
             "event": "error",
@@ -1824,8 +1906,8 @@ def _extract_story_meta(
     推演结果（LLM2 structured_output，经 End 节点扁平输出）映射：
       music / music_style     -> music_style
       choice_1 恒为空（用户后续自行填写，或直接选 choice_2/3）
-    choice_2/choice_3 不再由 Dify 提供（删除 action_a/action_b），
-    改由脚本库当前章节的选择提供（在流式段覆盖）。
+      action_a / action_b     -> 输入框 2/3 的推荐行动（优先于脚本 choice_2/3）
+    choice_2/choice_3 在流式段用 action_a/action_b 覆盖，取不到再用脚本当前章节的选择。
     任一字段缺失 / 非字符串 / 为空 / music_style 不在白名单 → 用保底默认值。
     """
     src = outputs if isinstance(outputs, dict) else {}
@@ -1853,9 +1935,13 @@ def _extract_story_meta(
 
     meta = {
         "choice_1": "",  # 默认空白，由用户后续自行填写
-        # choice_2/choice_3 不做任何兜底：空即空，由脚本库当前章节在流式段覆盖
+        # choice_2/choice_3 默认空：流式段用 Dify action_a/action_b 覆盖，取不到再用脚本 choice_2/3
         "choice_2": "",
         "choice_3": "",
+        # 推荐行动：Dify 生成工作流 LLM② 的结构化输出（action_a/action_b），
+        # 流式段里用它覆盖输入框 2/3；取不到则回退脚本当前章节的 choice_2/3。
+        "action_a": _s("action_a", "actionA", "action_a_text", "行动一"),
+        "action_b": _s("action_b", "actionB", "action_b_text", "行动二"),
         "music_style": _s("music", "music_style") or defaults["music_style"],
         "case_core": _s("case_core", "core_content", "content") or defaults["case_core"],
         "characters": characters,
@@ -1973,16 +2059,21 @@ async def _persist_story_segment(
         )
         conn.commit()
         # ---- RAG：人名登记 + 后台原文切块嵌入（异步，不阻塞生成流）----
+        # 排除主角名（player_name）：主角无处不在，收录进名字记忆只会制造噪声、污染检索。
+        _rag_names = meta.get("characters") or []
+        _pname = (settings.get("player_name") or "").strip()
+        if _pname:
+            _rag_names = [n for n in _rag_names if n != _pname]
         # 触发轮（非零且 seq%5==0）：当前章节构建成功后顺序补建缺失；普通轮：fire-and-forget。
         if _is_rag_trigger_seq(next_seq):
             _schedule_rag_trigger_build(
                 user_id, next_seq, current_script_id,
-                new_segment, meta.get("characters") or [],
+                new_segment, _rag_names,
             )
         else:
             _schedule_rag_build(
                 user_id, next_seq, current_script_id,
-                new_segment, meta.get("characters") or [],
+                new_segment, _rag_names,
             )
     finally:
         conn.close()
@@ -2066,7 +2157,12 @@ def _persist_story_segments_atomic(
                     completed_script_ids,
                 ),
             )
-            rag_items.append((next_seq, current_script_id, new_segment, meta.get("characters") or []))
+            # 排除主角名（player_name）：主角不进入名字记忆
+            _pname = (settings.get("player_name") or "").strip()
+            _cnames = meta.get("characters") or []
+            if _pname:
+                _cnames = [n for n in _cnames if n != _pname]
+            rag_items.append((next_seq, current_script_id, new_segment, _cnames))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2935,6 +3031,9 @@ async def generate_story(data: StoryInputData, request: Request):
                     "chapter_script": (pre_case_meta or {}).get("chapter_text") or "",
                     # RAG：之前脚本的整章记忆（无命中为空串）
                     "rag_context": rag_context or "",
+                    # 脚本当前章节的推荐行动（choice_2/choice_3），供 LLM 在正文中呼应
+                    "script_choice_2": (pre_case_meta or {}).get("choice_2") or "",
+                    "script_choice_3": (pre_case_meta or {}).get("choice_3") or "",
                 },
                 "response_mode": "streaming",
                 "user": user_id,
@@ -3003,6 +3102,9 @@ async def generate_story(data: StoryInputData, request: Request):
                         "chapter_script": (pre_case_meta or {}).get("chapter_text") or "",
                         # RAG：之前脚本的整章记忆（无命中为空串）
                         "rag_context": rag_context or "",
+                        # 脚本当前章节的推荐行动（choice_2/choice_3），供 LLM 在正文中呼应
+                        "script_choice_2": (pre_case_meta or {}).get("choice_2") or "",
+                        "script_choice_3": (pre_case_meta or {}).get("choice_3") or "",
                     },
                     "response_mode": "streaming",
                     "user": user_id,
@@ -3026,6 +3128,9 @@ async def generate_story(data: StoryInputData, request: Request):
                     audit_no = 1            # 下一次审核序号 k（窗口 [STEP*(k-1)-OVERLAP, STEP*k)）
                     sent_first = False      # 是否已发送过首段 chunk
                     audit_aborted = False   # 本次审核是否以 abort/error/超时终止（调用方据此 return）
+                    # 审核窗口基准偏移：正常为 0；违规修正覆盖违规段后重置为修正点，
+                    # 之后窗口从该点重新编号（保持 400/50 增量审核不因变长改写而错位）。
+                    _audit_base = 0
                     outputs = {}
                     think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
                     meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/music_style）；workflow_finished 时更新，失败用保底默认
@@ -3036,34 +3141,151 @@ async def generate_story(data: StoryInputData, request: Request):
 
                         - 每窗口审核是阻塞式 Dify 调用（最长 AUDIT_DIFY_TIMEOUT 秒），等待期间
                           每 15s yield 一个 heartbeat，重置客户端 30s 滚动计时；
-                        - REJECT（违规）→ yield abort；UNAVAILABLE（不可用）→ yield error；
-                          TIMEOUT（Dify 审核 30s 无返回）→ 不 yield 任何事件直接结束（关闭流），
-                          客户端 30s 无数据自然弹"网络疑似超时，请重启重试"；
+                        - REJECT（违规）→ 尝试"违规修正"工作流（最多 REVISE_MAX_ATTEMPTS 轮）：
+                          把违规文本 + guardrail JSON 发给修正工作流，收到改写文本后覆盖
+                          text_arg/full_text 中的违规段、让客户端回滚到违规窗口起点（truncate
+                          事件），再按老逻辑整段重送审核；通过 → 整段 reveal 继续打字；
+                          修正失败 / 未配置 / 超限 → 回退 yield abort（客户端弹窗"重新输入"）；
+                        - UNAVAILABLE（不可用）→ yield error；TIMEOUT（Dify 审核 30s 无返回）→
+                          不 yield 任何事件直接结束（关闭流），客户端 30s 无数据自然弹
+                          "网络疑似超时，请重启重试"；
                         - 发生任一终止时置 audit_aborted=True，调用方据此 return 关闭整段流。
                         """
-                        nonlocal audit_no, displayed_len, sent_first, audit_aborted
+                        nonlocal audit_no, displayed_len, sent_first, audit_aborted, _audit_base
+
+                        async def _handle_reject(
+                            audit_text: str,
+                            verdict,
+                            win_start: int,
+                            win_end: int,
+                        ):
+                            """违规窗口自动修正（async generator）：调修正 workflow（最多
+                            REVISE_MAX_ATTEMPTS 轮）覆盖违规段后整段重审。
+                            重审通过 → 整段发送（chunk/reveal），audit_aborted 保持 False；
+                            修正失败/未配置/超限 → 已 yield abort 并置 audit_aborted=True。
+                            （async generator 不能 return 值，用 audit_aborted 作成功/失败信号。）
+                            """
+                            nonlocal text_arg, full_text, displayed_len, audit_no, sent_first, audit_aborted, _audit_base
+                            attempts = 0
+                            cur_text = audit_text
+                            cur_verdict = verdict
+                            while True:
+                                attempts += 1
+                                if attempts > REVISE_MAX_ATTEMPTS:
+                                    audit_aborted = True
+                                    yield _moderation_failure_sse(
+                                        ModerationOutcome.REJECT, cur_text
+                                    )
+                                    return
+                                # 等修正工作流（阻塞式调用，等待期间每 15s 心跳，避免客户端误判断网）
+                                yield {"event": "heartbeat", "message": "正在修正违规内容"}
+                                revise_task = asyncio.create_task(
+                                    _revise_story(
+                                        cur_text,
+                                        cur_verdict,
+                                        _dify_language_name(
+                                            settings.get("language") or ""
+                                        ),
+                                    )
+                                )
+                                while True:
+                                    done, _ = await asyncio.wait({revise_task}, timeout=15)
+                                    if revise_task in done:
+                                        revised = revise_task.result()
+                                        break
+                                    yield {"event": "heartbeat", "message": "正在修正违规内容"}
+                                if not revised or not revised.strip():
+                                    # 修正失败 / 未配置修正工作流：回退现有 abort 弹窗
+                                    audit_aborted = True
+                                    yield _moderation_failure_sse(
+                                        ModerationOutcome.REJECT, cur_text
+                                    )
+                                    return
+                                # 覆盖违规段（text_arg 与 full_text 同步更新，后续 text_chunk 沿用修正后正文）
+                                text_arg = (
+                                    text_arg[:win_start]
+                                    + revised
+                                    + text_arg[win_end:]
+                                )
+                                full_text = text_arg
+                                # 让客户端把当前段回滚到违规窗口起点，避免重叠区重复
+                                yield {"event": "truncate", "keep": win_start}
+                                # 重审修正后的剩余部分（老逻辑：送审核 Dify）
+                                remainder = text_arg[win_start:]
+                                audit_task = asyncio.create_task(
+                                    _moderate_story(remainder)
+                                )
+                                while True:
+                                    done, _ = await asyncio.wait({audit_task}, timeout=15)
+                                    if audit_task in done:
+                                        mr2, v2 = audit_task.result()
+                                        break
+                                    yield {"event": "heartbeat", "message": "内容审核中"}
+                                if mr2 is ModerationOutcome.TIMEOUT:
+                                    audit_aborted = True
+                                    return
+                                if mr2 is ModerationOutcome.REJECT:
+                                    # 重审仍违规：再修正一轮
+                                    cur_text = remainder
+                                    cur_verdict = v2
+                                    continue
+                                if mr2 is not ModerationOutcome.PASS:
+                                    # 重审不可用：回退（按审核链路问题处理）
+                                    audit_aborted = True
+                                    yield _moderation_failure_sse(
+                                        ModerationOutcome.UNAVAILABLE, remainder
+                                    )
+                                    return
+                                # 重审通过：整段发送（首段 chunk / 续段 reveal）
+                                if win_start > 0:
+                                    yield {
+                                        "event": "reveal",
+                                        "text": remainder,
+                                        "outputs": {},
+                                    }
+                                else:
+                                    yield {"event": "chunk", "text": remainder}
+                                displayed_len = len(text_arg)
+                                sent_first = True
+                                # 已整段发送完毕：重置增量窗口基准到当前末尾，后续新文本继续增量审核
+                                _audit_base = len(text_arg)
+                                audit_no = 1
+                                return
+
                         audit_aborted = False
-                        while len(text_arg) >= STORY_AUDIT_STEP * audit_no:
+                        while len(text_arg) >= _audit_base + STORY_AUDIT_STEP * audit_no:
                             k = audit_no
-                            win_end = STORY_AUDIT_STEP * k
+                            win_end = _audit_base + STORY_AUDIT_STEP * k
                             if len(text_arg) < win_end:
                                 break
                             win_start = max(
-                                0, STORY_AUDIT_STEP * (k - 1) - STORY_AUDIT_OVERLAP
+                                _audit_base,
+                                _audit_base
+                                + STORY_AUDIT_STEP * (k - 1)
+                                - STORY_AUDIT_OVERLAP,
                             )
                             audit_text = text_arg[win_start:win_end]
                             audit_task = asyncio.create_task(_moderate_story(audit_text))
                             while True:
                                 done, _ = await asyncio.wait({audit_task}, timeout=15)
                                 if audit_task in done:
-                                    mr = audit_task.result()
+                                    mr, verdict = audit_task.result()
                                     break
                                 yield {"event": "heartbeat", "message": "内容审核中"}
                             if mr is ModerationOutcome.TIMEOUT:
                                 logger.warning("STREAM audit Dify 超时（30 秒），关闭流")
                                 audit_aborted = True
                                 return
-                            fail = _moderation_failure_sse(mr)
+                            if mr is ModerationOutcome.REJECT:
+                                # 违规：自动修正（覆盖违规段 → 整段重审 → 继续打字）
+                                async for ev in _handle_reject(
+                                    audit_text, verdict, win_start, win_end
+                                ):
+                                    yield ev
+                                if audit_aborted:
+                                    return
+                                return  # 修正成功：已整段发送并重置窗口，结束本次调用
+                            fail = _moderation_failure_sse(mr, audit_text)
                             if fail is not None:
                                 audit_aborted = True
                                 yield fail
@@ -3082,21 +3304,32 @@ async def generate_story(data: StoryInputData, request: Request):
                             sent_first = True
                         if final and displayed_len < len(text_arg):
                             win_start = max(
-                                0, STORY_AUDIT_STEP * (audit_no - 1) - STORY_AUDIT_OVERLAP
+                                _audit_base,
+                                _audit_base
+                                + STORY_AUDIT_STEP * (audit_no - 1)
+                                - STORY_AUDIT_OVERLAP,
                             )
                             audit_text = text_arg[win_start:]
                             audit_task = asyncio.create_task(_moderate_story(audit_text))
                             while True:
                                 done, _ = await asyncio.wait({audit_task}, timeout=15)
                                 if audit_task in done:
-                                    mr = audit_task.result()
+                                    mr, verdict = audit_task.result()
                                     break
                                 yield {"event": "heartbeat", "message": "内容审核中"}
                             if mr is ModerationOutcome.TIMEOUT:
                                 logger.warning("STREAM audit tail Dify 超时（30 秒），关闭流")
                                 audit_aborted = True
                                 return
-                            fail = _moderation_failure_sse(mr)
+                            if mr is ModerationOutcome.REJECT:
+                                async for ev in _handle_reject(
+                                    audit_text, verdict, win_start, len(text_arg)
+                                ):
+                                    yield ev
+                                if audit_aborted:
+                                    return
+                                return  # 修正成功：已整段发送
+                            fail = _moderation_failure_sse(mr, audit_text)
                             if fail is not None:
                                 audit_aborted = True
                                 yield fail
@@ -3193,15 +3426,16 @@ async def generate_story(data: StoryInputData, request: Request):
                             meta = _extract_story_meta(
                                 outputs, settings.get("language")
                             )
-                            # choice_2/choice_3 不再用 Dify 返回值（action_a/action_b），
-                            # 改用脚本库当前章节的选择。脚本章节的选择是【权威】的：
-                            # 有就是有、没有就是空（空 = 该脚本章节走完 → 触发换脚本）。
-                            # 关键：不能用 `or meta.get(...)` 回退到 META_DEFAULTS 的非空兜底
-                            # 文案，否则 choice_2/3 永不为空、choices_available 恒为 True，
-                            # "老脚本结束→换新脚本继续"的逻辑永远不会触发。
-                            if pre_case_meta is not None:
-                                meta["choice_2"] = pre_case_meta.get("choice_2") or ""
-                                meta["choice_3"] = pre_case_meta.get("choice_3") or ""
+                            # 输入框 2/3 的显示值：Dify 生成工作流 LLM② 的 action_a/action_b 优先，
+                            # 取不到再用脚本当前章节的 choice_2/3 保底。
+                            # 注意：脚本结束判定（choices_available）仍【只看脚本 choice_2/3】
+                            # （不看 action_a/b）——否则 Dify 恒输出 action 会让"老脚本结束→
+                            # 换新脚本继续"永不触发。
+                            script_c2 = (pre_case_meta or {}).get("choice_2") or ""
+                            script_c3 = (pre_case_meta or {}).get("choice_3") or ""
+                            choices_available = bool(script_c2 or script_c3)
+                            meta["choice_2"] = (meta.get("action_a") or "") or script_c2
+                            meta["choice_3"] = (meta.get("action_b") or "") or script_c3
                             # 权威全文：只用"流式累计正文"（text_chunk 已按来源过滤，只含
                             # 小说节点文本）。不再信任 Dify 结束节点的 outputs["text"]——
                             # 它可能被 Dify 画布拼入 LLM② 的 music_style
@@ -3223,8 +3457,7 @@ async def generate_story(data: StoryInputData, request: Request):
                                 yield _sse(ev)
                             if audit_aborted:
                                 return
-                            # 是否有可用的下一轮选择（脚本当前章节 choice2/3 非空）
-                            choices_available = bool(meta.get("choice_2") or meta.get("choice_3"))
+                            # choices_available 已在上面按脚本 choice_2/3 计算（脚本结束判定的权威信号）
                             # 计算本段应写入的 completed_script_ids：
                             # - 存在暂存段（换脚本场景）：沿用最后一条暂存段的累计表
                             #   （已含对上一脚本的 +1），保证成对记录使用同一累计快照；

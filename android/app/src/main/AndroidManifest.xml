@@ -2,7 +2,7 @@
     <!-- 允许访问网络，用于调取审核服务器 -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="flutter_application_1"
+        android:label="鬼谈录 AI"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">

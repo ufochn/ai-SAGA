@@ -78,7 +78,9 @@ class MyApp extends StatelessWidget {
                 ? AppTheme.pageBackgroundDark
                 : AppTheme.pageBackgroundLight,
           ),
-          home: compromised ? const DeviceSecurityWarningPage() : const SplashScreen(),
+          home: compromised
+              ? const DeviceSecurityWarningPage()
+              : const SplashScreen(),
         );
       },
     );
@@ -160,8 +162,9 @@ class _SplashScreenState extends State<SplashScreen>
       // （新用户从语言页开始设置，老用户用服务器金标准语言覆盖）。
       final authorized = await AccountService.isAuthorized();
       if (!mounted) return;
-      final Widget nextPage =
-          authorized ? const MyHomePage() : const LightAuthGate();
+      final Widget nextPage = authorized
+          ? const MyHomePage()
+          : const LightAuthGate();
       Navigator.of(context).pushReplacement(
         // Apple 风格的交叉溶解过渡（cross dissolve）
         PageRouteBuilder(
@@ -194,20 +197,73 @@ class _SplashScreenState extends State<SplashScreen>
     switch (language) {
       case 'zh-TW':
       case 'yue':
-        return 'AI 傳奇';
+        return '鬼談錄 AI';
       case 'en':
+        return 'Ghost Tales AI';
       case 'es':
       case 'fr':
       case 'de':
       case 'pt':
-        return 'AI SAGA';
+        return 'Ghost Tales AI';
       case 'ja':
-        return 'AI サーガ';
+        return '怪談録 AI';
       case 'ko':
-        return 'AI 사가';
+        return '귀신담록 AI';
       default:
-        return 'AI SAGA';
+        return '鬼谈录 AI';
     }
+  }
+
+  /// 把标题渲染成"主词 + AI 上标"：AI 缩小并抬到主词右上角，类似注册商标的 ™ 角标。
+  ///
+  /// 注意：**不要**用 `RichText` + `WidgetSpan` + `PlaceholderAlignment.baseline`
+  /// 做上标——inline placeholder 的 baseline 对齐会在 RichText 布局时触发断言
+  /// （红屏）。这里改用纯 `Stack` 把 "AI" 钉在主词右上角，无 inline placeholder，
+  /// 无断言风险。
+  Widget _buildTitle(String title) {
+    final isDark = AppTheme.isDark(context);
+    final color =
+        isDark ? AppTheme.accentBlueDark : AppTheme.accentBlueLight;
+    const double fontSize = 48;
+    const String aiSuffix = ' AI';
+    final bool hasAi = title.endsWith(aiSuffix);
+    final String base =
+        hasAi ? title.substring(0, title.length - aiSuffix.length) : title;
+
+    final TextStyle style = TextStyle(
+      fontSize: fontSize,
+      fontWeight: FontWeight.w600,
+      color: color,
+      height: 1.0,
+    );
+
+    if (!hasAi) {
+      return Text(base, textAlign: TextAlign.center, style: style);
+    }
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Text(base, textAlign: TextAlign.center, style: style),
+        Positioned(
+          top: 0,
+          right: 0,
+          child: Transform.translate(
+            // 把 AI 往右上角再推一点（正右 + 略上），落在主词右上角
+            offset: const Offset(fontSize * 0.5, -fontSize * 0.06),
+            child: Text(
+              'AI',
+              style: TextStyle(
+                fontSize: fontSize * 0.34,
+                fontWeight: FontWeight.w600,
+                color: color,
+                height: 1.0,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 
   @override
@@ -224,62 +280,17 @@ class _SplashScreenState extends State<SplashScreen>
             : AppTheme.pageBackgroundLight,
         child: Center(
           child: hasLanguage
-              ? Text(
-                  _getLocalizedTitle(language),
-                  style: TextStyle(
-                    fontSize: 48,
-                    fontWeight: FontWeight.w600,
-                    color: isDark
-                        ? AppTheme.accentBlueDark
-                        : AppTheme.accentBlueLight,
-                  ),
-                )
+              ? _buildTitle(_getLocalizedTitle(language))
               : Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      'AI SAGA',
-                      style: TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.w600,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'AI 傳奇',
-                      style: TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.w600,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'AI サーガ',
-                      style: TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.w600,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'AI 사가',
-                      style: TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.w600,
-                        color: isDark
-                            ? AppTheme.accentBlueDark
-                            : AppTheme.accentBlueLight,
-                      ),
-                    ),
+                    _buildTitle('Ghost Tales AI'),
+                    const SizedBox(height: 10),
+                    _buildTitle('鬼談錄 AI'),
+                    const SizedBox(height: 10),
+                    _buildTitle('怪談録 AI'),
+                    const SizedBox(height: 10),
+                    _buildTitle('귀신담록 AI'),
                   ],
                 ),
         ),
@@ -561,8 +572,9 @@ class _MyHomePageState extends State<MyHomePage> {
                 borderRadius: BorderRadius.circular(20),
                 boxShadow: [
                   BoxShadow(
-                    color: CupertinoColors.black
-                        .withValues(alpha: isDark ? 0.4 : 0.12),
+                    color: CupertinoColors.black.withValues(
+                      alpha: isDark ? 0.4 : 0.12,
+                    ),
                     blurRadius: 12,
                     offset: const Offset(0, 4),
                   ),
@@ -889,10 +901,14 @@ class _MyHomePageState extends State<MyHomePage> {
     final prefix = switch (StorageService.getLanguage()) {
       'zh-TW' || 'yue' => '無法清空數據，請檢查網絡後重試。',
       'en' => 'Failed to clear data. Please check your network and try again.',
-      'es' => 'No se pudieron borrar los datos. Revisa tu red e inténtalo de nuevo.',
-      'fr' => 'Échec de la suppression des données. Vérifiez le réseau et réessayez.',
-      'de' => 'Daten konnten nicht gelöscht werden. Prüfen Sie das Netzwerk und versuchen Sie es erneut.',
-      'pt' => 'Não foi possível apagar os dados. Verifique a rede e tente novamente.',
+      'es' =>
+        'No se pudieron borrar los datos. Revisa tu red e inténtalo de nuevo.',
+      'fr' =>
+        'Échec de la suppression des données. Vérifiez le réseau et réessayez.',
+      'de' =>
+        'Daten konnten nicht gelöscht werden. Prüfen Sie das Netzwerk und versuchen Sie es erneut.',
+      'pt' =>
+        'Não foi possível apagar os dados. Verifique a rede e tente novamente.',
       'ja' => 'データを消去できませんでした。ネットワークを確認して再試行してください。',
       'ko' => '데이터를 삭제하지 못했습니다. 네트워크를 확인하고 다시 시도해 주세요.',
       _ => '无法清空数据，请检查网络后重试。',
@@ -1283,7 +1299,9 @@ class _MyHomePageState extends State<MyHomePage> {
                           opacity: reveal,
                           child: GestureDetector(
                             // 生成期间禁止打开菜单：点击只弹短暂提示，说明当前状态
-                            onTap: isStreaming ? _showMenuLockedToast : _showMenuSheet,
+                            onTap: isStreaming
+                                ? _showMenuLockedToast
+                                : _showMenuSheet,
                             child: Container(
                               width: 36,
                               height: 36,

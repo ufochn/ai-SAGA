@@ -42,6 +42,7 @@ class StoryService {
   ///
   /// [onChunk]：审核通过的首段正文（打字机开始打）
   /// [onReveal]：后续各段审核通过的正文 + 结束节点 outputs（逐段追加显示）
+  /// [onTruncate]：服务器修正违规内容后，让当前段回滚到指定字符数（keep）再续打
   /// [onAbort]：内容违规被中止
   /// [onError]：出错
   /// [onDone]：流程结束（可在此保存/收尾）
@@ -60,7 +61,8 @@ class StoryService {
     String language = '',
     required void Function(String text) onChunk,
     required void Function(String text, Map<String, dynamic> outputs) onReveal,
-    required void Function(String reason) onAbort,
+    void Function(int keep)? onTruncate,
+    required void Function(String reason, String snippet) onAbort,
     required void Function(String message, {String? code}) onError,
     void Function()? onDeviceConflict,
     void Function()? onStalled,
@@ -194,6 +196,10 @@ class StoryService {
               (evt['outputs'] as Map?)?.cast<String, dynamic>() ?? const {},
             );
             break;
+          case 'truncate':
+            // 服务器修正违规内容后：把当前段回滚到 keep 字符，随后续 reveal 继续打字
+            onTruncate?.call(evt['keep'] as int? ?? 0);
+            break;
           case 'abort':
             terminatedByEvent = true;
             onAbort(evt['reason'] as String? ??
@@ -208,7 +214,7 @@ class StoryService {
                   pt: 'O conteúdo gerado contém informações que violam as diretrizes',
                   ja: '生成された内容に違反情報が含まれています',
                   ko: '생성된 콘텐츠에 위반 정보가 포함되어 있습니다',
-                ));
+                ), evt['snippet'] as String? ?? '');
             break;
           case 'error':
             terminatedByEvent = true;

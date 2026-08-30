@@ -39,6 +39,11 @@
 >
 > **⚠️ 2026-08-28 (unified timeouts, dedup, deployment tooling & RAG memory retrieval)**: this session (1) standardized the whole generation path on a **unified 30 s idle timeout across all four hops** (app→server, server→Dify, Dify→server, server→app) that resets on any data/heartbeat, with a real timeout silently closing the current task and the client surfacing the localized "network suspected timeout, please restart" dialog; (2) made the server **continue its work after the client disconnects** (waiting for Dify, auditing, persisting) so a restarted app can sync the full chapter back; (3) added **near-distance duplicate-chapter deduplication** by script id — delete the older duplicate only when the seq gap ≤ 3, scoped to the pulled rows, backed by a covering index; (4) built **deployment tooling** (hot in-place deploy into the container, plus a local-only DB admin tool bound to 127.0.0.1); (5) **removed the `choice_2`/`choice_3` fallback defaults** so a script with no choices is correctly detected as ended and a new script auto-starts; (6) changed the settings-overview transition to a **slide** and hid the menu button during the "enter your world" blackout so it **fades in with the brighten phase**; and (7) designed and implemented **RAG memory retrieval** — per-chapter character-name extraction from the Dify return, 600/100 token chunking with a trailing-600 rule, an embeddings API (bge-m3 preferred → Hugging Face blocked by the server's network path → **Jina Embeddings v3**), a dual-channel retrieval (exact-name + semantic cosine ≥ 0.65) that excludes the current script and injects one whole chapter, with per-user trigger-wheel backfill, delete-sync, an application-level embed concurrency cap, and a 3 s retrieval fail-open timeout. Read the **[Full Chatflow Summary — Unified Timeouts, Dedup, Deployment Tooling & RAG Memory Retrieval (2026-08-28)](#full-chatflow-summary--unified-timeouts-dedup-deployment-tooling--rag-memory-retrieval-2026-08-28)** section at the bottom.
 
+>
+> **⚠️ 2026-08-30 (automatic violation revision workflow & first-chapter back-to-setup)**: this session (1) added an **optional "violation revision" Dify workflow** — when the incremental content moderation REJECTs a 400-char window, the server automatically sends `{novel_text, guardrail_json}` to a new Dify workflow, overwrites the violating span inside the live streaming buffer (`full_text`), tells the app to roll the current segment back to the window start (a new `truncate` SSE event), **re-audits the rewritten remainder through the same audit pipeline**, and continues the typewriter — all inside the existing stream, **no separate typing flow**; the blocking revision call emits 15 s heartbeats so the app never misjudges a normal wait as a stall; the revise→re-audit loop is capped at **3 attempts** (`REVISE_MAX_ATTEMPTS`), after which the server falls back to the existing `abort` dialog; and (2) fixed a **first-chapter dead-end** — when the first generation is rejected there is no input box to re-enter into (blank white screen), so the violation dialog's button now returns to the **final settings overview page** instead of "re-enter" for that case. The revision workflow is **opt-in** (no `REVISE_DIFY_API_KEY` configured → behaviour unchanged, straight to the abort dialog). Read the **[Full Chatflow Summary — Automatic Violation Revision & First-Chapter Back-to-Setup (2026-08-30)](#full-chatflow-summary--automatic-violation-revision--first-chapter-back-to-setup-2026-08-30)** section at the bottom.
+>
+> **⚠️ 2026-08-30 (client: app title rename, superscript title & splash red-screen fix)**: the app was renamed from "AI传奇 / AI SAGA" to **鬼谈录 AI / Ghost Tales AI** (鬼談錄 AI / 怪談録 AI / 귀신담록 AI for 繁中・粵語 / 日 / 韩; English name for the Latin-script languages), the splash title gained a **™-style superscript "AI"**, and a **splash-page debug red-screen assertion** was fixed — the first superscript used `RichText` + `WidgetSpan` + `PlaceholderAlignment.baseline` without the required `baseline` argument (assert in `widget_span.dart:83`), rewritten to a plain `Stack`. Client-only. Read the **[Full Chatflow Summary — App Title Rename, Superscript Title & Splash Red-Screen Fix (2026-08-30)](#full-chatflow-summary--app-title-rename-superscript-title--splash-red-screen-fix-2026-08-30)** section at the bottom.
+>
 ---
 
 ## Table of Contents
@@ -136,7 +141,7 @@ The app was originally created from the default Flutter template (`flutter_appli
 | Secure storage | `flutter_secure_storage` (iOS Keychain / Android Keystore) |
 | Platform auth | `google_sign_in`, `sign_in_with_apple` |
 | Hardware keys | Android Keystore (StrongBox/TEE) & iOS Secure Enclave via a native `MethodChannel` |
-| Backend | **FastAPI** + **SQLite** (container `my-audit-app`, port 8000) |
+| Backend | **FastAPI** + **SQLite** (container `<container>`, port 8000) |
 | AI moderation | Server calls a **Dify audit workflow** (blocking response mode) |
 | AI fiction generation | Server calls a **Dify fiction workflow** (`response_mode: streaming`, SSE); output is audited in **two phases** before display |
 | Streaming | FastAPI `StreamingResponse` (SSE: `chunk` / `reveal` / `abort` / `error` / `done`) → Flutter `http` stream client → `TypewriterText` widget |
@@ -370,11 +375,11 @@ This is the core UX. The user asked: *“先审 400 字 → 打字 → 剩余全
 
 **Agreed setup (implemented)**:
 - Remote host `<server-ip>`, user `<user>`, SSH key `~/.ssh/<ssh-key>`.
-- Docker container **`my-audit-app`** runs the FastAPI server on port 8000 with bind mounts:
+- Docker container **`<container>`** runs the FastAPI server on port 8000 with bind mounts:
   - `/home/<user>/main.py` → `/code/main.py` (hot code mount),
   - `/home/<user>/ai_saga_data` → `/code/data` (SQLite data).
 - `uvicorn --reload` is enabled, so **uploading `main.py` auto-reloads the container** — no restart required.
-- [`deploy_helper.sh`](deploy_helper.sh:1) wraps the flow:
+- A local `deploy_helper.sh` (kept **outside** this public repo — it holds the operator's real host / SSH key path) wraps the flow:
   - `./deploy_helper.sh upload <local> <remote>` → `scp` upload,
   - `./deploy_helper.sh run "<cmd>"` → `ssh` remote command.
 - After each deploy we verify with `docker ps`, `docker logs` (look for `StatReload detected changes … Reloading`), and `curl /api/health`.
@@ -2131,7 +2136,7 @@ The setup-page audit endpoint (`/api/audit-and-chat`) previously returned `actio
 ## 10. Notes
 
 - As this is the pre-launch debugging stage, **no historical-data migration, no backward-compatibility, and no legacy-protection code** were added for any of the changes above (per the project's standing policy).
-- Script choices for the app's input boxes 2/3 come from the script database (`chapter_script_N_choice_2/3`), not from Dify's outputs; Dify's action_a/action_b fields are no longer used.
+- Input boxes 2/3 are filled with Dify's `action_a`/`action_b` (the fiction LLM's structured outputs) when present; when absent they fall back to the script database's `chapter_script_N_choice_2/3`. Script-end detection (`choices_available`) is **still** driven solely by the script chapter's `choice_2/3` — not `action_a/b` — so a finished script still auto-switches to the least-used new script.
 - The Dify canvas must use `case_core_prompt` (case workflow), `chapter_script` / `corrent_case_all_content` (fiction workflow), and the `heartbeat` SSE events are server-generated only (no canvas change needed).
 
 # Full Chatflow Summary — Unified Timeouts, Dedup, Deployment Tooling & RAG Memory Retrieval (2026-08-28)
@@ -2199,6 +2204,7 @@ The setup-page audit endpoint (`/api/audit-and-chat`) previously returned `actio
 - **Format.** `、`/comma/semicolon/newline separated, or a JSON array string; entries < 2 chars dropped; duplicates removed.
 - **No identity merging** across chapters (e.g., `老周` vs `周叔` stay separate entries).
 - **Latest memory.** Each distinct name maps to exactly one chapter — its **most recent** occurrence; a new occurrence **overwrites** the old mapping (no same/different-script distinction, no script-number comparisons).
+- **Protagonist excluded.** The player's own name (`player_name`, from the per-chapter settings snapshot) is filtered out before registration — the protagonist appears in every chapter, so indexing them would only add noise to the name memory.
 
 ### 8.5 Storage (existing SQLite file, 3 new tables)
 | Table | Purpose |
@@ -2248,3 +2254,94 @@ All 4 places that delete `story_segments` rows call a single purge helper **in t
 - Pre-launch debugging stage — no historical-data migration / backward-compat / legacy-protection code.
 - **Desensitized**: all credentials, hosts and container identifiers in this section are placeholders.
 - **Outstanding**: (1) the two Dify workflow changes (`characters` output + `rag_context` input) — platform-side, required for full RAG; (2) verify retrieval with real user data; (3) optional later switch back to local bge-m3 on a larger self-hosted machine (config-only change).
+
+# Full Chatflow Summary — Automatic Violation Revision & First-Chapter Back-to-Setup (2026-08-30)
+
+> This section documents the 2026-08-30 session: an **optional "violation revision" Dify workflow** that automatically rewrites moderation-rejected text inside the live streaming pipeline, and the **first-chapter violation dead-end fix** (the dialog now routes back to the final settings overview page instead of "re-enter"). All credentials, hosts and container identifiers below are **placeholders** (`<SERVER_HOST>`, `<CONTAINER_NAME>`, `<REVISE_API_KEY>`).
+
+## 1. The problem
+
+- When the incremental content moderation REJECTs a 400-char window, the old behaviour aborted the whole chapter and asked the user to **re-enter their prompt** — the entire chapter then had to be regenerated from scratch (a large context input + full output + a full re-audit).
+- For the **first chapter** specifically there was a dead-end: with no story text yet there is no input box to re-enter into, so after the violation dialog the app sat on a blank white screen.
+- Goal: automatically rewrite just the offending span (which is far cheaper than regenerating the whole chapter, because fiction cost is dominated by the large input context, not the output), re-audit it, and **continue the typewriter** — without inventing a second parallel typing flow.
+
+## 2. The design (chosen with the user)
+
+- **Option A — server-side, in-stream auto-revision** was chosen over a button-triggered round-trip: on REJECT the server itself calls the new revision workflow, overwrites the violating span inside the live stream buffer (`full_text`), tells the app to roll the current segment back to the window start (a new `truncate` SSE event), then **re-feeds the rewritten text through the same incremental audit pipeline** (the old logic — one source of truth, no separate typing flow).
+- The revision workflow is **opt-in** and fail-open: if `REVISE_DIFY_API_KEY` is not configured (or the call fails / times out), the server falls back to the existing `abort` dialog exactly as before.
+- **Heartbeats**: every blocking revision call is awaited in 15 s slices with a `heartbeat` emitted on each wait, so the app's 30 s idle timer is continuously reset and never misjudges the wait as a network stall.
+- **Dead-loop guard (server-side)**: the revise→re-audit loop is capped at **`REVISE_MAX_ATTEMPTS` = 3**. After 3 attempts the revised text still fails moderation, the server falls back to the current `abort` event → the app shows the existing dialog (re-enter, or back-to-setup for the first chapter). No unbounded spending.
+
+## 3. Server implementation
+
+- **Config** (`REVISE_DIFY_API_KEY`, `REVISE_DIFY_API_URL`, `REVISE_DIFY_TIMEOUT`, `REVISE_MAX_ATTEMPTS`, `REVISE_MAX_TOKENS`) added in the config block; an empty key disables the feature entirely.
+- **`_moderate_story()`** now returns `(ModerationOutcome, verdict_dict)` — the second element is the guardrail structured verdict (`action` / `category` / `confidence` / `reason`) needed by the revision workflow.
+- **`_revise_story(text, verdict, language)`** — new: posts `{novel_text, guardrail_json, language, max_tokens}` to the revision workflow (blocking) and returns the rewritten text (output variable tried in order: `revised_text` → `text` → `novel_text` → `output_text` → `result`); `language` is the full language name (e.g. `简体中文`, via `_dify_language_name`) so the rewrite stays in the user's language; returns `None` on any failure.
+- **New fiction-workflow inputs `script_choice_2` / `script_choice_3`** — the current script chapter's recommended actions (from `fiction_script`), sent to the generation workflow (both the debug-preview payload and the actual streaming payload) so the LLM can echo them in the chapter; empty when the script chapter has none.
+- **`action_a`/`action_b` fill input boxes 2/3** — the fiction LLM's structured outputs are extracted (`_extract_story_meta`) and used to override `choice_2`/`choice_3` for the app's input boxes; when absent, the script's `choice_2`/`choice_3` are the fallback. Script-end detection stays script-based so script switching is unaffected.
+- **`_audit_pipeline()`** refactored:
+  - Windows are now **base-relative** (`_audit_base`): normally `0`; after a revision the base is reset to the revision point so the 400/50 windowing stays aligned even though the replacement text has a different length.
+  - On REJECT a new inner generator **`_handle_reject()`** loops (≤ 3 rounds): call `_revise_story` (with heartbeats) → overwrite `text_arg[:win_start] + revised + text_arg[win_end:]` (and the outer `full_text`, so later `text_chunk`s continue from the revised buffer) → emit `{"event":"truncate","keep":win_start}` → re-audit the whole remainder in one blocking call → on PASS emit it as a single `chunk`/`reveal`, reset `_audit_base = len(text_arg)`, and continue; on REJECT it loops; on failure/超限 it emits the standard `abort`.
+- **New SSE event `truncate`** — tells the app to roll the current segment back to `keep` characters before the follow-up `reveal`, so the already-typed overlap region is not duplicated.
+
+## 4. Client implementation
+
+- **`story_service.dart`**: `generateStoryStream` gains an optional `onTruncate(int keep)` callback; a new `case 'truncate'` in the SSE switch calls it.
+- **`home_content.dart`** (both `_continueStory` and `_onSetupConfirmed`): the `onTruncate` handler truncates `_storyTexts[last]` to `keep` chars (no-op when there is no segment) and sets `_storyTyped = false`; the existing `TypewriterText` then re-types the appended revised text (a ≤ 50-char instant jump at the seam is accepted on this rare path; the existing height-compensation keeps the layout stable).
+- The success path is otherwise **transparent** — no dialog, no new flow; the typewriter just keeps going. The fallback (3 failed attempts) reuses the already-existing `abort` dialog.
+
+## 5. First-chapter violation dead-end fix (included in this session)
+
+- When the **first generation** is REJECTed, there is no story text yet → no input box → "re-enter" left a blank white screen.
+- `_onSetupConfirmed`'s `onAbort` now sets `_setupStep = 4` (final settings overview page) and calls `_showViolationDialog(snippet, backToSetup: true)`: the button text becomes **"回到最终审核设置页面" (Back to final setup page)** (10 languages), and on tap `_returnToSetupConfirmation()` clears the empty-segment residue and shows the settings overview again so the user can adjust settings and re-confirm.
+- Continuation (`_continueStory`) is unchanged — with existing text the input boxes are present, so "Re-enter" still applies.
+
+## 6. Verification
+
+- Server: `python3 -m py_compile` passes; deployed in place into the running container; health HTTP `200`.
+- Client: `flutter analyze` (home_content.dart / story_service.dart) — no issues found.
+- Behaviour matrix: revision configured → auto-revise + re-audit + continue typing; revision unconfigured/failed/超限 → unchanged `abort` dialog; first-chapter REJECT → back to final settings overview page.
+
+## 7. Notes & outstanding
+
+- Pre-launch debugging stage — no historical-data migration / backward-compat / legacy-protection code.
+- **Desensitized**: all credentials, hosts and container identifiers in this section are placeholders.
+- **Dify platform-side (user)**: build the **revision workflow** with input variables `novel_text` (String), `guardrail_json` (String — a serialized JSON string), `language` (String, full name like `简体中文`) and optionally `max_tokens` (Number), and an output the server can read (`revised_text` preferred); then set `REVISE_DIFY_API_KEY` (+ optional URL/timeouts/attempts/tokens) in the container's `/code/.env` — until then the feature stays disabled and behaviour is unchanged.
+- **Outstanding (unchanged)**: the RAG `characters` output + `rag_context` input Dify changes; verify retrieval with real user data.
+
+# Full Chatflow Summary — App Title Rename, Superscript Title & Splash Red-Screen Fix (2026-08-30)
+
+> Client-side work from the same 2026-08-30 session, kept as its own section for clarity: the app was renamed from "AI传奇 / AI SAGA" to **鬼谈录 AI / Ghost Tales AI**, the splash title gained a ™-style superscript "AI", and a splash-page debug red-screen assertion was diagnosed and fixed. Client-only — the server is unchanged by these items. All credentials/hosts below are placeholders.
+
+## 1. App title rename — "AI传奇 / AI SAGA" → 鬼谈录 AI / Ghost Tales AI
+
+- **Final names** (AI placed after the main word; Latin-script languages use the English name):
+
+  | language | title |
+  |---|---|
+  | zh-CN | 鬼谈录 AI |
+  | zh-TW / yue | 鬼談錄 AI |
+  | en / es / fr / de / pt | Ghost Tales AI |
+  | ja | 怪談録 AI |
+  | ko | 귀신담록 AI |
+
+- **Naming decisions**: 录 ("a record") beats 集 for the ghost-tale feel; 怪談 is the standard Japanese term; 繁中/粵語 keep the traditional form; Latin-script languages uniformly use the English name so "AI" stays suffix-positioned.
+- **Where applied**: [`_getLocalizedTitle()`](AI-SAGA/lib/main.dart:196) + the 4-language splash column ([`main.dart`](AI-SAGA/lib/main.dart:281)); Android `android:label`; iOS `CFBundleDisplayName` / `CFBundleName`; web `manifest.json` `name` / `short_name`. Client-only — hot-reload updates the in-app title; a rebuild is needed for the launcher icon label.
+
+## 2. ™-style superscript "AI" title
+
+- [`_buildTitle()`](AI-SAGA/lib/main.dart:223) renders the base word at 48 px with "AI" shrunk to ~34 % and raised to the top-right corner of the title (like a registered-trademark mark), using a pure `Stack`.
+
+## 3. Splash red-screen fix (root cause confirmed)
+
+- **Symptom**: at app startup the splash/title page showed the debug red screen ("assert failed").
+- **Root cause** (confirmed by the reported error): the first superscript implementation used `RichText` + `WidgetSpan` + `PlaceholderAlignment.baseline` **without supplying the required `baseline` argument** → Flutter asserts in `widget_span.dart:83` ("baseline != null … is not true") during `RichText` layout.
+- **Fix**: `_buildTitle` was rewritten to a plain `Stack` (a `Text` for the base word + `Positioned(top: 0, right: 0)` + `Transform.translate` for "AI", `Clip.none` to avoid clipping). No inline placeholder, no baseline dependency, no assert. `flutter analyze` passes.
+
+## 4. Violation-dialog snippet & copy (client)
+
+- The `abort` SSE event carries `snippet` (the moderation-rejected text); the violation dialog shows it in a scrollable box with a **"复制片段" (Copy snippet)** button (`Clipboard.setData`), plus a localized guidance sentence about sensitive elements. This was the debug aid that later became the input to the automatic violation-revision workflow (see the 2026-08-30 revision section above).
+
+## 5. Verification
+
+- `flutter analyze` — no issues. Server untouched by these client-only items.

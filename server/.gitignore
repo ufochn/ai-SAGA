@@ -29,6 +29,11 @@ data/
 *.db-wal
 *.db-shm
 
+# ---- 技术核心机密：大纲"故事底稿"模板（含层层"几选一"），绝不提交仓库 ----
+# 内容见 server/data/the_script_framework.txt（服务器 /code/data，单独部署）。
+# 单独列一行做双保险：即使上面 data/ 规则被改动，该机密文件也不会被 add/commit。
+data/the_script_framework.txt
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

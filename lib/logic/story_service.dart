@@ -65,10 +65,21 @@ class StoryService {
     required void Function(String reason, String snippet) onAbort,
     required void Function(String message, {String? code}) onError,
     void Function()? onDeviceConflict,
+    void Function()? onConflict,
     void Function()? onStalled,
     // 【调试】生成前确认：服务器在调 Dify 前把 payload 发回 App（SSE 事件 debug_payload）。
     // 回调负责弹窗展示 payload；用户点击"确认发送"后由回调调用 [confirmPayload] 通知服务器。
     void Function(Map<String, dynamic> payload, String requestId)? onDebugPayload,
+    // 违规修正前确认：服务器在修正前把待修正文本 + 违规判定 JSON 发回 App（SSE 事件 revise_confirm）。
+    // 回调负责弹窗展示；用户点击"送 Dify 修正"后由回调调用 [confirmRevise] 通知服务器继续。
+    void Function(String text, Map<String, dynamic> verdict, String requestId)?
+        onReviseConfirm,
+    // 大纲合规未通过（SSE 事件 outline_rejected）：服务器已删除该版大纲/正文，
+    // 上层弹多语言提示（统一话术"大纲尺度过大审核不过"）并提供"重新开始故事"。
+    void Function()? onOutlineRejected,
+    // 同一请求内开启新的一段（SSE 事件 segment_begin，如老小说末章自动续 →
+    // 新小说第一章）：上层应让接下来的正文另起一个新的文本框显示。
+    void Function()? onSegmentBegin,
     required void Function(Map<String, dynamic> outputs) onDone,
   }) async {
     final url = _storyApiUrl;
@@ -102,6 +113,9 @@ class StoryService {
       });
       request.body = jsonEncode({
         'user_input': userInput,
+        // 用户本轮"实际选择"文本：与所点/所确认输入框的内容一致，显式以
+        // user_choice 字段上传（服务器据此写入 user_choice 并作为 Dify 变量）
+        'user_choice': userInput,
         'choice_1': choice1,
         'choice_2': choice2,
         'choice_3': choice3,
@@ -132,16 +146,22 @@ class StoryService {
           onDeviceConflict?.call();
           return;
         }
+        if (detail == 'multi_client') {
+          // 本设备已不是最新登入（被其它设备顶掉）：写请求被拒。
+          // 由上层弹统一"多客户端"仅退出对话框。
+          onConflict?.call();
+          return;
+        }
         onError(detail);
         return;
       }
 
       var doneCalled = false;
       var terminatedByEvent = false; // 已通过 error/abort 事件终止（避免重复弹窗）
-      // 打字机流超时：每次收到新数据（含心跳）都把等待时间重置为 kStoryIdleTimeout，
-      // 超过该时长无任何数据到达即判定超时（调用 onStalled 提示重启）。
-      // 服务器在流中做阻塞式 Dify 调用时会每 15s 推心跳重置计时，只有真正超过
-      // 30 秒无任何数据/心跳才判定卡死（见 kStoryIdleTimeout 注释）。
+      // 打字机流超时规则（2026-09）：只有收到【实质内容】才把 30s 等待重置为
+      // kStoryIdleTimeout；服务器只在对应用户弹窗（审核确认/payload 确认）等待期间
+      // 发 heartbeat 维持，其余无实质内容的事件不重置（避免在无内容时错误地无限等待）。
+      // 一旦超过 30s 没有任何实质内容到达即判定卡死（调用 onStalled 提示重启）。
       Timer? idleTimer;
       void armIdleTimer() {
         idleTimer?.cancel();
@@ -157,10 +177,9 @@ class StoryService {
           .transform(utf8.decoder)
           .transform(const LineSplitter());
 
-      armIdleTimer();
+      armIdleTimer(); // 请求发出后等待首段实质内容
       await for (final line in lines) {
         if (stalled) break; // 已判定超时：停止读取后续数据
-        armIdleTimer(); // 收到新数据 → 重置 30 秒等待时间
         final s = line.trim();
         if (!s.startsWith('data:')) continue;
         final raw = s.substring(5).trim();
@@ -175,33 +194,75 @@ class StoryService {
         switch (event) {
           case 'debug_payload':
             // 【调试】生成前确认：服务器调 Dify 前把 payload 发回 App。
-            // 由回调弹窗展示；用户点"确认发送"后由回调调用 confirmPayload 放行服务器。
+            // 实质活动 → 重置 30s（弹窗等待用户确认期间不误判卡死）。
+            debugPrint('[story] RECV debug_payload id=${evt['request_id']}');
+            armIdleTimer();
             onDebugPayload?.call(
               (evt['payload'] as Map?)?.cast<String, dynamic>() ?? const {},
               evt['request_id'] as String? ?? '',
             );
             break;
-          case 'debug_waiting':
-            // 服务器等待 App 确认期间的心跳，忽略（仅用于重置客户端卡死计时器）
+          case 'outline_debug_payload':
+            // 【调试】申请小说大纲前：把将要发给大纲工作流的全部变量（含 used_name）
+            // 发回 App 弹窗确认；等待期间服务器会发 heartbeat 续命（不依赖本事件重置）。
+            debugPrint('[story] RECV outline_debug_payload id=${evt['request_id']}');
+            onDebugPayload?.call(
+              (evt['payload'] as Map?)?.cast<String, dynamic>() ?? const {},
+              evt['request_id'] as String? ?? '',
+            );
+            break;
+          case 'revise_confirm':
+            // 违规修正前确认：实质活动 → 重置 30s（等待用户确认修正期间不误判卡死）。
+            armIdleTimer();
+            onReviseConfirm?.call(
+              evt['text'] as String? ?? '',
+              (evt['verdict'] as Map?)?.cast<String, dynamic>() ?? const {},
+              evt['request_id'] as String? ?? '',
+            );
+            break;
+          case 'outline_rejected':
+            // 大纲合规未通过：终止本次生成（不做网络超时兜底弹窗），交上层弹窗。
+            terminatedByEvent = true;
+            idleTimer?.cancel(); // 已正常终止：停止 30s 等待计时
+            onOutlineRejected?.call();
+            break;
+          case 'conflict':
+            // 多客户端冲突：本设备已被更新的设备顶掉（落库被拒）。终止本次生成，
+            // 交上层弹统一"多客户端"仅退出对话框。
+            terminatedByEvent = true;
+            idleTimer?.cancel();
+            onConflict?.call();
+            break;
+          case 'segment_begin':
+            // 同一请求内开启新的一段（跨小说自动续等）：非实质内容，不重置 30s；
+            // 交上层让接下来的 chunk/reveal 另起一个新的文本框。
+            onSegmentBegin?.call();
             break;
           case 'heartbeat':
-            // 服务器换脚本/生成案件核心期间的心跳，忽略（每收到一行数据已重置 30s 计时器）
+            // "大纲活动心跳"：服务器仅在收到 Dify 大纲实质内容时才发（节流），
+            // 证明"还在等完整大纲、没有实质内容给你"→ 收到即重置 30s 防误断；
+            // 服务器在 Dify 真卡住时会停止发心跳，App 到 30s 自会断（不会无限等）。
+            armIdleTimer();
             break;
           case 'chunk':
+            armIdleTimer(); // 正文实质内容 → 重置 30s
             onChunk(evt['text'] as String? ?? '');
             break;
           case 'reveal':
+            armIdleTimer(); // 正文实质内容 → 重置 30s
             onReveal(
               evt['text'] as String? ?? '',
               (evt['outputs'] as Map?)?.cast<String, dynamic>() ?? const {},
             );
             break;
           case 'truncate':
+            armIdleTimer(); // 服务器实质改动（回滚点） → 重置 30s
             // 服务器修正违规内容后：把当前段回滚到 keep 字符，随后续 reveal 继续打字
             onTruncate?.call(evt['keep'] as int? ?? 0);
             break;
           case 'abort':
             terminatedByEvent = true;
+            idleTimer?.cancel(); // 已正常终止：停止 30s 等待计时，避免误弹超时
             onAbort(evt['reason'] as String? ??
                 StorageService.localizedText(
                   zhCN: '生成内容包含违规信息',
@@ -218,6 +279,7 @@ class StoryService {
             break;
           case 'error':
             terminatedByEvent = true;
+            idleTimer?.cancel(); // 已正常终止：停止 30s 等待计时，避免误弹超时
             onError(
               evt['message'] as String? ??
                   StorageService.localizedText(
@@ -239,11 +301,14 @@ class StoryService {
             // 【诊断】收到服务器 done 事件
             debugPrint('[story] received done event');
             doneCalled = true;
+            idleTimer?.cancel(); // 正常生成完成：立即停止等待计时
             onDone(
               (evt['outputs'] as Map?)?.cast<String, dynamic>() ?? const {},
             );
             break;
           default:
+            // 【诊断】未识别事件：若第二个弹窗其实以别的名字发来，会在此暴露
+            debugPrint('[story] UNKNOWN event=$event raw=$raw');
             break;
         }
       }
@@ -360,6 +425,32 @@ class StoryService {
     }
   }
 
+  /// 违规修正确认：通知服务器继续调用"违规修正"工作流。请求体只需 request_id。
+  static Future<bool> confirmRevise(String requestId) async {
+    final story = _storyApiUrl; // 形如 http://host/api/generate-story
+    if (story.isEmpty || requestId.isEmpty) return false;
+    final String url = '$story/revise-confirm';
+    final token = await AuthService.ensureToken();
+    final client = http.Client();
+    try {
+      final resp = await client
+          .post(
+            Uri.parse(url),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({'request_id': requestId}),
+          )
+          .timeout(const Duration(seconds: 30));
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close();
+    }
+  }
+
   /// 【调试】通知服务器"确认发送"：放行正在等待的 /api/generate-story 流式请求，
   /// 使服务器真正调用 Dify。请求体只需 request_id（服务器用其匹配 asyncio.Event）。
   static Future<bool> confirmPayload(String requestId) async {
@@ -379,7 +470,9 @@ class StoryService {
             body: jsonEncode({'request_id': requestId}),
           )
           .timeout(const Duration(seconds: 30));
-      return resp.statusCode == 200;
+      final ok = resp.statusCode == 200;
+      debugPrint('[story] confirmPayload id=$requestId http=${resp.statusCode} ok=$ok');
+      return ok;
     } catch (_) {
       return false;
     } finally {

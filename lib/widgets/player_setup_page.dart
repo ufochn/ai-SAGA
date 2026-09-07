@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:ai_saga/logic/app_theme.dart';
+import 'package:ai_saga/logic/player_name_defaults.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/sound_service.dart';
@@ -58,10 +59,7 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     final savedTraits = SetupDraft.instance.playerTraits.trim();
     _playerTraitsController.text = savedTraits.isNotEmpty
         ? savedTraits
-        : buildDefaultTraits(
-            language: _language,
-            location: SetupDraft.instance.location,
-          );
+        : buildDefaultTraits(language: _language);
 
     // 记录当前已加载语言（用于检测语言变更）
     _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
@@ -91,10 +89,8 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
         SetupDraft.instance.playerName = '';
         SetupDraft.instance.playerTraits = '';
         _playerNameController.text = _getDefaultName();
-        _playerTraitsController.text = buildDefaultTraits(
-          language: newLanguage,
-          location: SetupDraft.instance.location,
-        );
+        _playerTraitsController.text =
+            buildDefaultTraits(language: newLanguage);
         _loadedLanguage = widget.languageKey ?? StorageService.getLanguage();
       });
     }
@@ -120,25 +116,10 @@ class _PlayerSetupPageState extends State<PlayerSetupPage> {
     return _getPlayerMaleDefault(_language);
   }
 
-  /// 玩家 - 默认姓名
+  /// 玩家 - 默认姓名：每次（重新）设置主角姓名时，从该语言的 100 个候选里随机取一个，
+  /// 用户可继续自由编辑。
   String _getPlayerMaleDefault(String language) {
-    switch (language) {
-      case 'zh-TW':
-      case 'yue':
-        return '陸一鳴';
-      case 'en':
-      case 'es':
-      case 'fr':
-      case 'de':
-      case 'pt':
-        return 'Jimmy';
-      case 'ja':
-        return '蓮';
-      case 'ko':
-        return '민준';
-      default:
-        return '陆一鸣';
-    }
+    return randomMalePlayerName(language);
   }
 
   void _onSubmit() {

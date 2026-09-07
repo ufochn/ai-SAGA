@@ -44,10 +44,14 @@
 >
 > **⚠️ 2026-08-30 (client: app title rename, superscript title & splash red-screen fix)**: the app was renamed from "AI传奇 / AI SAGA" to **鬼谈录 AI / Ghost Tales AI** (鬼談錄 AI / 怪談録 AI / 귀신담록 AI for 繁中・粵語 / 日 / 韩; English name for the Latin-script languages), the splash title gained a **™-style superscript "AI"**, and a **splash-page debug red-screen assertion** was fixed — the first superscript used `RichText` + `WidgetSpan` + `PlaceholderAlignment.baseline` without the required `baseline` argument (assert in `widget_span.dart:83`), rewritten to a plain `Stack`. Client-only. Read the **[Full Chatflow Summary — App Title Rename, Superscript Title & Splash Red-Screen Fix (2026-08-30)](#full-chatflow-summary--app-title-rename-superscript-title--splash-red-screen-fix-2026-08-30)** section at the bottom.
 >
+> **⚠️ 2026-09-03 (single-writer latest-login pass, per-chapter-outline new-novel persistence, RAG re-enablement)**: the generation pipeline moved to a **per-chapter Dify outline workflow** with **one-shot atomic persistence** (a new novel is written only after both the full outline and the chapter-1 body complete, in a single transaction), and a **single-writer “latest-login pass” guard** was added so the database can only ever be written by the most recently logged-in program — every causally-related group of writes (per-chapter fill, reset, whole-array PUT, and each phase of a time-tree rewrite) lands inside one short SQLite transaction that verifies the login pass; a superseded device’s writes are refused (SSE `conflict` / HTTP 409 `multi_client`) and the app shows a localized **Exit-only** dialog. RAG memory generation (silently orphaned by a persistence rewrite) was restored and rewired to the two current persist points. Read the **[Full Chatflow Summary — Latest-Login Writer Pass, New-Novel Atomic Persistence and RAG Re-enablement (2026-09-03)](#full-chatflow-summary--latest-login-writer-pass-new-novel-atomic-persistence-and-rag-re-enablement-2026-09-03)** section at the bottom.
+>
+> **⚠️ 2026-09-07 (splash intro timing & render-performance lessons; Web CJK font loading; “Restart” 404 fix)**: the splash title sequence is now a **single timed opacity animation** — fade-in 3 s → fade-out 4 s (no hold at full brightness, both `easeInCubic`) → 2 s blank → the next page appears **immediately** via a zero-duration route transition, driven by one `AnimationController` + `TweenSequence` weight segments ([`main.dart`](AI-SAGA/lib/main.dart:159)). An experimental **searchlight beam + long-shadow title effect** was attempted and then **removed**; it exposed a hard rendering rule worth keeping — never use a `CustomPainter` to re-render dozens of layered `TextPainter` glyphs every frame (it stalls the UI thread into a blank frozen splash whose timed hand-off never fires) — prefer engine-native `TextStyle.shadows` and keep title text on real `Text` widgets so the theme’s Web CJK font fallback still applies. This session also documents that the **Web CJK font is loaded at runtime** (~4 MB `NotoSansCJK-Common.otf` fetched from `/fonts/` and registered via `FontLoader`, not bundled), and fixes menu **“Restart”** returning HTTP 404 — [`resetStory()`](AI-SAGA/lib/logic/sync_service.dart:84) now normalizes the configured `/api/generate-story` base to `/api/story` before POSTing `/reset`. Read the **[Full Chatflow Summary — Splash Intro Timing, Rendering-Performance Lessons, Web CJK Font Loading & Restart 404 Fix (2026-09-07)](#full-chatflow-summary--splash-intro-timing-rendering-performance-lessons-web-cjk-font-loading--restart-404-fix-2026-09-07)** section at the bottom.
+>
+> **⚠️ 2026-09-04 (fiction-script removal, audit & generation interface hardening)**: this session (1) **removed the prewritten-script library `fiction_script`** from the live database and code — `init_db` drops any leftover table, the local DB admin tool's default/labels now point at `story_segments`, the stale "下线" comment and the one-off authoring scripts were deleted; (2) adapted the **content-audit workflow to its new Bedrock-guardrail interface** — its End output is now `text` (a string-form verdict whose first line is `Action: NONE` for pass), the old `guardrail_return_json` handling was deleted, and verdict parsing reads the leading `Action:` marker (`NONE` → pass, anything else → block) while still accepting legacy JSON verdicts; (3) forwards the **raw audit feedback string** (the whole Bedrock text, including its "content safety guidelines" reason) to the **violation-revision workflow** as `guardrail_json` so the rewrite sees the actual feedback; (4) replaced the "one worker per user" single-flight gate with an **"at most one worker per login pass"** rule keyed on `device_id + login_ts` — after a warned restart (a fresh login pass) a new worker may start and the superseded worker is refused by the writer-pass guard, and lock release matches identity; (5) fixed the continuation **`seq`** sent to Dify — it had counted every `story_segments` row (outline placeholders included), so generating chapter 2 showed `seq=10`; it now counts only content-bearing segments so `seq` equals the index of the blank placeholder being filled; (6) fixed an **app** bug where the continuation `generateStoryStream` call did not register `onReviseConfirm`, so the "send to Dify to revise" dialog never appeared on chapter 2+ (a REJECT then just stalled until the app 30 s / server 120 s timeouts); and (7) made the **revision-confirm wait keep the app alive** — the server now emits a heartbeat every 15 s while the confirm dialog is open and one more heartbeat on confirm, so a normal "waiting for the user to approve a revision" is never misjudged as a stall. Read the **[Full Chatflow Summary — Fiction-Script Removal, Audit text Interface and Revision Feedback, Per-Login Generation Gate, Keep-Alive Fixes (2026-09-04)](#full-chatflow-summary--fiction-script-removal-audit-text-interface-and-revision-feedback-per-login-generation-gate-keep-alive-fixes-2026-09-04)** section at the bottom.
+>
 ---
-
 ## Table of Contents
-
 - [Overview](#overview)
 - [Key Decision: Full Story Text Instead of Outline Summaries](#key-decision-full-story-text-instead-of-outline-summaries)
 - [Tech Stack](#tech-stack)
@@ -2345,3 +2349,215 @@ All 4 places that delete `story_segments` rows call a single purge helper **in t
 ## 5. Verification
 
 - `flutter analyze` — no issues. Server untouched by these client-only items.
+
+---
+
+# Full Chatflow Summary — Latest-Login Writer Pass, New-Novel Atomic Persistence and RAG Re-enablement (2026-09-03)
+
+> Pre-release policy: no legacy-data / old-user compatibility — schema and tokens may change freely.
+
+## 1. Fiction pipeline: per-chapter outline workflow + one-shot atomic persistence
+
+- The prewritten chapter-script library / case-core pipeline was removed. Opening a new novel now runs a **Dify "chapter-by-chapter outline" workflow** that streams one full outline JSON (`chapter_script_01..N` + `check_result`). The typewriter can begin chapter 1 as soon as its outline arrives (early release) while the rest of the outline keeps streaming.
+- **Two lines must complete before anything is persisted**: ① the server↔Dify outline (1..N + check + chapter-1 body) and ② the app↔server delivery of the chapter-1 body. Only then is the whole new novel written in **one atomic transaction** — chapter 1 with full body/choices/settings, chapters 2..N as outline-only rows. Continuation chapters persist one row atomically. Any failure persists nothing; the client restarts and re-syncs from the database.
+- **The old-novel → new-novel boundary is one atomic transaction.** When a continuation fills the *final* chapter of an already-persisted novel (its outline is exhausted) and the flow auto-opens the next novel inside the same worker, the just-generated "old ending" is **no longer committed chapter-by-chapter**: it is deferred in memory (a `lead`) and folded into the very same guarded transaction that persists the next novel (chapter 1 body + chapters 2..N outline). Old ending + new novel therefore land together — **all present or all absent**. No DB transaction is held open during the (long) outline/chapter-1 generation; both former short commits simply collapse into **one short commit after both generations finish**, which keeps the "one short transaction per logical write unit" invariant.
+- If a newer device logs in while the boundary is still generating, the combined write is refused and rolls back to **zero bytes**, so the database can never be stranded at "last chapter written with no next-chapter placeholder and no successor novel". If the auto-open cannot start a next novel, the deferred ending is dropped too (all-or-nothing) and the client restarts from the database; only at the switch-guard stop (no further novel is opened) is the ending flushed on its own. After the single commit, RAG is scheduled for **both** the merged old ending and the new chapter 1.
+- Compliance rejection (`check_result != true`) never wrote anything and shows a localized "outline too large / restart the story" dialog.
+- Streaming robustness: activity-driven heartbeats; the app resets its idle timer only on substantive content; the server silently closes a stream after 30 s without data; reads filter blank-content rows; the `GET /api/story` near-duplicate cleanup became read-only.
+
+## 2. Single-writer "latest-login pass" guard (server + client)
+
+- **Why**: multi-device duplication/mis-fill comes from any stale device being able to write; client/device count is not the gold standard — the write is. The frozen invariant: the database is written only by the **most recently logged-in program**, and every causally-related group of writes lands in **one short transaction** (frozen spec: `plans/story-write-guard-final.md`).
+- Server: a per-user row `user_write_guard(user_id, device_id, login_ts)`. `register` / `device/activate` (the first call at every launch) overwrite the pass with a server-minted `login_ts` also embedded in the signed token.
+- Every **logical write unit** (new-novel persist, single-chapter fill, generate-entry choice save / time-tree rewrite, reset, whole-array story PUT) runs through `_run_write_unit`: one SQLite transaction (`BEGIN IMMEDIATE`) that (a) checks the request’s `device_id + login_ts` still equals the current latest login and (b) performs **all of that unit’s causally-related writes together**, then commits — or rolls back with **zero bytes written** if the device was superseded. Each unit is one gapless batch; no two writers can overlap because SQLite serializes the write transactions and every write re-validates the pass.
+- A superseded (stale) device therefore cannot write: generate persist / entry / reset / story PUT are refused with SSE `conflict` or HTTP 409 `multi_client`. Reads stay open. The earlier in-process "active device" checks and worker slot were folded into this DB-backed pass mechanism (works across processes and restarts).
+- **Time-tree rewrite is two atomic phases, not one giant transaction** — ① the synchronous clean-up (delete later novels’ rows, clear same-novel later chapters’ content while keeping their outlines, purge RAG) is one pass-guarded transaction at request entry; ② after the multi-minute Dify generation, the rewritten chapter is written in a second pass-guarded transaction (`_fill_content_row`) that re-validates the pass. The phases cannot be merged because a DB write transaction cannot be held across the LLM call; each phase is internally gapless and guarded, so a device superseded mid-generation cannot land phase ② and the database is always left in a consistent state.
+- **Same-worker cross-novel continuation is a single atomic commit, not two** — distinct from the time-tree restart. When filling the old novel’s final chapter would previously commit first and the auto-opened next novel second, the ending is now deferred in memory and merged into the next novel’s **one** guarded transaction after both generations complete. No transaction is held open during generation (both former short commits collapse into one short commit), so this is fully consistent with the one-short-transaction-per-write-unit invariant while guaranteeing old ending + new novel always land together.
+- App startup: splash → (if not authorized) light authorization → HomeContent sync gate: ensure token → `device/activate` **writes the pass** (10 s timeout) and saves the returned token → **immediately** pull the latest chapters. No artificial delay: the committed pass is the authoritative barrier, WAL reads are always consistent snapshots, and any old writer’s next write is refused once the pass commits.
+- Client UX: `story_service` maps SSE `conflict` and HTTP 409 `multi_client` to a localized (9 languages) **Exit-only** dialog, wired at both generate call sites and both `resetStory` call sites — including the menu **"Restart story"** path. **Exit** (not restart) is used so two devices cannot restart each other into a takeover loop; reopening the app re-writes the pass and recovers from the database.
+
+## 3. Dead-code cleanup
+
+- Removed 11 zero-reference functions (two-phase outline-row helpers, legacy per-user entitlement/usage-quota helpers, orphaned RAG schedulers, an unused provider-JWKS fetcher).
+- Removed the now-redundant "silently clear the server story before first generation" call — under the new pass guard a stale device’s delayed writes are refused (no "leftover" source), and every path into a fresh story already clears the server.
+
+## 4. RAG generation restored
+
+- **Root cause**: an earlier persistence rewrite (one-shot atomic persist) dropped the post-persist RAG hook that the old per-segment persist helpers used — RAG tables were only ever deleted, never written, so memory was silently dormant.
+- **Fix**: restored the original "trigger after each chapter persist" logic from git history and rewired it to the two current persist points (new-novel chapter 1; per-chapter continuation fill). After a chapter lands: register character names, chunk (600 tokens / 100 overlap with a tail-back 600), embed via the embeddings API, and write vectors + chapter distill + name lookup; seq multiples of 5 run the trigger-wheel that also back-fills missing earlier chapters. Retrieval is unchanged (dual-channel name + semantic cosine, injects one whole chapter as `rag_context`).
+
+## 5. Startup self-heal: auto-open the next novel when the current one is complete
+
+- **The problem**: if the database is ever left in a *terminal* state — the current novel fully written to its last outline chapter but no newer novel exists (legacy two-commit residue, a switch-guard stop, or a boundary failure from before the atomic merge) — the app previously sat on the finished ending with no automatic way forward.
+- **Server** ([`_story_needs_next_novel`](server/main.py:1718)): `GET /api/story` now returns `next_needed`. It uses the same predicate the generator uses at request entry: read the latest content row; if its next chapter has no outline placeholder (current novel fully consumed) and no newer content exists, the story is complete → `next_needed: true`. Mid-novel states (an unfilled next-chapter placeholder exists) return `false`, so nothing auto-triggers while a novel is still in progress.
+- **App**: after the startup sync for an existing user, if `next_needed` is true, [`HomeContent`](lib/logic/home_content.dart) schedules **one** automatic continuation with an empty input (`autoNext`) — the same worker path that, on a terminal latest row, auto-opens the next novel (chapter 1 + outline) and streams it. It runs at most once per session, records no fake user-choice node, and reuses the normal streaming/typewriter plus stall/error/`conflict` (Exit-only)/`outline_rejected` handling, so a later failure still self-heals on the next open. Settings come from the latest content row’s snapshot (identical to a manual continuation).
+
+## 6. Verification
+
+- Server: compile, hot in-place deploy, `/api/health` 200, clean reload.
+- App: `flutter analyze` — no issues.
+- Remaining: on-device end-to-end verification of the two-line atomic new-novel flow, the multi-device "Exit" popup, restart recovery, and RAG memory hits.
+
+---
+
+# Full Chatflow Summary — Splash Intro Timing, Rendering-Performance Lessons, Web CJK Font Loading & Restart 404 Fix (2026-09-07)
+
+> Client-side splash/intro work plus one server-API bug fix and a web-font mechanism clarification from the same session. The splash **searchlight effect** that started this session was eventually **removed** at the user's request, but the performance rule it exposed is kept here because it is a general lesson for any future decorative text effect. All credentials/hosts are placeholders.
+
+## 1. Splash title intro: a single timed opacity animation
+
+- **Final timeline** (one `AnimationController` + `TweenSequence` whose `weight`s map 1:1 to seconds, easing for each fade segment via `CurveTween`):
+  - 0–3 s — fade **in** with `easeInCubic` (starts very faint, accelerates, reaches full brightness only at the 3 s mark);
+  - 3–7 s — fade **out** with `easeInCubic` (fades slowly at first, then accelerates to fully transparent), with **no hold at full brightness** between the two fades;
+  - 7–9 s — blank screen pause (2 s);
+  - then the next page is pushed **immediately** — the old 1.6 s cross-dissolve was removed in favour of `PageRouteBuilder(transitionDuration: Duration.zero)`.
+  - Implementation lives in [`_SplashScreenState`](AI-SAGA/lib/main.dart:159) (`_titleOpacity` + `forward().whenComplete(_goToNextPage)`); the title widget itself is unchanged plain `Text`/`Stack` output from [`_buildTitle()`](AI-SAGA/lib/main.dart:266).
+- **Perceptual-easing lesson**: an earlier fade-in using **easeOutCubic** looked like it "reached full brightness after ~2 s" even though opacity mathematically only reached 1.0 at the end — ease-out rises fast and then changes imperceptibly near 1.0. For a fade-in that visibly brightens for its whole duration, a **linear or ease-in** curve is the right tool; the same applies to the fade-out if a slow-then-fast dissolve is desired.
+
+## 2. The removed searchlight effect & the rendering-performance rule it taught us
+
+- A cinematic title effect ("name lit by a sweeping searchlight beam that drags a long horror shadow") was attempted first. It was **abandoned/removed** (file and its widget test deleted) on product grounds, but two implementation attempts surfaced a hard rule worth recording:
+- **Do not use a `CustomPainter` to re-render multi-layer text glyphs per frame.** The first version drew ~46 translucent layered copies of the title (a `TextPainter` per layer) inside the beam painter every animation frame on Web — the frame cost exploded, the first paint could take seconds, and because the sweep is an infinite repeating animation the UI looked **blank and frozen** and even the timed page transition never fired.
+- **Prefer the engine-native path for decorative text shadows.** `TextStyle.shadows` renders layered shadows once (single text paint), not per-frame — both cheap and crisp. Reserve custom painters for light, non-text primitives.
+- **Keep text itself on real `Text` widgets.** Drawing text through `TextPainter` bypasses the app-wide `DefaultTextStyle`/theme, in particular the **Web CJK `fontFamilyFallback`**, which on CanvasKit can render CJK glyphs as invisible/blank. Real `Text` inherits the theme fallback so the title always shows.
+- **Isolate animation from text** with `RepaintBoundary` (the beam layer repaints each frame while the text layer does not), and wrap purely decorative painting in `try/catch` so an effect error can never blank the page.
+- Resulting splash intro therefore contains **no** custom effect layer — just a `FadeTransition` over the normal title.
+
+## 3. Web CJK font is loaded at runtime (not bundled)
+
+- [`_loadWebCjkFont()`](AI-SAGA/lib/main.dart:35) runs **only** when `kIsWeb`: it HTTP-fetches the site-root path `/fonts/NotoSansCJK-Common.otf` (documented as a ~4 MB common-character Noto CJK subset), then registers it as the `NotoCJKWeb` fallback via `FontLoader` so common CJK glyphs render immediately instead of as tofu placeholders; failure is swallowed and CanvasKit falls back to its own on-demand glyph download.
+- **It is not a packaged asset**: `pubspec.yaml` declares no such font, `web/` and `build/web/` contain no `fonts/` directory, and `FontManifest.json` only lists Material/Cupertino icons. The font must be provided by the deployment web server at `/fonts/NotoSansCJK-Common.otf`; otherwise the app silently falls back (no functional break).
+
+## 4. Menu “Restart” → HTTP 404 `{"detail":"Not Found"}` fix
+
+- **Symptom**: tapping “Restart” showed an alert with `HTTP 404 {"detail":"Not Found"}` and no clear happened.
+- **Root cause**: `.env` sets `STORY_API_URL=https://…/api/generate-story`. [`resetStory()`](AI-SAGA/lib/logic/sync_service.dart:84) built its URL from the **raw** `_storyApiUrl` and appended `/reset`, so it POSTed to the non-existent `/api/generate-story/reset`. Every other story request (sync pull, previous-chapter fetch) already normalizes that base to `/api/story` via [`_storyGetUrl`](AI-SAGA/lib/logic/sync_service.dart:52), and the server only exposes `POST /api/story/reset` ([`server/main.py`](AI-SAGA/server/main.py:4180)).
+- **Fix**: `resetStory()` now reads its base from `_storyGetUrl` (which maps `/api/generate-story` → `/api/story`) before appending `/reset`, so it correctly POSTs to `/api/story/reset`. One-line behavioural fix + a comment explaining why `_storyGetUrl` (not `_storyApiUrl`) must be used.
+- **Lesson**: when the same domain exposes several semantic paths and clients derive some from others by string replacement, centralize the normalization and reuse it everywhere instead of hand-building URLs per call site.
+
+## 5. Verification
+
+- `flutter analyze` — no issues. Server code untouched by this session (the reset endpoint already existed); if a deployed server predates `/api/story/reset`, that deployment must be updated.
+- Remaining: visual confirmation on device/Web of the final 3 s → 4 s → 2 s splash timing and of the directly-shown next page.
+
+---
+
+# Full Chatflow Summary — Chapter-Outline Engine, Cross-Novel Atomicity, Debug Confirms & Server-Hosted Lottery "the_script" (2026-09-06/07)
+
+This session turned the story engine into a **per-chapter-outline novel generator** (each novel = one outline with up to `OUTLINE_MAX_CHAPTERS` chapter scripts, ch1 streamed first), then hardened cross-novel handoff, audit revision, RAG naming, and shipped a public Web build. Pre-release only: **no old-user / old-data compatibility or migration code is kept** — legacy shims were deleted rather than preserved.
+
+## 1. Novel outline model & the "placeholder rows" rule
+
+- One row per chapter; `current_script_id = "<novelNo>-<chapter>"`. Opening a new novel writes ch1 content + ch2..chN outline placeholder rows (`content=''`, `outline` filled) in a **single atomic transaction** ([`_persist_new_novel_atomic`](server/main.py:2832)).
+- Placeholder rows sit at **higher `seq`** than real content, so `MAX(seq)` is meaningless. Every "latest row / next target / write-to" decision must target the **latest row with non-empty `content`** (e.g. `_latest_written_segment`, `_save_choices`, `story_latest`) — never `MAX(seq)`.
+- Generation target resolution: if the latest content chapter has a next outline placeholder → continue it; otherwise open the next novel (`_open_novel_events`), which first runs the **outline workflow** to produce `chapter_script_01..10` + `text_1`.
+
+## 2. Outline completeness check (`text_1`)
+
+- The outline workflow’s End node returns `text_1` (completeness check). Only `text_1 == "true"` lets the whole outline be persisted (`OUTLINE check 未通过 → outline_rejected` otherwise). Not a moderation verdict — a structural completeness gate.
+
+## 3. Cross-novel atomicity & `segment_begin`
+
+- When a request finishes an old novel’s **final chapter**, that chapter is **deferred** as a “lead” (`_defer_lead`) and is **not** committed alone. The same request auto-opens the next novel; the lead is committed together with the new novel in one write transaction (same “live-or-die” semantics), so an interrupted handoff can never leave “old novel ends but no next novel”.
+- The client splits UI text boxes with a **`segment_begin`** SSE event (new novel ch1 gets its own text box + a divider, no choice inputs at the boundary). This replaced the old “merge old ending + new ch1 into one box”.
+- Pre-release cleanup: the legacy “no script id (old data) → truncate everything after seq” fallback inside time-tree rewrite was **removed** (now logs & skips).
+
+## 4. Server-side debug-confirm gates (payload previews)
+
+- Before calling the outline workflow the server yields **`outline_debug_payload`** (the exact inputs JSON, incl. `the_script` + `used_name`) and waits; before each Dify story-workflow call it yields **`debug_payload`**. Each carries a `request_id` registered in `_pending_payload_confirm`; the App shows a read-only dialog and confirms via `POST /api/generate-story/confirm`; the server waits with 15 s heartbeats up to `DEBUG_PAYLOAD_CONFIRM_TIMEOUT`.
+- **Mid-request ch1 popup**: because the single top-of-stream `debug_payload` only covered the first segment, a new novel opened *inside* a request (old-final → next-novel ch1) now gets its **own** story-payload confirm before its Dify call (gated on `seg_iter>1` + un-persisted session ch1) — the “missing second popup” fix.
+
+## 5. Audit revision: 5-strikes-then-release, and the truncate guard
+
+- `REVISE_MAX_ATTEMPTS` now defaults to **5**. When the revised text still fails after 5 confirmed revision rounds, the server **releases** the current revised text as accepted (sends it on, no abort, no infinite loop) instead of aborting the segment ([`_handle_reject`](server/main.py:3830)).
+- **`truncate` is only sent when `displayed_len > 0`**: a first-window violation means the client has no box for the current segment yet, and an earlier unconditional `truncate keep=0` was **wiping the previous segment’s text box** (visible as “old novel text disappears”). Client also guards `onTruncate` while a new segment box isn’t created.
+
+## 6. Secret framework + fair “几选一” lottery → `the_script`
+
+- The story-premise generator (“story-outline framework”, containing nested `几选一` / `…选一` choices at several bracket levels) is treated as **confidential**: stored only in `server/data/the_script_framework.txt` (gitignored; on the server `/code/data/the_script_framework.txt`), **never in the repo and never sent to the client**.
+- In FastAPI, each time a new novel is opened the server composes it once by drawing **one option uniformly at each level** (bracket-aware recursive resolver, stdlib `random`/`re`, see the `_ts_*` helpers), strips all structural markers, and sends the result to the outline workflow as the input **`the_script`**. Preview popup and the real request share the same draw (WYSIWYG). A missing/illegible framework file degrades gracefully (no `the_script` key).
+- `used_name` (recent-`USED_NAME_RECENT_STORIES` novels’ protagonist + distilled character names, `、`-joined) is sent with the outline request to avoid duplicate character names.
+
+## 7. RAG person-name tuning
+
+- Name-channel retrieval now **excludes the current protagonist’s name** (passed from settings), because the protagonist appears in every chapter of every novel and its exact-substring hit would drag in unrelated historical chapters; semantic retrieval is untouched.
+
+## 8. Language & protagonist-name data
+
+- DB `language` stores the **native full name** (简体中文 / English / …), not `zh`/`en` codes; codes are only used internally via `_language_code`. `_dify_language_name` sends unambiguous full names to Dify.
+- Each of the 10 languages has a hard-coded pool of 100 era-neutral **male protagonist names** (`player_name_defaults.dart`) used as the randomized default in the setup flow.
+
+## 9. Startup disclaimer + full dialog localization
+
+- Every cold start shows a localized “technical-exchange only, pre-release (non-commercial)” disclaimer dialog **before the Splash title** (title stays at opacity 0 until acknowledged), 10 languages ([`technical_disclaimer_dialog.dart`](lib/widgets/technical_disclaimer_dialog.dart)). Content lists the feature areas and states that pop-ups show technical details for reference only; body is left-aligned.
+- Audited every popup: added 10-language getters for the remaining hard-coded dialog chrome (payload/debug dialogs, the “send to Dify to revise” dialog title/labels/button, violation snippet caption).
+
+## 10. Web title & deployment
+
+- Browser/app title set to **“Ghost Tales AI”** (`CupertinoApp.title` + `web/index.html` title & apple-web-app-title).
+- Live site: `https://ghosttalesai.com` (nginx static root `/var/www/ghosttalesai`, `/api` reverse-proxied to the FastAPI container on `127.0.0.1:8000`; CJK font served at `/fonts/NotoSansCJK-Common.otf`).
+- Deploy strategy: `flutter build web --release --base-href /`, then either a full directory swap (canvaskit + assets + fonts) or — for daily updates — an **incremental upload of only the changed root files** (index.html, main.dart.js, flutter_bootstrap.js, flutter_service_worker.js, version.json, … ≈ 0.8 MB gzip), which turns the ~15-minute full push into seconds on a slow uplink. Full swap only needed when the Flutter engine/canvaskit version changes.
+
+## 11. Legacy-compat cleanup (pre-release policy)
+
+Removed (never needed because there are no released old users/data):
+- the `DROP TABLE IF EXISTS fiction_script` dev-time cleanup in `init_db`;
+- the whole-group `POST /api/story` overwrite endpoint + its `StoryData` model (kept only “for external whole-array writers”; the App writes per-row and reads via `GET /api/story`);
+- the time-tree rewrite “no script id (old data) → legacy truncate” fallback;
+- the unused legacy `location` parameter on `buildDefaultTraits` (client).
+
+Kept as **product core** (not “old-data compatibility”): “server has content → resume / else fresh setup” startup, account-language golden sync, write-guard/optimistic concurrency, Dify-output format robustness, and `_enforce_active_device`’s no-op read placeholder (call-site only).
+
+## 12. Verification
+
+- Server: `py_compile` clean; deployed via `./deploy_helper.sh deploy server/main.py` (health 200); framework compose verified inside the container (non-empty, no leftover markers) and its fair randomness eyeballed over 10 draws (3 top-level branches all appear, 10/10 distinct).
+- Client: `flutter analyze` clean across changed files; Web build served and verified over HTTPS (index + `main.dart.js` size match the local build; font 200).
+- Remaining: visual re-confirmation on the live site of the updated disclaimer text and the browser-tab title after a hard refresh.
+
+---
+
+# Full Chatflow Summary — Fiction-Script Removal, Audit text Interface and Revision Feedback, Per-Login Generation Gate, Keep-Alive Fixes (2026-09-04)
+
+Pre-release session (no old-user / old-data compatibility kept) that cleaned up the now-dead prewritten-script library and hardened the **audit → revision** and **generation concurrency / keep-alive** paths that surfaced while testing real multi-chapter runs end-to-end. (The later 2026-09-06/07 session builds on this and re-removes the `init_db` drop as part of its own cleanup.)
+
+## 1. `fiction_script` (prewritten-script library) fully removed
+
+- The table was already unused by both the Flutter app and the FastAPI runtime; only the DB admin tool and one-off authoring scripts still touched it.
+- Removed: the stale "fiction_script 已于 2026-09-03 下线" comment; every fiction-script-only one-off script (create / insert / update ch2-ch3 / rebuild / rename columns / rename choices / add meta / verify / show); the admin tool's `fiction_script` default, JS default and label (now `story_segments`); and a dev-time `DROP TABLE IF EXISTS fiction_script` was added to `init_db` so any lingering table is cleared on startup. A later cleanup removed that drop again (see the 2026-09-06/07 section).
+
+## 2. Audit workflow moved to the Bedrock-guardrail `text` interface
+
+- The moderation Dify workflow's End output changed to **`text`** — a **string-form verdict** produced by an AWS Bedrock guardrail. A passing audit returns a report whose first line is `Action: NONE`; a blocking audit returns something like `Action: GUARDRAIL_INTERVENED` with a `Raw Output: … does not align with our content safety guidelines` line.
+- Server-side ([`server/main.py`](AI-SAGA/server/main.py)): `_extract_guardrail_output` reads only `outputs.text` (legacy `guardrail_return_json` support deleted). Verdict parsing (`_parse_audit_json`) first tries a JSON object's `action`, then falls back to the leading `Action: …` marker (`_parse_audit_action_marker`): `none` → pass, any other value → block; no readable `Action:` → unavailable (audit-unusable, not "violation"). Setting-page audits and in-stream incremental audits share the same path.
+
+## 3. The revision workflow now receives the raw audit feedback
+
+- When a window is blocked, the server embeds the **entire raw audit output** on the verdict as `__audit_feedback__`; `_revise_story` sends that raw Bedrock feedback text as the `guardrail_json` input (falling back to the minimal `{action, category, confidence, reason}` JSON when no raw text is available), so the rewriting LLM sees the actual content-safety reason instead of an empty `reason`.
+
+## 4. Generation concurrency gate: per login pass, not per user
+
+- The old "one worker per user" single-flight gate rejected the request right after a warned restart, because the previous run's background worker still held the user's lock even though its login pass was already dead.
+- The gate is now keyed by **`(device_id, login_ts)`** (one worker per login pass): the same-pass duplicate is refused (double-tap / HTTP-retry backstop) while a **new login pass** (a restarted app re-activating the device, or another device taking over) may start its own worker. The superseded worker is still killed by the writer-pass guard when it tries to persist. Lock release matches identity (`device_id + login_ts`), so a stale worker finishing later cannot clear the newer worker's registration. Per-pass locks keep a 15-minute zombie-lease for stuck workers.
+
+## 5. Continuation `seq` fix
+
+- `user_input_counter` (sent to Dify as `seq`) came from `_get_story_count`, which counted **every** `story_segments` row — including the blank outline-placeholder rows a new novel pre-creates — so continuing to chapter 2 reported `seq=10`.
+- It now counts only **content-bearing** rows, so `seq` equals the index of the exact blank placeholder row being filled (after chapter 1 → `seq=1`, i.e. `1-2`), matching the "fill the lowest-seq empty placeholder in order" rule.
+
+## 6. App: continuation call was missing `onReviseConfirm`
+
+- There are two `generateStoryStream` call sites in [`lib/logic/home_content.dart`](AI-SAGA/lib/logic/home_content.dart); the fresh-story one registered `onReviseConfirm` (opens the "send to Dify to revise" dialog), but the **continuation** one did not. So a chapter-2+ audit REJECT sent `revise_confirm` that the app silently ignored → no dialog → the server waited for a confirmation that could never come (app timed out at 30 s while the server waited silently up to 120 s). The continuation call now registers the same handler.
+
+## 7. Revision-confirm wait keeps the app alive
+
+- While the "send to Dify to revise" dialog is open the server now emits a **heartbeat every 15 s** (previously it waited silently), and it sends **one extra heartbeat when the user confirms**, so the app's 30 s idle timer is never tripped by a normal wait. Instrumentation confirmed the root cause: an audit REJECT at a 400-char window entered the confirm wait and sat silent (logged `等修正确认 15s 未确认 … waited=…/120`).
+
+## 8. Revision retry cap
+
+- The `REVISE_MAX_ATTEMPTS` cap is environment-configurable and now treats **0 (or negative) as unlimited** for experiments (`REVISE_MAX_ATTEMPTS > 0 and attempts > …` guard). (The follow-up 2026-09-06/07 session changed the default to 5 with a "release after 5 strikes" policy; see that section.)
+
+## 9. Verification
+
+- Server: `python3 -m py_compile` clean on every change; hot-deployed via `./deploy_helper.sh deploy AI-SAGA/server/main.py` with `/api/health` = 200 after each deploy; local parser unit-checked against the real Bedrock sample (`Action: NONE` → none, `Action: GUARDRAIL_INTERVENED` → block).
+- Client: the `onReviseConfirm` wiring change is a Dart change and requires a rebuild of the app to take effect.
+- Remaining/notes: restore a positive `REVISE_MAX_ATTEMPTS` after the unlimited experiment; moderation of graphic horror/violence is expected to be flagged by Bedrock and is handled by the revision workflow.

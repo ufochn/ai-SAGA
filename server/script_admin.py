@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """AI-SAGA 数据库本地管理工具 —— 仅本机 Chrome 可打开，不暴露到互联网。
 
-功能（在原 fiction_script 单表基础上扩展为全部子数据库/表）：
+功能（直接列出并编辑服务器数据库中的全部子数据库/表）：
 - 在 127.0.0.1 上启动一个只读本机的 HTTP 服务（绑定回环地址，外网无法访问；
   并对请求做 Host / Origin 本地校验，防止 DNS 重绑定 / 跨站请求）。
 - 通过 SSH（复用 ~/.ssh/ai_saga_deploy，与 deploy_helper.sh 相同）进入服务器上的
@@ -10,7 +10,7 @@
 - 浏览器打开 http://127.0.0.1:<port> 即可看到顶部「子数据库切换按钮」：
   点击任意按钮，以类似 Excel 的表格展示该表全部数据；每一行都配「保存本行」
   按钮，改完点它即可把本行所有改动格子写回数据库对应行。
-- 支持数据库中所有用户表（users / story_segments / fiction_script / ...），
+- 支持数据库中所有用户表（users / story_segments / ...），
   每行均以 SQLite 内部 rowid 定位，可安全编辑复合主键表、无主键表的所有列。
 
 用法：
@@ -63,13 +63,16 @@ USER = os.environ.get("AI_SAGA_USER", "root")
 KEY = os.environ.get("AI_SAGA_SSH_KEY", os.path.expanduser("~/.ssh/ai_saga_deploy"))
 CONTAINER = os.environ.get("AI_SAGA_CONTAINER", "my-audit-app")
 DB_PATH = os.environ.get("AI_SAGA_DB_PATH", "/code/data/ai_saga.db")
-TABLE = os.environ.get("AI_SAGA_TABLE", "fiction_script")   # 默认/初始选中的表
+TABLE = os.environ.get("AI_SAGA_TABLE", "story_segments")   # 默认/初始选中的表（小说正文核心表）
 MAX_ROWS = int(os.environ.get("AI_SAGA_MAX_ROWS", "2000"))   # 单表一次最多显示行数（防浏览器卡死）
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+# 远端（SSH→docker exec→python）单次读取响应硬超时（秒）。
+# 主服务器持有 SQLite 写锁或链路半死时，防止 readline() 无限阻塞导致浏览器请求挂起
+# （表现为页面只显示标题和刷新按钮、看似"连不上数据库"）。可用环境变量覆盖。
+REMOTE_READ_TIMEOUT = float(os.environ.get("AI_SAGA_REMOTE_TIMEOUT", "45"))
 
 # 各表的友好中文名（用于顶部切换按钮的显示；未列出的表直接显示原名）
 TABLE_LABELS = {
-    "fiction_script": "小说脚本库 fiction_script",
     "story_segments": "小说正文段 story_segments",
     "story_chapter_distill": "章节人物蒸馏",
     "story_chunk_vectors": "章节向量(只读)",
@@ -294,7 +297,15 @@ for _line in sys.stdin:
 
 class _RemoteWorker:
     """常驻远端 worker：只建立一次 SSH→docker exec→python 链路并保持打开，
-    之后每次请求往其 stdin 写一行命令、从 stdout 读一行 JSON，避免每请求都重新连接。"""
+    之后每次请求往其 stdin 写一行命令、从 stdout 读一行 JSON，避免每请求都重新连接。
+
+    健壮性（2026-08 修复）：
+    - 读远端响应带硬超时（默认 45 秒，可用 AI_SAGA_REMOTE_TIMEOUT 覆盖），
+      防止主服务器持有 SQLite 写锁或 SSH 半死链路导致 readline() 永久阻塞，
+      进而让浏览器请求无限挂起（表现为"只显示标题和刷新按钮/连不上数据库"）。
+    - 连接断开/超时/解析失败时自动杀掉并重建 SSH 链路，并整体重试一次，
+      让瞬时抖动自愈，无需用户手动重启工具。
+    """
 
     def __init__(self):
         self.proc = None
@@ -335,43 +346,75 @@ class _RemoteWorker:
 
         threading.Thread(target=_drain, daemon=True).start()
 
-    def call(self, op, payload):
-        with self._lock:
-            self._ensure()
-            if self.proc.poll() is not None:
-                self.proc = None
-                raise RuntimeError("SSH 远端连接已断开")
-            b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    def _teardown(self):
+        """杀掉当前 SSH 进程并置空，让下一次 _ensure() 重新建立链路。"""
+        p, self.proc = self.proc, None
+        if p is not None and p.poll() is None:
             try:
-                self.proc.stdin.write(op + " " + b64 + "\n")
-                self.proc.stdin.flush()
-                line = self.proc.stdout.readline()
-            except (BrokenPipeError, OSError) as e:
-                self.proc = None
-                raise RuntimeError("SSH 远端连接中断: %s" % e)
-            if not line:
-                errs = []
-                while not self._stderr_q.empty():
-                    errs.append(self._stderr_q.get())
-                self.proc = None
-                raise RuntimeError("远端未返回数据：%s" % ("; ".join(errs[-3:]) or "连接已断开"))
-            try:
-                return json.loads(line.strip())
-            except Exception:
-                self.proc = None
-                raise RuntimeError("远端返回解析失败: %s" % line.strip()[:300])
-
-    def close(self):
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
+                p.terminate()
                 try:
-                    self.proc.wait(timeout=3)
+                    p.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    self.proc.kill()
+                    p.kill()
             except Exception:
                 pass
-        self.proc = None
+
+    def _readline(self, timeout):
+        """在 timeout 秒内读取远端一行响应；超时返回 None，正常返回该行（可能为空串）。"""
+        box = {}
+
+        def _reader():
+            try:
+                box["line"] = self.proc.stdout.readline()
+            except Exception as e:
+                box["error"] = e
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            return None  # 远端迟迟不返回（疑似卡死/半死链路），交由上层超时处理
+        if "error" in box:
+            raise box["error"]
+        return box.get("line")
+
+    def call(self, op, payload):
+        with self._lock:
+            last_err = None
+            for _attempt in range(2):  # 首次 + 一次重试（重建 SSH 链路后重放同一操作）
+                try:
+                    self._ensure()
+                    if self.proc is None or self.proc.poll() is not None:
+                        raise RuntimeError("SSH 远端连接已断开")
+                    b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+                    try:
+                        self.proc.stdin.write(op + " " + b64 + "\n")
+                        self.proc.stdin.flush()
+                    except (BrokenPipeError, OSError) as e:
+                        raise RuntimeError("SSH 远端连接中断: %s" % e)
+                    line = self._readline(REMOTE_READ_TIMEOUT)
+                    if line is None:
+                        raise RuntimeError(
+                            "远端 %d 秒未返回（可能主服务正在写数据库或链路卡死），已重连重试"
+                            % int(REMOTE_READ_TIMEOUT)
+                        )
+                    line = line.strip()
+                    if not line:
+                        errs = []
+                        while not self._stderr_q.empty():
+                            errs.append(self._stderr_q.get())
+                        raise RuntimeError("远端未返回数据：%s" % ("; ".join(errs[-3:]) or "连接已断开"))
+                    try:
+                        return json.loads(line)
+                    except Exception:
+                        raise RuntimeError("远端返回解析失败: %s" % line[:300])
+                except Exception as e:
+                    self._teardown()
+                    last_err = e if isinstance(e, RuntimeError) else RuntimeError(repr(e))
+            raise last_err
+
+    def close(self):
+        self._teardown()
 
 
 _REMOTE = _RemoteWorker()
@@ -474,6 +517,8 @@ PAGE_HTML = """<!DOCTYPE html>
   <span class="sub" id="dbpath"></span>
   <span id="status"></span>
 </header>
+<div id="diag" style="display:none;padding:8px 20px;font-size:12px;line-height:1.6;background:#fff3d6;color:#7a5c00;border-bottom:1px solid #e5d9b0"></div>
+<noscript><div style="padding:8px 20px;font-size:12px;color:#b03a2e;background:#fdecea">此页面需要启用 JavaScript 才能显示数据库内容。</div></noscript>
 <nav class="tabs" id="tabs"></nav>
 <div class="wrap">
   <div class="toolbar"><button class="refresh" onclick="refreshCurrent()">⟳ 刷新当前子数据库</button></div>
@@ -492,7 +537,7 @@ const tabsEl = document.getElementById('tabs');
 const statusEl = document.getElementById('status');
 const dbpathEl = document.getElementById('dbpath');
 let tables = [];
-let current = 'fiction_script';
+let current = 'story_segments';
 let columns = [];
 let colTypes = {};
 let original = {};      // rowid -> { col: 原值（完整值） }
@@ -506,6 +551,39 @@ let fullTimer = null;
 let observer = null;
 const PREVIEW_UNITS = 30;
 
+// ---- 自诊断（帮助定位浏览器端问题：JS 是否运行、请求是否发出/失败）----
+const diagEl = document.getElementById('diag');
+function diag(msg, isError) {
+  if (!diagEl) return;
+  diagEl.style.display = 'block';
+  diagEl.style.background = isError ? '#fdecea' : '#fff3d6';
+  diagEl.style.color = isError ? '#b03a2e' : '#7a5c00';
+  diagEl.textContent = '[诊断] ' + msg;
+}
+diag('JavaScript 已启动，正在请求 /api/tables …');
+window.addEventListener('error', function (e) {
+  diag('页面 JS 出错：' + (e.message || e.type) + '（第 ' + e.lineno + ' 行）', true);
+});
+
+// 请求硬超时：与后端远端读取超时对齐（AI_SAGA_REMOTE_TIMEOUT 默认 45 秒），
+// 防止主服务写库/链路卡死时页面无限挂起（只显示标题和刷新按钮）。
+const FETCH_TIMEOUT = 45000;
+async function fetchJson(url, options) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT);
+  try {
+    const resp = await fetch(url, Object.assign({}, options || {}, { signal: ctrl.signal }));
+    return await resp.json();
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      throw new Error('请求超时（超过 ' + (FETCH_TIMEOUT / 1000) + ' 秒，通常为主服务正在写数据库），请稍后重试');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function setStatus(msg, err) {
   statusEl.textContent = msg;
   statusEl.style.color = err ? '#ffd9a0' : '#d9e8f7';
@@ -514,10 +592,10 @@ function setStatus(msg, err) {
 async function loadTables() {
   setStatus('正在读取子数据库列表…');
   try {
-    const resp = await fetch('/api/tables');
-    const data = await resp.json();
+    const data = await fetchJson('/api/tables');
     if (!data.ok) throw new Error(data.error || '读取表列表失败');
     tables = data.tables || [];
+    diag('成功读取 ' + tables.length + ' 个子数据库，正在渲染…');
     renderTabs();
     if (tables.length) {
       if (tables.some(t => t.name === current)) {
@@ -533,6 +611,7 @@ async function loadTables() {
     }
   } catch (e) {
     setStatus('加载表列表失败：' + e.message, true);
+    diag('加载表列表失败：' + e.message, true);
   }
 }
 
@@ -566,8 +645,7 @@ async function selectTable(name) {
 async function loadTable(name) {
   setStatus('正在读取「' + name + '」数据…');
   try {
-    const resp = await fetch('/api/table?table=' + encodeURIComponent(name) + '&preview=1');
-    const data = await resp.json();
+    const data = await fetchJson('/api/table?table=' + encodeURIComponent(name) + '&preview=1');
     if (!data.ok) throw new Error(data.error || '读取失败');
     columns = data.columns || [];
     colTypes = {};
@@ -743,8 +821,7 @@ async function flushFull() {
   if (!ids.length) return;
   pendingFull = {};
   try {
-    const resp = await fetch('/api/full?table=' + encodeURIComponent(current) + '&rowids=' + ids.join(','));
-    const data = await resp.json();
+    const data = await fetchJson('/api/full?table=' + encodeURIComponent(current) + '&rowids=' + ids.join(','));
     if (!data.ok) throw new Error(data.error || '预载全文失败');
     applyFull(data.rows || []);
   } catch (e) {
@@ -809,12 +886,11 @@ async function saveRow(btn) {
   btn.disabled = true;
   setStatus('正在上传修改内容到数据库…');
   try {
-    const resp = await fetch('/api/save', {
+    const data = await fetchJson('/api/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ table: current, updates }),
     });
-    const data = await resp.json();
     if (!data.ok) throw new Error(data.error || '保存失败');
     // 上传成功：不刷新页面，只把已保存格子标记为新基线；若用户上传期间又改了，
     // 保留其更新的改动（dirty 里的为准）。
@@ -840,7 +916,7 @@ async function saveRow(btn) {
       }
     }
     setStatus('上传失败：' + e.message, true);
-    showErrModal('上传修改内容到数据库失败：\n' + e.message);
+    showErrModal('上传修改内容到数据库失败：\\n' + e.message);
   }
   syncLcCells();   // 刷新折叠预览/展开态，并据此重算保存按钮状态
 }

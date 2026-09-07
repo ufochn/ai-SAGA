@@ -20,6 +20,10 @@ class SoundService {
   static final Map<String, int> _soundIds = {};
   static bool _unavailable = false;
 
+  /// 全局音效开关：当前【关闭】——去掉 App 中所有音效。
+  /// 接口与实现完整保留，后续需要音效时把此值改为 true 即可恢复（无需改任何调用方）。
+  static bool enabled = false;
+
   /// 按钮点击音效（短促的嘀嗒声）
   static void playClick() => _play('click', _clickWav);
 
@@ -77,7 +81,8 @@ class SoundService {
   // ---------------------------------------------------------------------
 
   static Future<void> _play(String key, Uint8List wav) async {
-    if (_unavailable) return;
+    // 音效关闭时直接返回（不初始化 Soundpool、不播放，静默无操作）。
+    if (!enabled || _unavailable) return;
     try {
       final pool = _pool ??= Soundpool.fromOptions(
         options: const SoundpoolOptions(maxStreams: 16),

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/services.dart'
     show Clipboard, ClipboardData, SystemChrome, SystemUiOverlayStyle;
@@ -17,11 +18,13 @@ import 'package:ai_saga/widgets/location_setup_page.dart';
 import 'package:ai_saga/widgets/era_setup_page.dart';
 import 'package:ai_saga/widgets/player_setup_page.dart';
 
+import 'package:ai_saga/logic/app_theme.dart';
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/setup_draft.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/story_service.dart';
 import 'package:ai_saga/logic/sync_service.dart';
+import 'package:ai_saga/logic/security_service.dart';
 import 'package:ai_saga/widgets/setup_confirmation_page.dart';
 
 /// 上插更早内容时用于"无闪"补偿的滚动控制器。
@@ -140,6 +143,9 @@ class _RenderSizeReporting extends RenderProxyBox {
 /// 用于控制菜单按钮显示/隐藏的通知器
 final ValueNotifier<bool> showMenuNotifier = ValueNotifier<bool>(true);
 
+/// 冷启动同步门禁进行中（“正在同步”页）：右上角菜单按钮应隐藏。
+final ValueNotifier<bool> startupSyncNotifier = ValueNotifier<bool>(false);
+
 /// 是否正在生成小说正文（流式进行中）的通知器。
 /// 用于让右上角菜单按钮在生成期间禁用并给出视觉提示，生成完成后恢复可点击。
 final ValueNotifier<bool> storyStreamingNotifier = ValueNotifier<bool>(false);
@@ -249,6 +255,14 @@ class _HomeContentState extends State<HomeContent>
   /// 由启动同步 / 上拉加载时从服务器拉取，用于判断某段是否为一个脚本的最后一章。
   final Map<int, String> _segmentScriptIds = {};
 
+  /// 跨小说边界所在段的绝对下标：该段（老小说末章）之后是新小说第一章。
+  /// 流式生成中收到 segment_begin 时打上标记；历史段由脚本号推导（见 _isNovelBoundaryAt）。
+  /// 边界处显示一条"新小说"分隔线，且不渲染该段的选项卡片 / 用户选择标记（无输入框）。
+  final Set<int> _novelBoundaryAbs = <int>{};
+
+  /// 收到服务器 segment_begin 后置位：下一个正文事件需另起一个新的文本框。
+  bool _segmentBeginPending = false;
+
   /// 本轮三个输入框的当前值（任一确认时随请求一并上传，作为本轮选择一/二/三快照）
   String _inputChoice1 = '';
   String _inputChoice2 = '';
@@ -265,6 +279,10 @@ class _HomeContentState extends State<HomeContent>
   /// 是否已把"下方输入区"激活显示过：一旦激活（首轮收到推荐后 / 老用户启动预填后），
   /// 后续生成期间保持可见（仅灰化禁用），不再随流式阶段消失。
   bool _storyInputsShown = false;
+
+  /// 启动自愈"自动开新小说"是否已触发过：仅本次会话触发一次，
+  /// 避免同步重试/重建时重复自动发起生成。
+  bool _autoNextNovelStarted = false;
 
   /// 本轮生成开始前的正文段数：生成期间若正文段数未超过它，说明新内容尚未到达，
   /// 用于在末尾显示"半屏空白 + 生成提示"占位。
@@ -298,6 +316,7 @@ class _HomeContentState extends State<HomeContent>
     _setupStep = 5;
     showMenuNotifier.value = true;
     _startupSyncing = true;
+    startupSyncNotifier.value = true;
     _performStartupSync();
     // 记录当前已选语言，用于检测后续用户是否切换语言
     _confirmedLanguage = StorageService.getLanguage();
@@ -476,6 +495,7 @@ class _HomeContentState extends State<HomeContent>
   Future<void> _performStartupSync() async {
     setState(() {
       _startupSyncing = true;
+      startupSyncNotifier.value = true;
       _startupSyncError = null;
     });
     try {
@@ -497,6 +517,8 @@ class _HomeContentState extends State<HomeContent>
           // 记录每段对应的三个选项（与正文一起从服务器拉取，显示在对应按钮中）
           _segmentChoices.clear();
           _segmentScriptIds.clear();
+          _novelBoundaryAbs.clear();
+          _segmentBeginPending = false;
           for (int i = 0; i < snap.segments.length; i++) {
             _segmentChoices[_storyStartIndex + i] = (i < snap.choices.length
                 ? snap.choices[i]
@@ -538,6 +560,15 @@ class _HomeContentState extends State<HomeContent>
           _hasRecommendedActions = true;
           _storyInputsShown = true;
           _setupStep = 5;
+          // 老用户进入"等用户选择/输入继续"的空闲态：本次打开并未在生成。
+          // 必须把生成态复位——尤其经 RestartWidget 原地重建后，模块级全局
+          // storyStreamingNotifier 会残留 true（同一 isolate 不随重建归零），
+          // 导致右上角菜单一直置灰、点击误提示"生成中"。此处显式回到空闲：
+          // 仅当随后自愈(nextNeeded)要自动开新小说时，_continueStory 会自动再置 true
+          // （届时菜单按规则变灰，等三输入框出现再恢复）。
+          _storyStreaming = false;
+          storyStreamingNotifier.value = false;
+          _storyTyped = true;
         } else {
           // 新用户（服务器没有任何小说正文）：从语言页重新开始设置
           SetupDraft.instance.reset();
@@ -546,6 +577,7 @@ class _HomeContentState extends State<HomeContent>
           showMenuNotifier.value = false;
         }
         _startupSyncing = false;
+        startupSyncNotifier.value = false;
         _startupSyncError = null;
       });
       if (isOldUser) {
@@ -562,12 +594,29 @@ class _HomeContentState extends State<HomeContent>
           }
         });
       }
+      if (isOldUser && snap.nextNeeded) {
+        // 启动自愈：老小说已写满、数据库没有更新的小说 → 本轮渲染落定后，
+        // 自动开始生成下一本新小说（无需用户再手动点"继续"）。
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || _storyStreaming || _autoNextNovelStarted) return;
+          if (_storyTexts.isEmpty) return;
+          _autoNextNovelStarted = true;
+          _continueStory(
+            '',
+            autoNext: true,
+            choice1: '',
+            choice2: '',
+            choice3: '',
+          );
+        });
+      }
     } catch (e) {
       if (!mounted) return;
       if (e is HardwareAccountLimitException) {
         // 同硬件 24h 内切换账号过多：弹出英文警告，用户确认后退出 App
         setState(() {
           _startupSyncing = false;
+          startupSyncNotifier.value = false;
         });
         await showAccountLimitWarning(context);
         return;
@@ -580,6 +629,7 @@ class _HomeContentState extends State<HomeContent>
       }
       setState(() {
         _startupSyncing = false;
+        startupSyncNotifier.value = false;
         _startupSyncError = _localizeNetworkError(e);
       });
       await _showStartupSyncErrorDialog();
@@ -592,6 +642,7 @@ class _HomeContentState extends State<HomeContent>
     if (!mounted) return;
     setState(() {
       _startupSyncing = false;
+      startupSyncNotifier.value = false;
     });
     final reauthed = await _promptReAuth();
     if (!mounted) return;
@@ -732,13 +783,17 @@ class _HomeContentState extends State<HomeContent>
   /// 新内容在屏幕上接力显示（作为 _storyTexts 数组的新元素，由打字机继续揭示）。
   Future<void> _continueStory(
     String userInput, {
+    // 启动自愈"自动开新小说"：true 时允许空输入（老小说已写满、数据库无新小说，
+    // App 打开自动发起生成下一本），且不记录"用户选择"节点。
+    bool autoNext = false,
     int retryDepth = 0,
     int? rewriteFrom,
     String? choice1,
     String? choice2,
     String? choice3,
   }) async {
-    if (!mounted || userInput.trim().isEmpty) return;
+    if (!mounted) return;
+    if (!autoNext && userInput.trim().isEmpty) return;
     // 记录本次续写开始前的段数：断流出错时据此丢弃未传完的段落
     final int preStreamLen = _storyTexts.length;
     // 新一段内容是否已作为数组新元素创建（每次续写独占一个数组元素）
@@ -758,24 +813,30 @@ class _HomeContentState extends State<HomeContent>
       // 每次点击"继续"都用本次输入覆盖该段的旧选择（时间树重写同样覆盖段 k）。
       final int choiceSegAbs = _storyStartIndex + _storyTexts.length - 1;
       _choices.removeWhere((c) => c.segmentIndex == choiceSegAbs);
-      _choices.add(
-        _ChoiceRecord(
-          text: userInput.trim(),
-          segmentIndex: choiceSegAbs,
-          startOffset: 0,
-        ),
-      );
+      // 自动开新小说没有用户输入：不记录空的选择节点。
+      if (userInput.trim().isNotEmpty) {
+        _choices.add(
+          _ChoiceRecord(
+            text: userInput.trim(),
+            segmentIndex: choiceSegAbs,
+            startOffset: 0,
+          ),
+        );
+      }
       // 保存本轮三个输入框当前值到该段（与服务器 choice_1/2/3 覆盖一致），
       // 使该段成为历史段后其输入框显示"用户选择那一瞬间"的文本。
       // 注意：时间树"从这里重写"时 choice1/2/3 参数携带的是被重写段的正确选项
       // （由 StoryChoiceCard 传入），而全局 _inputChoice1/2/3 仍保留着删除前
       // 最新段的选项——必须优先用参数，否则会把最新段的选项错误覆盖到重写点
       // （只影响 App 内存显示；服务器端存的是正确值，重启后回读才正确）。
-      _segmentChoices[choiceSegAbs] = [
-        choice1 ?? _inputChoice1,
-        choice2 ?? _inputChoice2,
-        choice3 ?? _inputChoice3,
-      ];
+      // 自动开新小说也不改写老小说末章的选项快照（保留其历史按钮显示）。
+      if (!autoNext) {
+        _segmentChoices[choiceSegAbs] = [
+          choice1 ?? _inputChoice1,
+          choice2 ?? _inputChoice2,
+          choice3 ?? _inputChoice3,
+        ];
+      }
       // 时间树"从这里重写"：被重写段现在是"最新一段"，其选项改由页面底部三个输入框
       // 显示。把全局输入框同步为该段选项，避免残留删除前最新段的选项。
       if (rewriteFrom != null) {
@@ -810,19 +871,40 @@ class _HomeContentState extends State<HomeContent>
         choice3: choice3 ?? _inputChoice3,
         rewriteFrom: rewriteFrom,
         onDeviceConflict: _onDeviceConflict,
+        onConflict: _onMultiClientConflict,
         onStalled: _onStreamStalled,
+        // 大纲合规未通过：清除本次残缺内容后弹多语言提示（话术统一"尺度过大"）
+        onOutlineRejected: () {
+          if (!mounted) return;
+          setState(() {
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
+            _storyTyped = true;
+            _storyStreaming = false;
+            storyStreamingNotifier.value = false;
+          });
+          _showOutlineRejectedDialog();
+        },
+        // 同请求内开启新的一段（老小说末章自动续 → 新小说第一章）：下段正文另起文本框
+        onSegmentBegin: _onSegmentBegin,
         // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
         onDebugPayload: (payload, requestId) {
           _showDebugPayloadDialog(payload, requestId);
+        },
+        onReviseConfirm: (text, verdict, requestId) {
+          _showReviseConfirmDialog(text, verdict, requestId);
         },
         onChunk: (text) {
           if (!mounted) return;
           if (text.trim().isNotEmpty) hadContent = true;
           setState(() {
-            if (!segmentStarted) {
+            // 收到 segment_begin 后需另起一段：把下一本小说第一章放进新的文本框。
+            if (!segmentStarted || _segmentBeginPending) {
               // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
               _storyTexts.add(text);
               segmentStarted = true;
+              _segmentBeginPending = false;
               // 新段从 0 高度重新测量（尺寸上报组件会在其首次布局后自动上报实际
               // 高度，使底部预留空白立即按新段高度同步缩小，消除打字开始时的跳动）
               _streamedSegmentHeight.value = 0;
@@ -837,10 +919,12 @@ class _HomeContentState extends State<HomeContent>
           if (text.trim().isNotEmpty) hadContent = true;
           // 剩余部分不再一次性显示，而是由打字机以不断加速的方式接续打出
           setState(() {
-            if (!segmentStarted) {
+            // 收到 segment_begin 后需另起一段：把下一本小说第一章放进新的文本框。
+            if (!segmentStarted || _segmentBeginPending) {
               // 新一段内容：单独存入数组新元素（每段自带卡片与间距，不再加空行前缀）
               _storyTexts.add(text);
               segmentStarted = true;
+              _segmentBeginPending = false;
               // 新段从 0 高度重新测量（尺寸上报组件会在其首次布局后自动上报实际
               // 高度，使底部预留空白立即按新段高度同步缩小，消除打字开始时的跳动）
               _streamedSegmentHeight.value = 0;
@@ -866,21 +950,16 @@ class _HomeContentState extends State<HomeContent>
         },
         onAbort: (_, snippet) {
           if (!mounted) return;
-          // 违规中止：弹窗期间保持当前流式布局（用户选择 + 残缺段 + 预留空白）在
-          // 弹窗背后原样冻结，不在弹窗前改动任何布局状态；弹窗关闭后再删掉本次
-          // 可能已由打字机打出的残缺段落、恢复等待输入状态，避免弹窗背后的页面跳动
-          // （在弹窗前删段/切"生成区"分支会让按钮弹出、选择文本与按钮错位）。
-          _showViolationDialog(snippet: snippet).then((_) {
-            if (!mounted) return;
-            setState(() {
-              if (_storyTexts.length > preStreamLen) {
-                _storyTexts.removeRange(preStreamLen, _storyTexts.length);
-              }
-              _storyTyped = true;
-              _storyStreaming = false; // 弹窗关闭后恢复等待输入状态
-              storyStreamingNotifier.value = false;
-            });
+          // 违规中止：先清理本次残缺内容，再走统一失败流程（调试期保留真实详情）
+          setState(() {
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
+            _storyTyped = true;
+            _storyStreaming = false;
+            storyStreamingNotifier.value = false;
           });
+          _handleAuditAbortUnified(snippet);
         },
         onError: (message, {code}) {
           if (!mounted) return;
@@ -994,6 +1073,44 @@ class _HomeContentState extends State<HomeContent>
     return false;
   }
 
+  /// 该段（绝对下标 absSeq）之后是否为"跨小说边界"（其下一段是新小说第一章）：
+  /// - 流式段：以收到 segment_begin 时打上的标记为准；
+  /// - 历史段：由相邻两段脚本号推导（属不同脚本即边界，等价 _isScriptLast）。
+  bool _isNovelBoundaryAt(int absSeq) {
+    if (_novelBoundaryAbs.contains(absSeq)) return true;
+    return _isScriptLast(absSeq);
+  }
+
+  /// 服务器告知：本次请求内即将开启新的一段（老小说末章 → 新小说第一章）。
+  /// 记录跨小说边界（渲染时在边界处插分隔线、且不显示该段的输入卡片/选择标记），
+  /// 并让下一段正文另起一个新的文本框。此回调不改动界面状态，正文到达时再重建。
+  void _onSegmentBegin() {
+    if (_storyTexts.isEmpty) return;
+    final int abs = _storyStartIndex + _storyTexts.length - 1;
+    _novelBoundaryAbs.add(abs);
+    _segmentBeginPending = true;
+  }
+
+  /// 跨小说边界分隔线：位于"老小说末章文本框"与"新小说第一章文本框"之间。
+  /// 只放一条居中的细线 + 上下留白；刻意不渲染任何选项卡片 / 三个输入框，
+  /// 让读者明确感知"这里换了一本新故事"。
+  Widget _buildNovelBoundaryDivider() {
+    final bool isDark = AppTheme.isDark(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 18),
+      child: Center(
+        child: Container(
+          width: 48,
+          height: 2,
+          decoration: BoxDecoration(
+            color: isDark ? AppTheme.separatorDark : AppTheme.separatorLight,
+            borderRadius: BorderRadius.circular(1),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// 构建正文区：按数组顺序逐段渲染故事文本（打字机揭示），
   /// 逐段渲染故事正文；每段统一按"段文本 → 该段输入框按钮（历史段卡片）→
   /// 该段之后用户所做的选择标记"排列，位置与"点击按钮生成新文本时占位区顶部"
@@ -1008,8 +1125,6 @@ class _HomeContentState extends State<HomeContent>
         streaming && _storyTexts.length > _generationStartLen;
     // 只渲染 [ _visibleStartIndex, _storyTexts.length ) 范围内的文本段，
     // 更早的历史段等用户向上滚动到顶部时才逐个加载
-    // 脚本最后一章的段落文本已并入下一段（连续文本框），跳过下一段的独立文本渲染
-    bool skipText = false;
     for (
       int segIndex = _visibleStartIndex;
       segIndex < _storyTexts.length;
@@ -1024,38 +1139,33 @@ class _HomeContentState extends State<HomeContent>
       // 本次会话流式生成的新段用打字机揭示；重启恢复的历史段直接完整显示
       final useTypewriter = segIndex >= _sessionStreamStartIndex;
       final int segAbs = _storyStartIndex + segIndex;
-      // 该段是否"脚本最后一章"：仅历史段（非本会话打字机段）才判定。
-      // 此类段落不显示选项卡片，并把本段与下一段文本合并到一个连续文本框显示。
-      final bool scriptLast =
-          !isStreamingSegment && !useTypewriter && _isScriptLast(segAbs);
-      // 1) 段文本：脚本最后一章时把下一段文本一并拼入同一文本框（连续显示，不分段）
-      String displayText = segment;
-      bool mergedNext = false;
-      if (!skipText && scriptLast && segIndex + 1 < _storyTexts.length) {
-        displayText = '$segment\n\n${_storyTexts[segIndex + 1]}';
-        mergedNext = true;
+      // 跨小说边界：历史段由相邻脚本号推导，流式段用 segment_begin 打上的标记。
+      // 边界段（老小说末章）后不渲染选项卡片 / 用户选择标记（无输入框），
+      // 只插入一条"新小说"分隔线，下一本第一章另起独立文本框显示。
+      final bool novelBoundary = _isNovelBoundaryAt(segAbs);
+      // 1) 段文本：每段一个独立文本框（跨小说边界不再把两本拼进同一段/同一框）。
+      children.add(
+        useTypewriter
+            ? _buildStorySegment(
+                segment,
+                isLast: isLast,
+                segIndex: segIndex,
+              )
+            : CharacterText(text: segment),
+      );
+      // 跨小说边界：本段（老小说末章）文本框之后插入分隔线，再接下一本第一章。
+      if (novelBoundary && segIndex + 1 < _storyTexts.length) {
+        children.add(_buildNovelBoundaryDivider());
       }
-      if (!skipText) {
-        children.add(
-          useTypewriter
-              ? _buildStorySegment(
-                  displayText,
-                  isLast: isLast,
-                  segIndex: segIndex,
-                )
-              : CharacterText(text: displayText),
-        );
-      }
-      skipText = mergedNext; // 下一段文本已并入本段，跳过其独立渲染
       // 2) 历史段落（非最新一段）下方：三个输入框 + "从这里重新开始"按钮（时间树）。
       //    与原始逻辑一致：最新一段下方不插入卡片，其下方的输入框由页面底部的三个承载。
       //    流式新段（数组末尾）即"最新一段"，故自动不渲染卡片；打字开始时它出现
       //    造成的高度变化由底部"生成区"的预留空白吸收，正文中不会留下空白。
-      //    脚本最后一章：无配套选项，也不渲染卡片。
+      //    跨小说边界：老小说末章后不渲染卡片（无输入框），只插分隔线。
       final bool renderCard =
           !isStreamingSegment &&
           segIndex < _storyTexts.length - 1 &&
-          !scriptLast;
+          !novelBoundary;
       if (renderCard) {
         children.add(
           StoryChoiceCard(
@@ -1082,10 +1192,10 @@ class _HomeContentState extends State<HomeContent>
       //    统一显示在本段文本 + 输入框按钮（历史段卡片）下方，与最终布局一致。
       //    流式新段的选择不在此显示；等待期（新段未到）最新一段的选择改由底部
       //    "生成区"在输入框与按钮下方显示（原始布局位置），此处不重复。
-      //    脚本最后一章：不显示提示与选择标记。
+      //    跨小说边界：不显示提示与选择标记。
       final bool skipChoice =
           isStreamingSegment ||
-          scriptLast ||
+          novelBoundary ||
           (_storyStreaming &&
               _storyTexts.length <= _generationStartLen &&
               segIndex == _storyTexts.length - 1);
@@ -1594,14 +1704,9 @@ class _HomeContentState extends State<HomeContent>
         showMenuNotifier.value = true;
       });
     });
-    // 清理"漏网之鱼"：重置/设备切换后，另一设备的延迟写入可能在服务器残留旧正文。
-    // 首次生成前静默清空服务器小说正文，确保新故事从 seq 0 干净开始。
-    // 失败时静默忽略（残留最多导致起始下标不为 0，不阻塞生成流程）。
-    try {
-      await SyncService.resetStory();
-    } catch (_) {
-      // 静默失败：不阻塞生成
-    }
+    // 注：已删除"首次生成前静默 resetStory"。新口令闸门会拒绝陈旧设备的延迟写入
+    //（不再有"漏网残留"来源），且到达此"全新生成"前库已由 重置/大纲被拒 等路径清空，
+    // 故此处无需再对服务器做一次防御性清空。
     // 记录本次生成开始前的段数（已清空为 0）：断流出错时据此丢弃未传完的内容
     final int preStreamLen = _storyTexts.length;
     // 本次生成是否收到过非空正文（LLM 返回空白时用于弹窗警告）
@@ -1617,10 +1722,27 @@ class _HomeContentState extends State<HomeContent>
         playerTraits: SetupDraft.instance.playerTraits,
         language: StorageService.getLanguage(),
         onDeviceConflict: _onDeviceConflict,
+        onConflict: _onMultiClientConflict,
         onStalled: _onStreamStalled,
         // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
         onDebugPayload: (payload, requestId) {
           _showDebugPayloadDialog(payload, requestId);
+        },
+        onReviseConfirm: (text, verdict, requestId) {
+          _showReviseConfirmDialog(text, verdict, requestId);
+        },
+        // 大纲合规未通过：清除本次残缺内容后弹多语言提示（话术统一"尺度过大"）
+        onOutlineRejected: () {
+          if (!mounted) return;
+          setState(() {
+            if (_storyTexts.length > preStreamLen) {
+              _storyTexts.removeRange(preStreamLen, _storyTexts.length);
+            }
+            _storyStreaming = false;
+            storyStreamingNotifier.value = false;
+            _storyTyped = true;
+          });
+          _showOutlineRejectedDialog();
         },
         onChunk: (text) {
           if (!mounted) return;
@@ -1654,6 +1776,12 @@ class _HomeContentState extends State<HomeContent>
           if (!mounted) return;
           // 违规自动修正：服务器已把违规段覆盖为改写文本，先把当前段回滚到
           // keep 字符（违规窗口起点），随后续 reveal 继续打字，避免重叠区重复。
+          // 【防御】若当前流式段还没有属于自己的文本框（首窗即违规，尚未 reveal 过
+          // 任何内容；或刚收到 segment_begin、下一段文本框还没建立），此刻 truncate
+          // 会误作用到上一段（如跨小说时的"老小说末章"已完成文本框）→ 直接跳过，
+          // 修正后的整段会由后续 chunk/reveal 全新建立文本框，无需回滚。
+          if (_segmentBeginPending) return;
+          if (_storyTexts.length <= preStreamLen) return;
           setState(() {
             if (_storyTexts.isNotEmpty) {
               final seg = _storyTexts[_storyTexts.length - 1];
@@ -1665,22 +1793,17 @@ class _HomeContentState extends State<HomeContent>
         },
         onAbort: (_, snippet) {
           if (!mounted) return;
-          // 违规中止：删掉本次可能已由打字机打出的残缺段落。
-          // 第一章场景：正文为空时主页面没有输入框，点"重新输入"会白屏挂死，
-          // 所以先退回"设置确认页"（_setupStep=4），按钮改为"回到最终审核设置页面"，
-          // 让用户调整设定后再重新生成。
+          // 违规中止：先清理本次残缺内容，再走统一失败流程（调试期保留真实详情）
           setState(() {
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
             }
-            _setupStep = 4;
-            showMenuNotifier.value = false;
             _storyStreaming = false;
             storyStreamingNotifier.value = false;
             _storyTyped = true;
           });
           _abortBlackoutTransition();
-          _showViolationDialog(snippet: snippet, backToSetup: true);
+          _handleAuditAbortUnified(snippet);
         },
         onError: (message, {code}) {
           if (!mounted) return;
@@ -1997,31 +2120,6 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 生成失败弹窗内容
-  String _getErrorMessageText(String detail) {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-        return '無法生成小說內容：$detail\n\n是否重試？';
-      case 'yue':
-        return '無法生成小說內容：$detail\n\n係咪重試？';
-      case 'en':
-        return 'Unable to generate the story: $detail\n\nRetry?';
-      case 'es':
-        return 'No se pudo generar la historia: $detail\n\n¿Reintentar?';
-      case 'fr':
-        return "Impossible de générer l'histoire : $detail\n\nRéessayer ?";
-      case 'de':
-        return 'Die Geschichte konnte nicht erstellt werden: $detail\n\nErneut versuchen?';
-      case 'pt':
-        return 'Não foi possível gerar a história: $detail\n\nTentar novamente?';
-      case 'ja':
-        return '物語を生成できませんでした：$detail\n\n再試行しますか？';
-      case 'ko':
-        return '이야기를 생성할 수 없습니다: $detail\n\n다시 시도하시겠습니까?';
-      default:
-        return '无法生成小说内容：$detail\n\n是否重试？';
-    }
-  }
 
   /// 服务器返回空白正文时的额度警告（本地化，不出现 LLM 字样）
   String _getQuotaWarningText() {
@@ -2294,6 +2392,110 @@ class _HomeContentState extends State<HomeContent>
     RestartWidget.restartApp(context);
   }
 
+  /// 多客户端冲突（写被拒：本设备已被更新的设备顶掉）：停流式态，弹"仅退出"对话框。
+  Future<void> _onMultiClientConflict() async {
+    if (!mounted) return;
+    setState(() {
+      _storyTyped = true;
+      _storyStreaming = false;
+      storyStreamingNotifier.value = false;
+    });
+    await showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CupertinoAlertDialog(
+        title: Text(_getMultiClientTitleText()),
+        content: Text(_getMultiClientMessageText()),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              SecurityService.exitApp();
+            },
+            child: Text(_getMultiClientExitText()),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// "多客户端冲突"警告标题（本地化）
+  String _getMultiClientTitleText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '偵測到其他裝置同時登入';
+      case 'en':
+        return 'Another Device Is Signed In';
+      case 'es':
+        return 'Otro dispositivo inició sesión';
+      case 'fr':
+        return 'Un autre appareil est connecté';
+      case 'de':
+        return 'Ein anderes Gerät ist angemeldet';
+      case 'pt':
+        return 'Outro dispositivo está conectado';
+      case 'ja':
+        return '別のデバイスがログインしています';
+      case 'ko':
+        return '다른 기기가 로그인되어 있습니다';
+      default:
+        return '检测到其他设备同时登入';
+    }
+  }
+
+  /// "多客户端冲突"警告内容（本地化）
+  String _getMultiClientMessageText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '似乎有其他裝置同時登入，為保證小說文本完整，請過幾分鐘再次嘗試登入。';
+      case 'yue':
+        return '似乎有其他裝置同時登入，為咗保證小說文本完整，請過幾分鐘再試吓登入。';
+      case 'en':
+        return 'It looks like another device is signed in at the same time. To keep your story text complete, please try signing in again in a few minutes.';
+      case 'es':
+        return 'Parece que otro dispositivo inició sesión al mismo tiempo. Para mantener el texto de tu historia completo, intenta iniciar sesión de nuevo en unos minutos.';
+      case 'fr':
+        return "Un autre appareil semble être connecté en même temps. Pour conserver le texte de votre histoire complet, réessayez de vous connecter dans quelques minutes.";
+      case 'de':
+        return 'Es scheint, dass ein anderes Gerät gleichzeitig angemeldet ist. Um Ihren Geschichtentext vollständig zu erhalten, versuchen Sie es in einigen Minuten erneut.';
+      case 'pt':
+        return 'Parece que outro dispositivo está conectado ao mesmo tempo. Para manter o texto da sua história completo, tente entrar novamente em alguns minutos.';
+      case 'ja':
+        return '同時に別のデバイスがログインしているようです。小説のテキストを完全に保つため、数分後にもう一度ログインしてください。';
+      case 'ko':
+        return '다른 기기가 동시에 로그인된 것 같습니다. 이야기 텍스트를 완전하게 유지하려면 몇 분 후 다시 로그인해 주세요.';
+      default:
+        return '似乎有其他设备在同时登入，为保证小说文本完整，请过几分钟再次尝试登入。';
+    }
+  }
+
+  /// "多客户端冲突"退出按钮（本地化）
+  String _getMultiClientExitText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '退出';
+      case 'en':
+        return 'Exit';
+      case 'es':
+        return 'Salir';
+      case 'fr':
+        return 'Quitter';
+      case 'de':
+        return 'Beenden';
+      case 'pt':
+        return 'Sair';
+      case 'ja':
+        return '終了';
+      case 'ko':
+        return '종료';
+      default:
+        return '退出';
+    }
+  }
+
   /// "多设备同时登入"警告标题（本地化）
   String _getDeviceConflictTitleText() {
     switch (StorageService.getLanguage()) {
@@ -2563,6 +2765,87 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 大纲合规未通过弹窗：正文统一说"尺度过大"（不说大纲有瑕疵），致歉并引导重新开始故事。
+  Future<void> _showOutlineRejectedDialog() async {
+    if (!mounted) return;
+    final restart = await showCupertinoDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => CupertinoAlertDialog(
+        title: Text(_getOutlineRejectedTitleText()),
+        content: Text(_getOutlineRejectedMessageText()),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(_getOutlineRejectedButtonText()),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || restart != true) return;
+    try {
+      // 服务器端已删除被废弃的大纲/正文；此处整体清空正文并重启，走全新故事流程重新生成
+      await SyncService.resetStory();
+    } on MultiClientConflictException {
+      // 本设备已被顶掉（非最新登入）：不执行"清空+重启"，弹"多客户端"仅退出
+      await _onMultiClientConflict();
+      return;
+    } catch (_) {
+      // reset 失败不阻断重启；重启后冷启动同步会再对齐
+    }
+    if (!mounted) return;
+    RestartWidget.restartApp(context);
+  }
+
+  /// 大纲合规弹窗标题（本地化，只致歉）
+  String _getOutlineRejectedTitleText() {
+    return StorageService.localizedText(
+      zhCN: '很抱歉',
+      zhTW: '很抱歉',
+      en: 'Sorry',
+      yue: '唔好意思',
+      es: 'Lo sentimos',
+      fr: 'Désolé',
+      de: 'Entschuldigung',
+      pt: 'Desculpe',
+      ja: '申し訳ございません',
+      ko: '죄송합니다',
+    );
+  }
+
+  /// 大纲合规弹窗正文（本地化，统一话术"尺度过大审核不过"，不说大纲有瑕疵）
+  String _getOutlineRejectedMessageText() {
+    return StorageService.localizedText(
+      zhCN: '本次生成的大纲尺度过大，未能通过审核。已为你清除该版内容，请点击“重新开始故事”重新生成。',
+      zhTW: '本次生成的大綱尺度过大，未能通過審核。已為你清除該版內容，請點擊「重新開始故事」重新生成。',
+      en: 'The generated outline is too large in scale and did not pass review. That version has been cleared. Please tap “Start a new story” to begin again.',
+      yue: '今次生成嘅大綱尺度过大，未能通過審核。我哋已經清除嗰版內容，請撳「重新開始故事」重新生成。',
+      es: 'El esquema generado tiene una escala demasiado grande y no superó la revisión. Esa versión se ha borrado. Toca “Reiniciar historia” para empezar de nuevo.',
+      fr: "Le plan généré est d'une ampleur trop importante et n'a pas passé l'examen. Cette version a été supprimée. Touchez « Recommencer l'histoire » pour repartir.",
+      de: 'Der generierte Umriss ist zu groß und hat die Prüfung nicht bestanden. Diese Version wurde gelöscht. Tippen Sie auf „Neue Geschichte beginnen“, um neu zu starten.',
+      pt: 'O roteiro gerado é grande demais e não passou na revisão. Essa versão foi removida. Toque em “Reiniciar história” para recomeçar.',
+      ja: '生成したあらすじの規模が大きすぎるため審査を通過できませんでした。この版は削除しました。「新しい物語を始める」をタップしてやり直してください。',
+      ko: '생성된 개요의 규모가 너무 커서 검토를 통과하지 못했습니다. 해당 버전은 삭제되었습니다. “새 이야기 시작”을 눌러 다시 시작하세요.',
+    );
+  }
+
+  /// 大纲合规弹窗按钮（本地化）
+  String _getOutlineRejectedButtonText() {
+    return StorageService.localizedText(
+      zhCN: '重新开始故事',
+      zhTW: '重新開始故事',
+      en: 'Start a new story',
+      yue: '重新開始故事',
+      es: 'Reiniciar historia',
+      fr: "Recommencer l'histoire",
+      de: 'Neue Geschichte beginnen',
+      pt: 'Reiniciar história',
+      ja: '新しい物語を始める',
+      ko: '새 이야기 시작',
+    );
+  }
+
   /// 违规弹窗内容：提示当前生成内容疑似违规，需重新输入提示词（本地化）
   String _getViolationMessageText() {
     switch (StorageService.getLanguage()) {
@@ -2719,9 +3002,9 @@ class _HomeContentState extends State<HomeContent>
             // 调试辅助：把审核未通过的片段原文也显示出来，便于判断是真违规还是误判。
             if (snippet.trim().isNotEmpty) ...[
               const SizedBox(height: 12),
-              const Text(
-                '—— 审核未通过的片段 ——',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              Text(
+                _violationSnippetCaptionText(),
+                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 6),
               ConstrainedBox(
@@ -2767,6 +3050,8 @@ class _HomeContentState extends State<HomeContent>
       _choices.clear();
       _segmentChoices.clear();
       _segmentScriptIds.clear();
+      _novelBoundaryAbs.clear();
+      _segmentBeginPending = false;
       _storyStartIndex = 0;
       _visibleStartIndex = 0;
       _sessionStreamStartIndex = 0;
@@ -2793,7 +3078,7 @@ class _HomeContentState extends State<HomeContent>
     final Map<String, dynamic>? row = await StoryService.fetchLatestStoryRow();
     if (!mounted) return;
     final String body = row == null
-        ? '(无法获取数据库最新条目，请确认服务器已部署 /api/story/latest 调试端点)'
+        ? _debugDbUnavailableText()
         : _formatDebugRow(row);
     // 调试内容用"只读 CupertinoTextField"承载：与 App 内其它输入框同款控件，
     // 在 macOS 上原生支持鼠标框选 + 右键"拷贝"。该控件只出现在本调试弹窗内，
@@ -2803,7 +3088,7 @@ class _HomeContentState extends State<HomeContent>
       context: context,
       barrierDismissible: false,
       builder: (context) => CupertinoAlertDialog(
-        title: const Text('调试 · 数据库最新生成条目'),
+        title: Text(_debugDbTitleText()),
         content: SizedBox(
           width: 460,
           height: 400,
@@ -2825,7 +3110,7 @@ class _HomeContentState extends State<HomeContent>
           CupertinoDialogAction(
             isDefaultAction: true,
             onPressed: () => Navigator.of(context).pop(),
-            child: const Text('确认'),
+            child: Text(_okText()),
           ),
         ],
       ),
@@ -2846,6 +3131,166 @@ class _HomeContentState extends State<HomeContent>
     return buf.toString();
   }
 
+  /// 通用"确认/OK"按钮文字（本地化）
+  String _okText() {
+    return StorageService.localizedText(
+      zhCN: '确认',
+      zhTW: '確認',
+      yue: '確認',
+      en: 'OK',
+      es: 'OK',
+      fr: 'OK',
+      de: 'OK',
+      pt: 'OK',
+      ja: 'OK',
+      ko: '확인',
+    );
+  }
+
+  /// 调试弹窗标题："调试 · 待发送给 Dify 的 payload（确认后发送）"（本地化）
+  String _debugPayloadTitleText() {
+    return StorageService.localizedText(
+      zhCN: '调试 · 待发送给 Dify 的 payload（确认后发送）',
+      zhTW: '調試 · 待發送給 Dify 的 payload（確認後發送）',
+      yue: '調試 · 準備發畀 Dify 嘅 payload（確認之後先發送）',
+      en: 'Debug · Payload to be sent to Dify (confirm to send)',
+      es: 'Depuración · Payload a enviar a Dify (confirmar envío)',
+      fr: 'Débogage · Payload à envoyer à Dify (confirmer l\'envoi)',
+      de: 'Debug · An Dify zu sendende Payload (Senden bestätigen)',
+      pt: 'Depuração · Payload a enviar ao Dify (confirmar envio)',
+      ja: 'デバッグ・Dify へ送信する payload（送信を確認）',
+      ko: '디버그 · Dify로 보낼 payload(전송 확인)',
+    );
+  }
+
+  /// 调试弹窗"确认发送"按钮（本地化）
+  String _debugSendText() {
+    return StorageService.localizedText(
+      zhCN: '确认发送',
+      zhTW: '確認發送',
+      yue: '確認發送',
+      en: 'Confirm & Send',
+      es: 'Confirmar y enviar',
+      fr: 'Confirmer et envoyer',
+      de: 'Bestätigen und senden',
+      pt: 'Confirmar e enviar',
+      ja: '送信する',
+      ko: '전송',
+    );
+  }
+
+  /// 调试弹窗标题："调试 · 数据库最新生成条目"（本地化）
+  String _debugDbTitleText() {
+    return StorageService.localizedText(
+      zhCN: '调试 · 数据库最新生成条目',
+      zhTW: '調試 · 資料庫最新生成條目',
+      yue: '調試 · 資料庫最新生成條目',
+      en: 'Debug · Latest database entry',
+      es: 'Depuración · Última entrada de la base de datos',
+      fr: 'Débogage · Dernière entrée en base de données',
+      de: 'Debug · Neuester Datenbankeintrag',
+      pt: 'Depuração · Último registro do banco de dados',
+      ja: 'デバッグ・最新の生成レコード',
+      ko: '디버그 · 최신 생성 레코드',
+    );
+  }
+
+  /// 调试弹窗（数据库最新一条拉取失败）提示（本地化）
+  String _debugDbUnavailableText() {
+    return StorageService.localizedText(
+      zhCN: '（无法获取数据库最新条目，请确认服务器已部署 /api/story/latest 调试端点）',
+      zhTW: '（無法取得資料庫最新條目，請確認伺服器已部署 /api/story/latest 偵錯端點）',
+      yue: '（攞唔到資料庫最新條目，請確認伺服器已部署 /api/story/latest 偵錯端點）',
+      en: '(Unable to fetch the latest database row — please ensure the server exposes the /api/story/latest debug endpoint)',
+      es: '(No se pudo obtener la última fila de la base de datos; asegúrate de que el servidor exponga el endpoint de depuración /api/story/latest)',
+      fr: '(Impossible de récupérer la dernière ligne en base ; vérifiez que le serveur expose l\'endpoint de débogage /api/story/latest)',
+      de: '(Neuester Datenbankeintrag nicht abrufbar – bitte prüfen, ob der Server den Debug-Endpunkt /api/story/latest bereitstellt)',
+      pt: '(Não foi possível obter o último registro do banco; verifique se o servidor expõe o endpoint de depuração /api/story/latest)',
+      ja: '（DB の最新レコードを取得できませんでした。サーバーに /api/story/latest のデバッグAPIがデプロイされているか確認してください）',
+      ko: '(최신 DB 레코드를 가져오지 못했습니다. 서버에 /api/story/latest 디버그 엔드포인트가 있는지 확인하세요)',
+    );
+  }
+
+  /// 违规修正弹窗标题："检测到疑似违规内容，将送 Dify 修正"（本地化）
+  String _reviseTitleText() {
+    return StorageService.localizedText(
+      zhCN: '检测到疑似违规内容，将送 Dify 修正',
+      zhTW: '偵測到疑似違規內容，將送 Dify 修正',
+      yue: '偵測到疑似違規內容，會送去 Dify 修正',
+      en: 'Possible guideline violation detected — content will be revised via Dify',
+      es: 'Se detectó posible contenido infractor; se corregirá mediante Dify',
+      fr: 'Violation possible détectée ; le contenu sera corrigé via Dify',
+      de: 'Möglicher Verstoß erkannt – wird über Dify überarbeitet',
+      pt: 'Possível violação detectada; será corrigida via Dify',
+      ja: 'ガイドライン違反の可能性がある内容を検出しました。Dify で修正します',
+      ko: '가이드라인 위반 가능성이 있는 콘텐츠를 감지했습니다. Dify로 수정합니다',
+    );
+  }
+
+  /// 违规修正弹窗"待修正文本："标签（本地化）
+  String _reviseTextLabelText() {
+    return StorageService.localizedText(
+      zhCN: '待修正文本：',
+      zhTW: '待修正文本：',
+      yue: '待修正文本：',
+      en: 'Text to be revised:',
+      es: 'Texto a corregir:',
+      fr: 'Texte à corriger :',
+      de: 'Zu überarbeitender Text:',
+      pt: 'Texto a corrigir:',
+      ja: '修正対象テキスト：',
+      ko: '수정할 텍스트:',
+    );
+  }
+
+  /// 违规修正弹窗"违规判定 JSON："标签（本地化）
+  String _reviseJsonLabelText() {
+    return StorageService.localizedText(
+      zhCN: '违规判定 JSON：',
+      zhTW: '違規判定 JSON：',
+      yue: '違規判定 JSON：',
+      en: 'Violation verdict JSON:',
+      es: 'JSON del dictamen de infracción:',
+      fr: 'JSON du verdict de violation :',
+      de: 'JSON der Verstoßbewertung:',
+      pt: 'JSON do parecer de violação:',
+      ja: '違反判定 JSON：',
+      ko: '위반 판정 JSON:',
+    );
+  }
+
+  /// 违规修正弹窗按钮："点击送 Dify 修正"（本地化）
+  String _reviseSubmitText() {
+    return StorageService.localizedText(
+      zhCN: '点击送 Dify 修正',
+      zhTW: '點擊送 Dify 修正',
+      yue: '撳呢度送去 Dify 修正',
+      en: 'Send to Dify to revise',
+      es: 'Enviar a Dify para corregir',
+      fr: 'Envoyer à Dify pour corriger',
+      de: 'An Dify senden zur Überarbeitung',
+      pt: 'Enviar ao Dify para corrigir',
+      ja: 'Dify で修正する',
+      ko: 'Dify로 수정 보내기',
+    );
+  }
+
+  /// 违规弹窗里的"—— 审核未通过的片段 ——"小标题（本地化）
+  String _violationSnippetCaptionText() {
+    return StorageService.localizedText(
+      zhCN: '—— 审核未通过的片段 ——',
+      zhTW: '—— 審核未通過的片段 ——',
+      yue: '—— 審核唔通過嘅片段 ——',
+      en: '—— Segment that failed review ——',
+      es: '—— Fragmento que no superó la revisión ——',
+      fr: '—— Segment n\'ayant pas passé la vérification ——',
+      de: '—— Segment, das die Prüfung nicht bestand ——',
+      pt: '—— Trecho que não passou na revisão ——',
+      ja: '—— 審査に通らなかった断片 ——',
+      ko: '—— 심사를 통과하지 못한 구간 ——',
+    );
+  }
+
   /// 【调试】生成前确认弹窗：展示服务器即将发送给 Dify 的 payload JSON。
   ///
   /// 点击任一生成按钮后，服务器在真正调 Dify 之前先通过 SSE 事件 debug_payload
@@ -2856,6 +3301,7 @@ class _HomeContentState extends State<HomeContent>
     String requestId,
   ) async {
     if (!mounted) return;
+    debugPrint('[dialog] _showDebugPayloadDialog id=$requestId');
     String body;
     try {
       body = const JsonEncoder.withIndent('  ').convert(payload);
@@ -2867,7 +3313,7 @@ class _HomeContentState extends State<HomeContent>
       context: context,
       barrierDismissible: false,
       builder: (context) => CupertinoAlertDialog(
-        title: const Text('调试 · 待发送给 Dify 的 payload（确认后发送）'),
+        title: Text(_debugPayloadTitleText()),
         content: SizedBox(
           width: 460,
           height: 420,
@@ -2890,10 +3336,11 @@ class _HomeContentState extends State<HomeContent>
             isDefaultAction: true,
             onPressed: () async {
               // 通知服务器放行本次生成（服务器收到后才真正调 Dify）
-              await StoryService.confirmPayload(requestId);
+              final ok = await StoryService.confirmPayload(requestId);
+              debugPrint('[dialog] confirmPayload id=$requestId ok=$ok');
               if (context.mounted) Navigator.of(context).pop();
             },
-            child: const Text('确认发送'),
+            child: Text(_debugSendText()),
           ),
         ],
       ),
@@ -2901,27 +3348,135 @@ class _HomeContentState extends State<HomeContent>
     ctrl.dispose();
   }
 
-  /// 生成失败弹窗：仅提供"重启 App"按钮。
-  /// 出错后不再提供"跳过/重试"（避免本地与服务器段数不一致时少显示一段、
-  /// 或基于错位状态续写）；重启后启动同步会重新拉取服务器已落库的段落并对齐。
-  Future<void> _showGenerateError(String detail) async {
+  /// 违规修正前确认弹窗：服务器把待修正文本 + 违规判定 JSON 发回（SSE 事件 revise_confirm）。
+  /// 弹窗展示待修正文本与违规判定 JSON（只读可复制），按钮明确写"点击送 Dify 修正"；
+  /// 用户点击后调用 [StoryService.confirmRevise] 通知服务器放行调用修正工作流。
+  Future<void> _showReviseConfirmDialog(
+    String text,
+    Map<String, dynamic> verdict,
+    String requestId,
+  ) async {
     if (!mounted) return;
+    String jsonBody;
+    try {
+      jsonBody = const JsonEncoder.withIndent('  ').convert(verdict);
+    } catch (_) {
+      jsonBody = verdict.toString();
+    }
+    final TextEditingController textCtrl = TextEditingController(text: text);
+    final TextEditingController jsonCtrl = TextEditingController(text: jsonBody);
     await showCupertinoDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => CupertinoAlertDialog(
-        title: Text(_getErrorTitleText()),
-        content: Text(_getErrorMessageText(detail)),
+        title: Text(_reviseTitleText()),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(_reviseTextLabelText(),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: 460,
+              height: 120,
+              child: CupertinoTextField(
+                controller: textCtrl,
+                readOnly: true,
+                maxLines: null,
+                minLines: null,
+                expands: true,
+                keyboardType: TextInputType.multiline,
+                padding: const EdgeInsets.all(8),
+                decoration: null,
+                style: const TextStyle(fontSize: 13),
+                enableInteractiveSelection: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(_reviseJsonLabelText(),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: 460,
+              height: 160,
+              child: CupertinoTextField(
+                controller: jsonCtrl,
+                readOnly: true,
+                maxLines: null,
+                minLines: null,
+                expands: true,
+                keyboardType: TextInputType.multiline,
+                padding: const EdgeInsets.all(8),
+                decoration: null,
+                style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+                enableInteractiveSelection: true,
+              ),
+            ),
+          ],
+        ),
         actions: [
           CupertinoDialogAction(
             isDefaultAction: true,
-            onPressed: () => Navigator.of(context).pop(),
-            child: Text(_getStallRestartText()),
+            onPressed: () async {
+              // 通知服务器放行调用"违规修正"工作流
+              await StoryService.confirmRevise(requestId);
+              if (context.mounted) Navigator.of(context).pop();
+            },
+            child: Text(_reviseSubmitText()),
           ),
         ],
       ),
     );
+    textCtrl.dispose();
+    jsonCtrl.dispose();
+  }
+
+  /// 审核/违规失败统一处理：调试期先弹"审核详情"（真实违规文本，便于定位）；
+  /// 用户最终统一看到"网络异常 → 重启"（重启后启动同步对齐，残缺段落自然丢弃）。
+  Future<void> _handleAuditAbortUnified(String snippet) async {
     if (!mounted) return;
-    RestartWidget.restartApp(context);
+    if (kDebugMode && snippet.trim().isNotEmpty) {
+      await _showViolationDialog(snippet: snippet);
+      if (!mounted) return;
+    }
+    await _onStreamStalled();
+  }
+
+  /// 统一失败提示：给用户看到的都收敛为"网络异常 → 重启"；调试期（kDebugMode）先弹真实原因详情。
+  Future<void> _showGenerateError(String detail) async {
+    if (!mounted) return;
+    if (kDebugMode && detail.trim().isNotEmpty) {
+      // 调试期保留真实失败原因（含审核/额度/服务端具体信息），便于定位
+      await showCupertinoDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => CupertinoAlertDialog(
+          title: Text(_getErrorTitleText()),
+          content: Text(detail),
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(StorageService.localizedText(
+                zhCN: '知道了',
+                zhTW: '知道了',
+                en: 'OK',
+                yue: '知道',
+                es: 'Entendido',
+                fr: 'OK',
+                de: 'OK',
+                pt: 'OK',
+                ja: 'OK',
+                ko: '확인',
+              )),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return;
+    }
+    // 用户统一提示：疑似网络连接失败，请重启（重启后启动同步会重新拉取并对齐）
+    await _onStreamStalled();
   }
 }

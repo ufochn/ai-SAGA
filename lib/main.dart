@@ -1,5 +1,8 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:http/http.dart' as http;
 import 'package:ai_saga/logic/account_service.dart';
 import 'package:ai_saga/logic/home_content.dart';
 import 'package:ai_saga/logic/storage_service.dart';
@@ -10,6 +13,7 @@ import 'package:ai_saga/logic/security_service.dart';
 import 'package:ai_saga/widgets/light_auth_page.dart';
 import 'package:ai_saga/widgets/security_warning_page.dart';
 import 'package:ai_saga/widgets/app_restart.dart';
+import 'package:ai_saga/widgets/technical_disclaimer_dialog.dart';
 
 /// 全局主题亮度通知器
 final ValueNotifier<Brightness> themeBrightnessNotifier =
@@ -19,6 +23,27 @@ final ValueNotifier<Brightness> themeBrightnessNotifier =
 
 /// 【诊断】右上角菜单按钮上次渲染的流式状态（用于观察按钮是否被 done 恢复）
 bool _lastMenuStreaming = false;
+
+// ---- Web 端 CJK 本地字体（仅网页版生效，原生 iOS/Android/桌面不受影响）----
+// Flutter Web 用 CanvasKit 渲染时，中/日/韩字形需异步下载 fallback 字体，
+// 下载完成前显示占位符/豆腐块。这里在启动时从本站 /fonts/ 加载 4MB 常用子集
+// （Noto CJK）并注册为回退字体，常用字即时渲染；生僻字仍由 CanvasKit 自动下载回退。
+// 原生端 kIsWeb=false 完全跳过，不增肥、继续用系统字体。
+const String _webCjkFontUrl = '/fonts/NotoSansCJK-Common.otf';
+const String _webCjkFontFamily = 'NotoCJKWeb';
+
+Future<void> _loadWebCjkFont() async {
+  if (!kIsWeb) return; // 仅 Web 端加载
+  try {
+    final resp = await http.get(Uri.parse(_webCjkFontUrl));
+    if (resp.statusCode != 200) return;
+    final loader = FontLoader(_webCjkFontFamily)
+      ..addFont(Future.value(ByteData.sublistView(resp.bodyBytes)));
+    await loader.load();
+  } catch (_) {
+    // 字体加载失败不阻塞启动，退回浏览器默认回退字体
+  }
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -38,6 +63,7 @@ void main() async {
   themeBrightnessNotifier.value = StorageService.getIsDarkMode()
       ? Brightness.dark
       : Brightness.light;
+  await _loadWebCjkFont(); // Web 端在渲染前加载 CJK 字体，避免占位符
   runApp(RestartWidget(child: MyApp(compromised: compromised)));
 }
 
@@ -52,7 +78,7 @@ class MyApp extends StatelessWidget {
       builder: (context, _) {
         final isDark = themeBrightnessNotifier.value == Brightness.dark;
         return CupertinoApp(
-          title: 'Hello World',
+          title: 'Ghost Tales AI',
           debugShowCheckedModeBanner: false,
           theme: CupertinoThemeData(
             brightness: themeBrightnessNotifier.value,
@@ -65,6 +91,8 @@ class MyApp extends StatelessWidget {
             textTheme: CupertinoTextThemeData(
               textStyle: TextStyle(
                 fontFamily: '.SF Pro Display',
+                // Web 端回退到本地加载的 CJK 字体；原生端不设置，保持系统字体
+                fontFamilyFallback: kIsWeb ? const [_webCjkFontFamily] : null,
                 fontSize: 17,
                 color: isDark
                     ? AppTheme.primaryTextDark
@@ -131,59 +159,77 @@ class SplashScreen extends StatefulWidget {
 
 class _SplashScreenState extends State<SplashScreen>
     with SingleTickerProviderStateMixin {
-  late AnimationController _animationController;
-  late Animation<double> _fadeOutAnimation;
+  /// 封面标题动画控制器：总时长 9s
+  late final AnimationController _animationController;
+
+  /// 标题透明度时序：
+  /// 0-3s 淡入 → 3-7s 淡出 → 7-9s 空白(静止 2s)
+  late final Animation<double> _titleOpacity;
 
   @override
   void initState() {
     super.initState();
     _animationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1600),
+      duration: const Duration(seconds: 9),
     );
-    _fadeOutAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: const Cubic(0.22, 1.0, 0.36, 1.0), // Apple easeInOutCubic
+    _titleOpacity = TweenSequence<double>([
+      // 淡入 3s：easeIn 曲线，先慢慢变亮、速度越来越快，第 3 秒才到最亮
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.0,
+          end: 1.0,
+        ).chain(CurveTween(curve: Curves.easeInCubic)),
+        weight: 3,
+      ),
+      // 淡出 4s：easeIn 曲线，先慢慢变暗、最后加速彻底透明（无中间静止）
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.0,
+          end: 0.0,
+        ).chain(CurveTween(curve: Curves.easeInCubic)),
+        weight: 4,
+      ),
+      // 空白静止 2s
+      TweenSequenceItem(tween: ConstantTween(0.0), weight: 2),
+    ]).animate(_animationController);
+
+    // 免责弹窗：每次启动在 Splash 标题出现前先弹（此刻标题保持透明）。
+    // 用户点"知道了"后，才开始 9s 标题动画；动画走完后进入下一个页面。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startAfterDisclaimer();
+    });
+  }
+
+  /// 每次启动先弹「技术交流 · 非商用版」免责弹窗（当前语言），
+  /// 确认关闭后才开始标题动画，保证标题在弹窗之后出现。
+  Future<void> _startAfterDisclaimer() async {
+    if (!mounted) return;
+    await showTechnicalDisclaimer(context);
+    if (!mounted) return;
+    // 动画走完（9s）后：播放音效并直接进入下一个页面
+    _animationController.forward().whenComplete(_goToNextPage);
+  }
+
+  /// 标题消失并静止 2s 后，直接进入下一个页面（无过渡动画）
+  Future<void> _goToNextPage() async {
+    if (!mounted) return;
+    SoundService.playHorror();
+    // 语言不再在启动时单独选择：StorageService.getLanguage() 按
+    // 「已存语言 → 系统语言」回退；语言选择统一放在设定流程
+    // （新用户从语言页开始设置，老用户用服务器金标准语言覆盖）。
+    final authorized = await AccountService.isAuthorized();
+    if (!mounted) return;
+    final Widget nextPage = authorized
+        ? const MyHomePage()
+        : const LightAuthGate();
+    Navigator.of(context).pushReplacement(
+      // 下一个页面直接显现（不播放过渡动画）
+      PageRouteBuilder(
+        pageBuilder: (context, animation, secondaryAnimation) => nextPage,
+        transitionDuration: Duration.zero,
       ),
     );
-
-    // 2秒后开始封面淡出
-    Future.delayed(const Duration(seconds: 2), () {
-      _animationController.forward();
-    });
-
-    // 淡出动画结束后执行页面切换（与淡出重叠），同时播放恐怖音效
-    Future.delayed(const Duration(milliseconds: 2600), () async {
-      SoundService.playHorror();
-      if (!mounted) return;
-      // 语言不再在启动时单独选择：StorageService.getLanguage() 按
-      // 「已存语言 → 系统语言」回退；语言选择统一放在设定流程
-      // （新用户从语言页开始设置，老用户用服务器金标准语言覆盖）。
-      final authorized = await AccountService.isAuthorized();
-      if (!mounted) return;
-      final Widget nextPage = authorized
-          ? const MyHomePage()
-          : const LightAuthGate();
-      Navigator.of(context).pushReplacement(
-        // Apple 风格的交叉溶解过渡（cross dissolve）
-        PageRouteBuilder(
-          pageBuilder: (context, animation, secondaryAnimation) => nextPage,
-          transitionsBuilder: (context, animation, secondaryAnimation, child) {
-            return FadeTransition(
-              opacity: Tween<double>(begin: 0.0, end: 1.0).animate(
-                CurvedAnimation(
-                  parent: animation,
-                  curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-                ),
-              ),
-              child: child,
-            );
-          },
-          transitionDuration: const Duration(milliseconds: 1200),
-        ),
-      );
-    });
   }
 
   @override
@@ -222,13 +268,13 @@ class _SplashScreenState extends State<SplashScreen>
   /// 无断言风险。
   Widget _buildTitle(String title) {
     final isDark = AppTheme.isDark(context);
-    final color =
-        isDark ? AppTheme.accentBlueDark : AppTheme.accentBlueLight;
+    final color = isDark ? AppTheme.accentBlueDark : AppTheme.accentBlueLight;
     const double fontSize = 48;
     const String aiSuffix = ' AI';
     final bool hasAi = title.endsWith(aiSuffix);
-    final String base =
-        hasAi ? title.substring(0, title.length - aiSuffix.length) : title;
+    final String base = hasAi
+        ? title.substring(0, title.length - aiSuffix.length)
+        : title;
 
     final TextStyle style = TextStyle(
       fontSize: fontSize,
@@ -272,13 +318,14 @@ class _SplashScreenState extends State<SplashScreen>
     final language = StorageService.getLanguage();
     final hasLanguage = language.isNotEmpty;
 
-    return FadeTransition(
-      opacity: _fadeOutAnimation,
-      child: CupertinoPageScaffold(
-        backgroundColor: isDark
-            ? AppTheme.pageBackgroundDark
-            : AppTheme.pageBackgroundLight,
-        child: Center(
+    return CupertinoPageScaffold(
+      backgroundColor: isDark
+          ? AppTheme.pageBackgroundDark
+          : AppTheme.pageBackgroundLight,
+      child: Center(
+        child: FadeTransition(
+          // 标题按「淡入 3s → 淡出 4s → 空白 2s」播放（无中间静止）
+          opacity: _titleOpacity,
           child: hasLanguage
               ? _buildTitle(_getLocalizedTitle(language))
               : Column(
@@ -1141,6 +1188,54 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  /// "多客户端冲突"标题（本地化，仅退出）
+  String _getMultiClientTitleText() {
+    return StorageService.localizedText(
+      zhCN: '检测到其他设备同时登入',
+      zhTW: '偵測到其他裝置同時登入',
+      en: 'Another Device Is Signed In',
+      yue: '偵測到其他裝置同時登入',
+      es: 'Otro dispositivo inició sesión',
+      fr: 'Un autre appareil est connecté',
+      de: 'Ein anderes Gerät ist angemeldet',
+      pt: 'Outro dispositivo está conectado',
+      ja: '別のデバイスがログインしています',
+      ko: '다른 기기가 로그인되어 있습니다',
+    );
+  }
+
+  /// "多客户端冲突"内容（本地化）
+  String _getMultiClientMessageText() {
+    return StorageService.localizedText(
+      zhCN: '似乎有其他设备在同时登入，为保证小说文本完整，请过几分钟再次尝试登入。',
+      zhTW: '似乎有其他裝置同時登入，為保證小說文本完整，請過幾分鐘再次嘗試登入。',
+      en: 'It looks like another device is signed in at the same time. To keep your story text complete, please try signing in again in a few minutes.',
+      yue: '似乎有其他裝置同時登入，為咗保證小說文本完整，請過幾分鐘再試吓登入。',
+      es: 'Parece que otro dispositivo inició sesión al mismo tiempo. Para mantener el texto de tu historia completo, intenta iniciar sesión de nuevo en unos minutos.',
+      fr: "Un autre appareil semble être connecté en même temps. Pour conserver le texte de votre histoire complet, réessayez de vous connecter dans quelques minutes.",
+      de: 'Es scheint, dass ein anderes Gerät gleichzeitig angemeldet ist. Um Ihren Geschichtentext vollständig zu erhalten, versuchen Sie es in einigen Minuten erneut.',
+      pt: 'Parece que outro dispositivo está conectado ao mesmo tempo. Para manter o texto da sua história completo, tente entrar novamente em alguns minutos.',
+      ja: '同時に別のデバイスがログインしているようです。小説のテキストを完全に保つため、数分後にもう一度ログインしてください。',
+      ko: '다른 기기가 동시에 로그인된 것 같습니다. 이야기 텍스트를 완전하게 유지하려면 몇 분 후 다시 로그인해 주세요.',
+    );
+  }
+
+  /// "多客户端冲突"退出按钮（本地化）
+  String _getMultiClientExitText() {
+    return StorageService.localizedText(
+      zhCN: '退出',
+      zhTW: '退出',
+      en: 'Exit',
+      yue: '退出',
+      es: 'Salir',
+      fr: 'Quitter',
+      de: 'Beenden',
+      pt: 'Sair',
+      ja: '終了',
+      ko: '종료',
+    );
+  }
+
   /// 重新开始流程：先弹出"正在清空数据"进度弹窗 → 清空服务器正文 + 本地数据 →
   /// 完成后弹出"重置完成，重启"弹窗，用户确认后重启 App。
   Future<void> _performRestart() async {
@@ -1218,6 +1313,30 @@ class _MyHomePageState extends State<MyHomePage> {
           ],
         ),
       );
+    } on MultiClientConflictException {
+      // 本设备口令已失效（被其它设备顶掉）：清库被拒 → 关进度弹窗，弹"多客户端仅退出"
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      if (!mounted) return;
+      await showCupertinoDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => CupertinoAlertDialog(
+          title: Text(_getMultiClientTitleText()),
+          content: Text(_getMultiClientMessageText()),
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                SecurityService.exitApp();
+              },
+              child: Text(_getMultiClientExitText()),
+            ),
+          ],
+        ),
+      );
     } catch (e) {
       if (!mounted) return;
       // 关闭进度弹窗，弹出失败提示
@@ -1280,9 +1399,14 @@ class _MyHomePageState extends State<MyHomePage> {
             valueListenable: showMenuNotifier,
             builder: (context, showMenu, child) {
               if (!showMenu) return const SizedBox.shrink();
+              // “正在同步”加载页（startupSyncNotifier=true）不显示右上角菜单按钮
               return ValueListenableBuilder<bool>(
-                valueListenable: storyStreamingNotifier,
-                builder: (context, isStreaming, child) {
+                valueListenable: startupSyncNotifier,
+                builder: (context, syncing, _) {
+                  if (syncing) return const SizedBox.shrink();
+                  return ValueListenableBuilder<bool>(
+                    valueListenable: storyStreamingNotifier,
+                    builder: (context, isStreaming, child) {
                   // 【诊断】记录菜单按钮流式状态变化（判断 done 是否恢复按钮）
                   if (_lastMenuStreaming != isStreaming) {
                     _lastMenuStreaming = isStreaming;
@@ -1335,6 +1459,8 @@ class _MyHomePageState extends State<MyHomePage> {
                   );
                 },
               );
+            },
+          );
             },
           ),
         ],

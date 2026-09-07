@@ -7,7 +7,6 @@
 /// 例：zh → 「冷峻自傲」；en → 「Cold and proud」。
 String buildDefaultTraits({
   required String language,
-  String location = '', // 兼容保留参数（不再使用）
 }) {
   return _traits(language);
 }

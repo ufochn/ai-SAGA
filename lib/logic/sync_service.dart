@@ -20,7 +20,15 @@ typedef StorySnapshot = ({
   int startSeq,
   int total,
   String language,
+  /// 服务器权威判定：老小说是否已写满且没有更新的小说 → App 打开应自动开始生成下一本。
+  bool nextNeeded,
 });
+
+/// 表示服务器判定本设备已不是最新登入（被其它设备顶掉），写请求被拒（multi_client）。
+/// 上层应弹出统一"多客户端"仅退出对话框。
+class MultiClientConflictException implements Exception {
+  const MultiClientConflictException();
+}
 
 /// 启动同步服务：每次 App 启动时
 /// 1) 上传本机硬件公钥 + 用户 id，服务器校验后更新硬件公钥并登记为活跃设备；
@@ -46,6 +54,17 @@ class SyncService {
     return '';
   }
 
+  /// 云同步正文 GET 接口地址。
+  /// 注意：/api/generate-story 仅接受 POST（生成），同步拉取正文必须用 GET /api/story。
+  /// 显式配置了 STORY_API_URL（=/api/generate-story）时，把它替换成 /api/story。
+  static String get _storyGetUrl {
+    final url = _storyApiUrl;
+    if (url.isEmpty) return '';
+    return url.contains('/api/generate-story')
+        ? url.replaceFirst('/api/generate-story', '/api/story')
+        : url;
+  }
+
   /// 设备激活地址（来自 .env 或由注册地址推导）
   static String get _activateApiUrl {
     final direct = dotenv.env['ACTIVATE_API_URL'] ?? '';
@@ -59,20 +78,28 @@ class SyncService {
 
   /// 启动同步（硬性前置）：任一环节失败都会抛出异常，由调用方门禁处理。
   ///
-  /// 流程：上传硬件公钥 + 用户 id（服务器校验并更新硬件公钥）
-  ///      → 拉取服务器小说尾部（最后 [tailLimit] 段）→ 覆盖写入 App 本地存储。
+  /// 顺序（2026-09 口令规格，合并进"正在同步"一步，无需延后缓冲）：
+  ///   ① ensureToken：新用户走 register（服务器已写口令）；老用户取缓存令牌；
+  ///   ② device/activate：**取得"最新登入口令"**（超时 10s），保存返回的新令牌。
+  ///      口令提交即权威屏障：旧设备之后的任何写入都会被 SQLite 事务串行 +
+  ///      口令校验拒掉；本步只读不写，WAL 读取永远一致快照 → 口令成功后可直接拉取；
+  ///   ③ 立即拉取小说尾部（最后 [tailLimit] 段）→ 覆盖本地。
   static Future<StorySnapshot> syncAll() async {
-    final token = await AuthService.ensureToken();
     final publicKey = await HardwareKeyService.getPublicKey();
-    await _activate(token, publicKey);
+    var token = await AuthService.ensureToken();
+    token = await _activate(token, publicKey);
     return _pullStory(token, limit: tailLimit);
   }
 
   /// 重新开始：清空服务器上该用户的全部小说正文（POST /api/story/reset）。
   /// 成功后 App 重启，重启后同步拉取为空 → 判定为新用户 → 从设置重新开始。
+  ///
+  /// 注意：必须用 [_storyGetUrl]（它会把配置中的 `/api/generate-story`
+  /// 归一化成 `/api/story`），再拼 `/reset`；若直接用 [_storyApiUrl]
+  /// 会请求到不存在的 `/api/generate-story/reset` → 服务器 404。
   static Future<void> resetStory() async {
     final token = await AuthService.ensureToken();
-    final url = _storyApiUrl;
+    final url = _storyGetUrl;
     if (url.isEmpty) {
       throw Exception(StorageService.localizedText(
         zhCN: '小说存储地址未配置，无法清空服务器数据',
@@ -99,6 +126,10 @@ class SyncService {
         )
         .timeout(const Duration(seconds: 30));
     if (resp.statusCode != 200) {
+      if (resp.body.contains('multi_client')) {
+        // 本设备已不是最新登入（被其它设备顶掉）：清空被拒 → 交上层弹"仅退出"
+        throw const MultiClientConflictException();
+      }
       throw Exception(
         '${StorageService.localizedText(
           zhCN: '清空服务器数据失败',
@@ -122,7 +153,7 @@ class SyncService {
     int limit = previousBatchLimit,
   }) async {
     final token = await AuthService.ensureToken();
-    final url = _storyApiUrl;
+    final url = _storyGetUrl;
     if (url.isEmpty) {
       return (
         segments: const <String>[],
@@ -132,6 +163,7 @@ class SyncService {
         startSeq: 0,
         total: 0,
         language: '',
+        nextNeeded: false,
       );
     }
     final resp = await http
@@ -167,10 +199,12 @@ class SyncService {
     return _parseStory(resp.body);
   }
 
-  /// 握手：上传硬件公钥 + 用户 id，服务器校验后更新硬件公钥（失败抛异常）。
-  static Future<void> _activate(String token, String publicKey) async {
+  /// 握手 = **写"最新登入口令"**（POST /api/device/activate）。
+  /// 成功返回本次登录应使用的令牌：服务器每次返回携带新 login_ts 的令牌，
+  /// 这里保存新令牌并以其继续后续请求（否则沿用旧 token）。
+  static Future<String> _activate(String token, String publicKey) async {
     final url = _activateApiUrl;
-    if (url.isEmpty) return;
+    if (url.isEmpty) return token;
     final resp = await http
         .post(
           Uri.parse(url),
@@ -184,7 +218,7 @@ class SyncService {
             'public_key': publicKey,
           }),
         )
-        .timeout(const Duration(seconds: 20));
+        .timeout(const Duration(seconds: 10));
     if (resp.statusCode != 200) {
       throw Exception(
         '${StorageService.localizedText(
@@ -201,6 +235,18 @@ class SyncService {
         )}: HTTP ${resp.statusCode} ${resp.body}',
       );
     }
+    try {
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final newToken = data['token'] as String?;
+      final exp = (data['expires_at'] as num?)?.toInt();
+      if (newToken != null && newToken.isNotEmpty && exp != null) {
+        await AuthService.saveToken(newToken, exp);
+        return newToken;
+      }
+    } catch (_) {
+      // 服务器未返回新令牌（旧版/异常）：沿用旧 token
+    }
+    return token;
   }
 
   /// 从服务器拉取该用户的小说正文（limit>0 只拉最后 limit 段）。
@@ -208,7 +254,7 @@ class SyncService {
     String token, {
     int limit = 0,
   }) async {
-    final url = _storyApiUrl;
+    final url = _storyGetUrl;
     if (url.isEmpty) {
       return (
         segments: const <String>[],
@@ -218,6 +264,7 @@ class SyncService {
         startSeq: 0,
         total: 0,
         language: '',
+        nextNeeded: false,
       );
     }
     final uri = limit > 0
@@ -287,6 +334,7 @@ class SyncService {
       startSeq: startSeq,
       total: total,
       language: language,
+      nextNeeded: (data['next_needed'] as bool?) ?? false,
     );
   }
 }

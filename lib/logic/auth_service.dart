@@ -236,6 +236,13 @@ class AuthService {
     await _storage.delete(key: _tokenKey);
     await _storage.delete(key: _tokenExpiryKey);
   }
+
+  /// 存储服务器新签发的令牌（device/activate 每次返回携带新 login_ts 的令牌时调用）。
+  static Future<void> saveToken(String token, int expiresAt) async {
+    if (token.isEmpty) return;
+    await _storage.write(key: _tokenKey, value: token);
+    await _storage.write(key: _tokenExpiryKey, value: '$expiresAt');
+  }
 }
 
 /// 表示用户尚未完成轻授权，需要引导到 [LightAuthPage]。

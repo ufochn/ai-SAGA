@@ -8,17 +8,17 @@ import 'package:http/http.dart' as http;
 import 'package:ai_saga/logic/auth_service.dart';
 import 'package:ai_saga/logic/storage_service.dart';
 
-/// 发送请求的最长等待（用户 App → FastAPI 这一段，统一 30 秒）。
+/// 发送请求的最长等待（用户 App → FastAPI 这一段，统一 60 秒）。
 /// 服务器现在首段也会立刻返回 SSE 响应头（案件核心在流内生成并配心跳），
-/// 因此 30 秒足够覆盖建立连接 + 拿到响应头。
-const Duration kStorySendTimeout = Duration(seconds: 30);
+/// 因此 60 秒足够覆盖建立连接 + 拿到响应头。
+const Duration kStorySendTimeout = Duration(seconds: 60);
 
-/// 流式"卡死"判定（两次数据到达之间的最长静默，统一 30 秒）。
-/// 四段传输（App→FastAPI、FastAPI→Dify、Dify→FastAPI、FastAPI→App）一律 30 秒
+/// 流式"卡死"判定（两次数据到达之间的最长静默，统一 60 秒）。
+/// 四段传输（App→FastAPI、FastAPI→Dify、Dify→FastAPI、FastAPI→App）一律 60 秒
 /// 空闲超时，且收到任何数据或心跳即重置。服务器在阻塞式 Dify 调用（案件核心 /
-/// 内容审核）期间每 15s 推心跳，因此正常慢 Dify 不会误判；只有真正超过 30 秒
+/// 内容审核）期间每 15s 推心跳，因此正常慢 Dify 不会误判；只有真正超过 60 秒
 /// 无任何数据/心跳才判定超时，触发"网络疑似超时，请重启重试"提示。
-const Duration kStoryIdleTimeout = Duration(seconds: 30);
+const Duration kStoryIdleTimeout = Duration(seconds: 60);
 
 /// 小说生成服务（流式）：把用户设定发送到 FastAPI 网关，网关每满 400 字增量审核
 /// （窗口 [0,400)、[350,800)、[750,1200)... 重叠防漏网）、通过后以 SSE 流式返回
@@ -69,7 +69,11 @@ class StoryService {
     void Function()? onStalled,
     // 【调试】生成前确认：服务器在调 Dify 前把 payload 发回 App（SSE 事件 debug_payload）。
     // 回调负责弹窗展示 payload；用户点击"确认发送"后由回调调用 [confirmPayload] 通知服务器。
-    void Function(Map<String, dynamic> payload, String requestId)? onDebugPayload,
+    // 第三个参数 onUserConfirm 供弹窗在"用户点击确认"时调用——App 借此给自己补一次心跳，
+    // 把本流的 30s 空闲计时重置为从确认那一刻起算（确认前等待/阅读 JSON 可能已消耗预算，
+    // 若不复位，Dify 首段静默期会把 App 提前误判断网）。
+    void Function(Map<String, dynamic> payload, String requestId,
+        void Function() onUserConfirm)? onDebugPayload,
     // 违规修正前确认：服务器在修正前把待修正文本 + 违规判定 JSON 发回 App（SSE 事件 revise_confirm）。
     // 回调负责弹窗展示；用户点击"送 Dify 修正"后由回调调用 [confirmRevise] 通知服务器继续。
     void Function(String text, Map<String, dynamic> verdict, String requestId)?
@@ -200,6 +204,7 @@ class StoryService {
             onDebugPayload?.call(
               (evt['payload'] as Map?)?.cast<String, dynamic>() ?? const {},
               evt['request_id'] as String? ?? '',
+              armIdleTimer, // 用户点击确认时 App 自心跳：把 30s 空闲计时重置为从确认起算
             );
             break;
           case 'outline_debug_payload':
@@ -209,6 +214,7 @@ class StoryService {
             onDebugPayload?.call(
               (evt['payload'] as Map?)?.cast<String, dynamic>() ?? const {},
               evt['request_id'] as String? ?? '',
+              armIdleTimer, // 用户点击确认时 App 自心跳：把 30s 空闲计时重置为从确认起算
             );
             break;
           case 'revise_confirm':
@@ -475,6 +481,36 @@ class StoryService {
       return ok;
     } catch (_) {
       return false;
+    } finally {
+      client.close();
+    }
+  }
+
+  /// 迟到的大纲判定：轮询"本轮开新小说的大纲最终判定是否已到达 / 是否被驳回"。
+  ///
+  /// 返回 {'rejected': bool, 'pending': bool}；网络失败返回 null（上层下一轮再试）。
+  /// 背景：第 1 章正文一生成完就 done（本次生成请求结束），而大纲的【最终合规判定】
+  /// 要等整份大纲流完（约 1~1.5 分钟）才到。判定为"非 true"时服务器会【立即】
+  /// 原子删除该本小说；App 没有推送通道，只能靠本轮询第一时间拿到 `rejected`
+  /// 并弹"尺度过大，请重新生成"对话框打断用户。
+  static Future<Map<String, dynamic>?> fetchStoryNotice() async {
+    final story = _storyApiUrl; // 形如 http://host/api/generate-story
+    if (story.isEmpty) return null;
+    final String url = story.endsWith('/api/generate-story')
+        ? story.replaceFirst('/api/generate-story', '/api/story/notice')
+        : '$story/notice';
+    final token = await AuthService.ensureToken();
+    final client = http.Client();
+    try {
+      final resp = await client
+          .get(Uri.parse(url), headers: {'Authorization': 'Bearer $token'})
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) return null;
+      final decoded = jsonDecode(resp.body);
+      if (decoded is! Map) return null;
+      return decoded.cast<String, dynamic>();
+    } catch (_) {
+      return null;
     } finally {
       client.close();
     }

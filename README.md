@@ -2442,6 +2442,48 @@ All 4 places that delete `story_segments` rows call a single purge helper **in t
 
 ---
 
+# Full Chatflow Summary — 40-Chapter Outlines, Compressed Continuation Context, Launch Wait Screen, Reading-Position Restore & Boundary-Scoped Audit Revision (2026-09-08/09)
+
+Pre-release session. Scope: (a) let the outline workflow drive a **40-chapter** novel, (b) shrink the continuation context for long novels, (c) replace the fixed "enter the world" blackout with a **progress screen driven by real generation time**, (d) **resume the reader's last scroll position** on reopen, (e) stop a failed generation's leftover user-choice marker from showing, and (f) rework the moderation revision loop so a window released after the retry cap can no longer re-audit/rewrite text that was already shown. No legacy / old-data compatibility code was kept.
+
+## 1. Outline cap: 10 → 40 chapters (server)
+- [`OUTLINE_MAX_CHAPTERS`](AI-SAGA/server/main.py:81) default is now `"40"` (still overridable via the environment). [`_parse_outline_outputs()`](AI-SAGA/server/main.py:1564) already reads `chapter_script_01..N` dynamically, so raising the cap is sufficient: every chapter is parsed, and the per-chapter placeholder rows, body back-fill and "outline exhausted → open the next novel" logic are all data-driven (no other hard-coded 10-chapter limit).
+- A live probe confirmed the outline app returns `chapter_script_01..40`. A blocking request exceeds the gateway's ~100 s limit, so the server keeps using `response_mode=streaming` (unchanged).
+
+## 2. Outline stream read timeout & keep-alive (server)
+- [`OUTLINE_DIFY_STREAM_TIMEOUT`](AI-SAGA/server/main.py:78) default raised **30 s → 180 s**: the outline typewriter stream tolerates multi-minute gaps while a 40-chapter outline is generated (the timer resets on every received chunk).
+- [`_outline_activity_events()`](AI-SAGA/server/main.py:3169) now emits a **heartbeat about every 15 s** for as long as the server is still waiting (independent of whether Dify produced content in the last few seconds), so a legitimate silent gap never trips the app's 30 s idle check; a real ≥30 s stall still closes the stream via the read timeout and surfaces the existing "possible network issue" dialog.
+
+## 3. Compressed continuation context (`corrent_case_all_content`) (server)
+- [`_get_current_case_story()`](AI-SAGA/server/main.py:2051) still returns only the **current novel's** past chapters, but now the **three most recent written chapters contribute their full text**, while **older chapters contribute their per-chapter outline** instead of full text (falling back to text only when an outline is missing). This bounds prompt size for 40-chapter novels, and it revises the earlier "full text instead of outline summaries" decision for chapters older than three.
+
+## 4. Launch wait screen for a brand-new novel (client)
+- New [`NovelLaunchProgress`](AI-SAGA/lib/widgets/novel_launch_progress.dart:1) replaces the fixed 15 s "entering your world" blackout for the first generation after setup confirmation. It shows a black screen with a progress bar and localized status text on a **1-minute timeline** (each phase scaled proportionally):
+  - 0–15 s → 0→40 % (slow start); 15–30 s → 40→55 %; 30–45 s → 55→78 % (fast) then to 90 % (slow); 45–60 s → 90→100 %.
+  - If no body text has arrived by 60 s the bar holds at **99.9 %** and keeps waiting (heartbeats keep the connection alive).
+  - The instant the first body chunk arrives the bar jumps to **100 %** and shows the "received, the story begins" text, then fades to reveal the story page.
+- The status line ends with an animated ellipsis cycling `…` → `……` → `………` (about once per second, with a blank reset). The text itself stays fixed: the ellipsis animates inside a reserved fixed-width tail, so the line never shifts horizontally. All status strings are localized.
+
+## 5. Resume the reader's position on reopen (client)
+- [`home_content.dart`](AI-SAGA/lib/logic/home_content.dart) persists the reading position (distance above the document bottom) plus the newest segment's absolute index; it is saved on a debounce while scrolling and on app background/exit.
+- On cold start for an existing user the position is restored only when the story is unchanged (same newest segment index). If the saved spot is older than the cold-start tail, the app lazily pulls earlier chapters until the layout can reach it, then scrolls there. If the story changed, or a self-heal new novel is pending, it falls back to the previous "newest chapter at the top" behaviour.
+
+## 6. Suppress a dangling user-choice marker after a failed generation (client)
+- The server records the acting segment's `user_choice` **before** generating the next chapter; if that generation fails, the newest content segment is left with a non-empty `user_choice` and no following text. When restoring choices from the snapshot the client now **skips the newest segment's choice** (a marker is only meaningful when a later segment exists), so a restart no longer shows the failed attempt's choice while its text is absent.
+
+## 7. Boundary-scoped audit revision (server)
+- The window-start-anchored revision loop in [`_handle_reject()`](AI-SAGA/server/main.py:3822) was replaced. Previously a rejected window (50-char overlap + up to 400 new chars) was rewritten from `win_start`, which **re-included and overwrote the already-displayed overlap head**; because rewriting replaced text through the buffer end while Dify kept streaming the original remainder, the same region could keep entering new windows, re-auditing/rewriting endlessly and swallowing later text.
+- Revision now starts at **`fix0 = displayed_len`** (the already-displayed boundary): only the **not-yet-shown new portion** is sent to the revision workflow and replaced, the 50-char overlap head — already shown and approved by the previous window — is never rewritten or re-sent, and no client `truncate` is needed. Windows therefore advance strictly and cannot re-consume shown text.
+- The retry cap is unchanged and **per window**: the same window gets up to `REVISE_MAX_ATTEMPTS` (5) confirm + revise rounds; if it still fails, only **that window** is released once, and the **next window is audited normally and may prompt again** — each segment is warned independently (the earlier whole-segment "stop auditing" behaviour was removed).
+- Incremental `chunk` / `reveal` display keeps using the `text_arg[displayed_len:…]` slices, so already-shown text is preserved.
+
+## 8. Verification & deployment
+- `flutter analyze` — no issues; `python -m py_compile` on the server — clean.
+- Server change deployed by uploading the updated `main.py` to the host and writing it **in place** into the running container (preserving the inode so `uvicorn --reload` picks it up), followed by a health check.
+- Web client: `flutter build web --release --base-href /`, then published to the live site's nginx static root via an incremental (checksum) `rsync`, transferring only changed files. Verified: the site root and `/api/health` both return HTTP 200, and the deployed `main.dart.js` matches the local build.
+
+---
+
 # Full Chatflow Summary — Chapter-Outline Engine, Cross-Novel Atomicity, Debug Confirms & Server-Hosted Lottery "the_script" (2026-09-06/07)
 
 This session turned the story engine into a **per-chapter-outline novel generator** (each novel = one outline with up to `OUTLINE_MAX_CHAPTERS` chapter scripts, ch1 streamed first), then hardened cross-novel handoff, audit revision, RAG naming, and shipped a public Web build. Pre-release only: **no old-user / old-data compatibility or migration code is kept** — legacy shims were deleted rather than preserved.

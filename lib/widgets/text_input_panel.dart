@@ -34,6 +34,13 @@ class TextInputPanel extends StatefulWidget {
   /// 生成中置灰禁用确定按钮：保持按钮可见但不可点击
   final bool disabled;
 
+  /// 输入框左侧的前缀标签（如"主角想说："）。为空/null 时不显示，布局与原来一致。
+  final String? label;
+
+  /// 自定义超限判定（如"50 个宽字符或 200 个窄字符"）。
+  /// 为 null 时用 [maxLength] 做加权字数判定（汉字/日文/韩文按 3 字）。
+  final bool Function(String text)? overLimitCheck;
+
   const TextInputPanel({
     super.key,
     required this.onConfirm,
@@ -44,6 +51,8 @@ class TextInputPanel extends StatefulWidget {
     this.maxLength = 300,
     this.buttonBelow = false,
     this.disabled = false,
+    this.label,
+    this.overLimitCheck,
   });
 
   @override
@@ -63,8 +72,11 @@ class _TextInputPanelState extends State<TextInputPanel> {
   }
 
   bool get _hasText => _controller.text.trim().isNotEmpty;
-  bool get _isOverLimit =>
-      weightedCharCount(_controller.text) > widget.maxLength;
+  bool get _isOverLimit {
+    final check = widget.overLimitCheck;
+    if (check != null) return check(_controller.text);
+    return weightedCharCount(_controller.text) > widget.maxLength;
+  }
   bool get _canConfirm => !_isOverLimit && _hasText;
 
   @override
@@ -119,6 +131,29 @@ class _TextInputPanelState extends State<TextInputPanel> {
       ),
     );
 
+    // 可选前缀标签（如"主角想说："）：显示在输入框左侧，不属于输入内容
+    final String? label = widget.label;
+    final Widget fieldWithLabel = (label == null || label.isEmpty)
+        ? inputField
+        : Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(top: 12, right: 6),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: isDark
+                        ? AppTheme.secondaryTextDark
+                        : AppTheme.secondaryTextLight,
+                  ),
+                ),
+              ),
+              Expanded(child: inputField),
+            ],
+          );
+
     // 确定输入按钮（生成中/超限/为空时置灰禁用）
     final bool canConfirm = !widget.disabled && _canConfirm;
     // 灰化（禁用）期间整体降低透明度：保留蓝色按钮外形与圆角，辨识度不减，
@@ -170,7 +205,7 @@ class _TextInputPanelState extends State<TextInputPanel> {
           ? Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                inputField,
+                fieldWithLabel,
                 const SizedBox(height: 8),
                 confirmButton,
               ],
@@ -179,7 +214,7 @@ class _TextInputPanelState extends State<TextInputPanel> {
           : Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Expanded(child: inputField),
+                Expanded(child: fieldWithLabel),
                 const SizedBox(width: 10),
                 SizedBox(width: 80, child: confirmButton),
               ],

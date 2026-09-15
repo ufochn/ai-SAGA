@@ -48,6 +48,19 @@ class StorageService {
     return _prefs.getString(_keyUserUniqueId) ?? '';
   }
 
+  /// 通用字符串偏好读写（阅读位置等非敏感本地状态）。
+  static Future<void> saveLocalString(String key, String value) async {
+    await _prefs.setString(key, value);
+  }
+
+  /// 读取通用字符串偏好；不存在返回 null。
+  static String? getLocalString(String key) => _prefs.getString(key);
+
+  /// 删除通用字符串偏好。
+  static Future<void> removeLocalString(String key) async {
+    await _prefs.remove(key);
+  }
+
   // ---- 夜间模式 ----
 
   /// 保存夜间模式偏好

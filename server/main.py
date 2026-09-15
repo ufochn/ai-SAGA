@@ -66,19 +66,19 @@ CASE_DIFY_API_KEY = os.environ.get("CASE_DIFY_API_KEY", "")
 CASE_DIFY_API_URL = os.environ.get("CASE_DIFY_API_URL", DIFY_API_URL)
 # 分章节大纲工作流（2026-09 新逻辑）：每次开新小说实时生成整份分章大纲。
 # 输入：location / era / player_name / player_traits；response_mode=streaming。
-# 输出（实测）：outputs.text = 整份大纲 JSON（含 chapter_script_01..10）；
+# 输出（实测）：outputs.text = 整份大纲 JSON（含 chapter_script_01..40）；
 #              outputs.text_1 = 合规判定字符串（"true" 才允许把其余章落库）。
 # Key 必须通过环境变量 OUTLINE_DIFY_API_KEY 提供（勿硬编码/提交仓库）。
 OUTLINE_DIFY_API_KEY = os.environ.get("OUTLINE_DIFY_API_KEY", "")
 OUTLINE_DIFY_API_URL = os.environ.get("OUTLINE_DIFY_API_URL", DIFY_API_URL)
 # 大纲流整体超时（分钟级：整份大纲 + 合规判定可能 30s~数分钟）
 OUTLINE_DIFY_TIMEOUT = float(os.environ.get("OUTLINE_DIFY_TIMEOUT", "300"))
-# 大纲流读取超时（与小说流一致）：收到任何 Dify 数据即重置；持续无数据 30s 视为断/失败。
-# 服务端不再发“纯粹心跳”；App 只在收到实质内容时重置其 30s 等待。
-OUTLINE_DIFY_STREAM_TIMEOUT = float(os.environ.get("OUTLINE_DIFY_STREAM_TIMEOUT", "30"))
-# 大纲 JSON 字段约定：chapter_script_01..10
+# 大纲流读取超时：收到任何 Dify 数据即重置；持续无数据 180s（3 分钟）才视为断/失败。
+# 期间服务端每约 15s 发一次大纲活动心跳，App 以此判断未断联（不会因 30s 静默误判断网）。
+OUTLINE_DIFY_STREAM_TIMEOUT = float(os.environ.get("OUTLINE_DIFY_STREAM_TIMEOUT", "180"))
+# 大纲 JSON 字段约定：chapter_script_01..N（调试期：Dify 一次产出 40 章）
 OUTLINE_CHAPTER_PREFIX = "chapter_script_"
-OUTLINE_MAX_CHAPTERS = int(os.environ.get("OUTLINE_MAX_CHAPTERS", "10"))
+OUTLINE_MAX_CHAPTERS = int(os.environ.get("OUTLINE_MAX_CHAPTERS", "40"))
 # 大纲防重名：used_name 输入 = 最近 USED_NAME_RECENT_STORIES 个故事已用过的
 # 人名（每本主角 + distill 副角），以顿号连接的字符串传给大纲工作流。
 USED_NAME_RECENT_STORIES = int(os.environ.get("USED_NAME_RECENT_STORIES", "10"))
@@ -210,6 +210,37 @@ DEBUG_PAYLOAD_CONFIRM_TIMEOUT = int(os.environ.get("DEBUG_PAYLOAD_CONFIRM_TIMEOU
 _pending_payload_confirm: dict[str, asyncio.Event] = {}
 # 违规修正前的确认注册表：request_id -> asyncio.Event（App 点击"送 Dify 修正"后 set）
 _pending_revise_confirm: dict[str, asyncio.Event] = {}
+
+# 还在跑大纲会话的用户：user_id -> 最近活动时间戳（内存态）。
+#
+# 用途【只有一个】：GET /api/story/notice 的 pending 字段——告诉 App"大纲的最终
+# 判定还没到，继续轮询"（判定一到、若非 true，App 立刻弹窗打断用户）。
+#
+# 【明确不再参与】GET /api/story 的"启动校验：最新一本不足 40 章即整本删除"：
+# App 每次启动都会 POST /api/device/activate 铸出【新 login_ts】，旧会话的每一次
+# 落库都被写者守卫判为口令不符而拒绝——它根本写不进库了，"会话还在写所以不能
+# 校验"这个前提不成立。因此残缺本一律交给启动校验兜底清掉（重启后不全就全删）。
+#
+# 生存逻辑（谁写、谁续、谁清、谁兜底）：
+#   建立：OutlineSession.run() 一进入就写入（覆盖该用户旧值）。
+#   续命：会话每收到一次 Dify 大纲实质内容（_activity()）刷新时间戳 → TTL 是
+#         "最后一次活动后 10 分钟"，长会话不会中途失效。
+#   清除：run() 的 finally 里必定 pop（正常结束、Dify 超时、会话内异常都算）。
+#   兜底：进程被杀（uvicorn --reload、容器重启）不走 finally → 靠 TTL 自动失效；
+#         新进程内存字典本就为空，语义一致。
+_OUTLINE_BUSY: dict[str, float] = {}
+_OUTLINE_BUSY_TTL = 600.0   # 兜底：10 分钟无活动即视为残留（进程被杀）自动失效
+
+
+def _outline_busy(user_id: str) -> bool:
+    """该用户是否还有大纲会话在跑（仅用于 /api/story/notice 的 pending）。"""
+    ts = _OUTLINE_BUSY.get(user_id)
+    if ts is None:
+        return False
+    if time.time() - ts > _OUTLINE_BUSY_TTL:
+        _OUTLINE_BUSY.pop(user_id, None)
+        return False
+    return True
 
 # 客户端配置（校验 ID Token 的 audience / issuer）
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -404,6 +435,16 @@ CREATE TABLE IF NOT EXISTS user_write_guard (
     user_id    TEXT PRIMARY KEY,
     device_id  TEXT NOT NULL,
     login_ts   INTEGER NOT NULL
+);
+
+-- 大纲"迟到驳回"通知：第 1 章正文已抢先 done（App 的生成请求已结束、当场发不出弹窗）
+-- 之后，大纲的最终判定才到达且为"非 true"时写一行。该本小说此时已被原子删除，
+-- App 通过轮询 GET /api/story/notice 立即取走本行并弹"尺度过大"对话框打断用户；
+-- 若 App 未轮询，则其下一次生成请求会取走本行并补发 outline_rejected。
+CREATE TABLE IF NOT EXISTS story_rejections (
+    user_id    TEXT PRIMARY KEY,
+    script_no  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
 );
 """
 
@@ -1509,7 +1550,7 @@ def _moderation_failure_sse(mr: ModerationOutcome, snippet: str = "") -> Optiona
 
 
 # ================= 分章节大纲：解析与流式切分（2026-09 新逻辑） =================
-# 大纲 Dify 流一次产出整份 JSON：{"chapter_script_01": "...", ..., "chapter_script_10": "..."}
+# 大纲 Dify 流一次产出整份 JSON：{"chapter_script_01": "...", ..., "chapter_script_40": "..."}
 # text_chunk 逐字携带该 JSON（第 1 章在最前），可增量切出第 1 章提前开写；
 # workflow_finished.outputs 里 text=整份 JSON、text_1=合规值。
 
@@ -1564,7 +1605,7 @@ def _incremental_chapter1(raw: str) -> Optional[str]:
 def _parse_outline_outputs(outputs: Optional[dict]) -> dict:
     """解析 workflow_finished.outputs，返回 {"chapters":{1:..n:..},"check":Optional[bool],"raw":str}。
 
-    固定契约（实测）：outputs['text'] = 整份大纲 JSON 字符串（含 chapter_script_01..10）；
+    固定契约（实测）：outputs['text'] = 整份大纲 JSON 字符串（含 chapter_script_01..40）；
     outputs['text_1'] = 合规判定字符串（"true"）。check 归一化 == "true" 才为 True。
     """
     outs = outputs or {}
@@ -1809,7 +1850,7 @@ def _outline_inputs(
 
 async def _request_outline_chapters(
     settings: dict, user_id: str, script_no: int,
-    on_chapter1=None, on_activity=None,
+    on_chapter1=None, on_activity=None, on_chapter=None,
     the_script: Optional[str] = None,
 ) -> dict:
     """调大纲工作流（streaming）跑一次，返回 _parse_outline_outputs 同构 dict。
@@ -1840,6 +1881,7 @@ async def _request_outline_chapters(
     }
     buf = ""
     early = None
+    emitted_chapters: set = set()   # 已回调过的章号（增量去重）
     async with async_http_client.stream(
         "POST", OUTLINE_DIFY_API_URL, json=payload, headers=headers,
         timeout=OUTLINE_DIFY_STREAM_TIMEOUT,
@@ -1866,15 +1908,28 @@ async def _request_outline_chapters(
                 buf += txt
                 if on_activity is not None:
                     on_activity()   # 收到 Dify 大纲实质内容：驱动"大纲活动心跳"
-                if early is None:
-                    c1 = _incremental_chapter1(buf)
-                    if c1:
-                        early = c1
+                # 增量扫描“值已闭合”的章并回调：第 1 章同时驱动正文开写（on_chapter1）；
+                # 各章交 on_chapter 由上层按“大纲就绪即建条目”落库（第 40 章由 check 门控）。
+                try:
+                    done_map = _iter_complete_outline_chapters(buf)
+                except Exception:
+                    done_map = {}
+                for _n in sorted(done_map):
+                    if _n in emitted_chapters:
+                        continue
+                    emitted_chapters.add(_n)
+                    if _n == 1 and early is None:
+                        early = done_map[1]
                         if on_chapter1 is not None:
                             try:
-                                await on_chapter1(c1)
+                                await on_chapter1(done_map[1])
                             except Exception as e:
                                 logger.warning("大纲 on_chapter1 回调异常: %s", e)
+                    if on_chapter is not None:
+                        try:
+                            await on_chapter(_n, done_map[_n])
+                        except Exception as e:
+                            logger.warning("大纲 on_chapter 回调异常 n=%s: %s", _n, e)
             elif etype == "workflow_finished":
                 if on_activity is not None:
                     on_activity()
@@ -2028,10 +2083,185 @@ def _fill_content_row(user_id: str, device_id: str, login_ts: Optional[int],
 
 
 
+def _iter_complete_outline_chapters(raw: str) -> dict:
+    """从累计的流式大纲原始文本中，扫描所有“值已闭合”的章：返回 {chapter:int: outline:str}。
+
+    仅返回“该章 JSON 字符串值已完整到达”的章；章号递增，遇到第一个未就绪章即停止。
+    第 40 章（并入 OUTLINE_MAX_CHAPTERS）由调用方按 check 门控决定是否落库。
+    """
+    out: dict = {}
+    i = 0
+    n = len(raw)
+    for ch in range(1, OUTLINE_MAX_CHAPTERS + 1):
+        marker = '"' + f"{OUTLINE_CHAPTER_PREFIX}{ch:02d}" + '"'
+        idx = raw.find(marker, i)
+        if idx < 0:
+            break
+        colon = raw.find(":", idx + len(marker))
+        if colon < 0:
+            break
+        p = colon + 1
+        while p < n and raw[p] in " \t\r\n":
+            p += 1
+        if p >= n or raw[p] != '"':
+            break
+        end = _json_string_end(raw, p)
+        if end < 0:
+            break
+        text = _decode_json_string_literal(raw[p:end + 1]).strip()
+        if text:
+            out[ch] = text
+        i = end + 1
+    return out
+
+
+def _insert_outline_row(user_id: str, device_id: str, login_ts: Optional[int],
+                        script_no: int, chapter: int, outline: str) -> str:
+    """为某章大纲创建/确保一行占位（content=''、outline=该章大纲）；幂等。
+
+    只写 outline，绝不改动已存在的 content（正文回填是独立的逐章原子写）。
+    返回 'ok' / 'conflict' / 'fail'。
+    """
+    if not (outline or "").strip():
+        return "ok"
+    cur_id = f"{script_no}-{chapter}"
+
+    def _w(conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            """SELECT seq FROM story_segments
+               WHERE user_id=? AND current_script_id=? ORDER BY seq DESC LIMIT 1""",
+            (user_id, cur_id),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                """UPDATE story_segments SET outline=?
+                   WHERE user_id=? AND current_script_id=? AND seq=?""",
+                (outline.strip(), user_id, cur_id, row["seq"]),
+            )
+            return
+        conn.execute(
+            """INSERT INTO story_segments
+                 (user_id, seq, content, outline, created_at, current_script_id)
+               VALUES (?,?,?,?,?,?)""",
+            (user_id, _next_seq(user_id, conn), "", outline.strip(),
+             int(time.time()), cur_id),
+        )
+
+    try:
+        _run_write_unit(user_id, device_id, login_ts, _w)
+        return "ok"
+    except StoryWriteConflict:
+        logger.warning("OUTLINE-ROW 口令不符（被顶掉）s=%d ch=%d", script_no, chapter)
+        return "conflict"
+    except Exception as e:
+        logger.warning("OUTLINE-ROW 写入失败 s=%d ch=%d: %s",
+                       script_no, chapter, e, exc_info=True)
+        return "fail"
+
+
+def _delete_script_rows(user_id: str, device_id: str, login_ts: Optional[int],
+                        script_no: int) -> str:
+    """原子删除某脚本的全部章节条目（仅大纲占位 + 已写正文一并清除）。
+
+    写入允许分批，但删除必须一次原子完成——保证不留残缺章节/残缺正文。
+    返回 'ok' / 'conflict' / 'fail'。
+    """
+    def _w(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "DELETE FROM story_segments WHERE user_id=? AND current_script_id LIKE ?",
+            (user_id, f"{script_no}-%"),
+        )
+
+    try:
+        _run_write_unit(user_id, device_id, login_ts, _w)
+        return "ok"
+    except StoryWriteConflict:
+        logger.warning("DELETE-SCRIPT 口令不符（被顶掉）s=%d", script_no)
+        return "conflict"
+    except Exception as e:
+        logger.warning("DELETE-SCRIPT 失败 s=%d: %s", script_no, e, exc_info=True)
+        return "fail"
+
+
+def _mark_rejection(user_id: str, script_no: int) -> None:
+    """登记"迟到驳回"通知（App 轮询 /api/story/notice 取走；取走即消费）。"""
+    conn = _db()
+    try:
+        conn.execute(
+            """INSERT INTO story_rejections (user_id, script_no, created_at)
+               VALUES (?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 script_no=excluded.script_no, created_at=excluded.created_at""",
+            (user_id, int(script_no or 0), int(time.time())),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("登记驳回通知失败: %s", e, exc_info=True)
+    finally:
+        conn.close()
+
+
+def _consume_rejection(user_id: str) -> Optional[int]:
+    """取出并清除"迟到驳回"通知；无通知返回 None（取走即消费，避免重复弹窗）。"""
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT script_no FROM story_rejections WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM story_rejections WHERE user_id=?", (user_id,))
+        conn.commit()
+        try:
+            return int(row["script_no"])
+        except Exception:
+            return 0
+    except Exception as e:
+        logger.warning("读取驳回通知失败: %s", e, exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
+def _count_script_chapters(user_id: str, script_no: int) -> int:
+    """某脚本（s-k）在库中的章节条目数（含仅大纲占位）。"""
+    conn = _db()
+    try:
+        return int(conn.execute(
+            """SELECT COUNT(*) AS c FROM story_segments
+               WHERE user_id=? AND current_script_id LIKE ?""",
+            (user_id, f"{script_no}-%"),
+        ).fetchone()["c"])
+    finally:
+        conn.close()
+
+
+def _latest_script_no(user_id: str) -> Optional[int]:
+    """该用户库中出现过的最大脚本号（按 current_script_id "s-k" 解析）；无则 None。"""
+    conn = _db()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT current_script_id FROM story_segments
+               WHERE user_id=? AND current_script_id LIKE '%-%'""",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    mx = None
+    for r in rows:
+        cur = (r["current_script_id"] or "").strip()
+        m = re.match(r"^(\d+)-(\d+)$", cur)
+        if m:
+            s = int(m.group(1))
+            mx = s if mx is None else max(mx, s)
+    return mx
+
+
 def _get_story_count(user_id: str) -> int:
     """只读该用户【已生成正文】的段落数（续写/全新判断、以及生成 seq 用）。
 
-    只统计 content 非空的行，不把"仅含大纲、正文空白的占位行"（如新本的第 2..10 章
+    只统计 content 非空的行，不把"仅含大纲、正文空白的占位行"（如新本的第 2..N 章
     预建占位）算进去。这样新本第 1 章落库后此值为 1，第 2 章生成的 seq=1（对应要填的
     '1-2' 占位行），第 3 章=2 … 与"seq 按已写正文顺序增长、填最小空白占位"一致；
     空库仍为 0（判定全新故事）。
@@ -2058,14 +2288,14 @@ def _get_current_case_story(user_id: str, seq: int) -> str:
         1) 章节号到 1（S-1）→ 停，且 S-1 这一段【包含】（它是本轮脚本的起点）；
         2) 章节号变大（更早一节的章节号 > 当前这一节的章节号）→ 停；
         3) 脚本号开头不再是 S（如遇到 4-x）→ 停；
-    - 收集到的章节按 seq 升序（老→新）拼接 content。
+    - 收集到的章节按 seq 升序（老→新）输出：最近 3 章用正文（content），更早的用大纲（outline）。
     - 兜底：最新一段取不到 / current_script_id 空白或解析不出脚本号 / 用户无任何段 → 返回空串。
-    注：corrent_case_all_content 读的是 content 列（正文原文）。
+    注：corrent_case_all_content 现在读 content + outline（最近 3 章正文、更早章节大纲）。
     """
     conn = _db()
     try:
         rows = conn.execute(
-            """SELECT seq, current_script_id, content FROM story_segments
+            """SELECT seq, current_script_id, content, outline FROM story_segments
                WHERE user_id=? AND seq < ? ORDER BY seq DESC""",
             (user_id, seq),
         ).fetchall()
@@ -2083,7 +2313,8 @@ def _get_current_case_story(user_id: str, seq: int) -> str:
         for idx, row in enumerate(rows):
             if idx == 0:
                 # 最新一段总是属于本轮运行
-                items.append((row["seq"], row["content"] or ""))
+                items.append(
+                    (row["seq"], row["content"] or "", row["outline"] or ""))
                 if prev_chapter == 1:  # 最新段就是 S-1：只有它自己
                     break
                 continue
@@ -2097,14 +2328,25 @@ def _get_current_case_story(user_id: str, seq: int) -> str:
                 break  # 条件3：脚本号不再是 S
             if ch > prev_chapter:
                 break  # 条件2：章节号变大（往上回溯不允许）
-            items.append((row["seq"], row["content"] or ""))
+            items.append(
+                (row["seq"], row["content"] or "", row["outline"] or ""))
             if ch == 1:
                 break  # 条件1：到 S-1（本轮起点），包含后结束
             prev_chapter = ch
 
-        # 按 seq 升序（老→新）拼接
+        # 按 seq 升序（老→新）输出。
+        # 压缩策略（需求）：仍只回传【本小说】的过去章节；其中
+        # 最近 3 章（正文已生成的最末 3 章）用真正的小说正文（content），
+        # 更早的章节不再用正文，改用该章分场大纲（outline）拼接，控制上下文长度。
         items.sort(key=lambda x: x[0])
-        parts = [c for _, c in items if c and c.strip()]
+        written = [(c, o) for _, c, o in items if c and c.strip()]
+        n = len(written)
+        parts = []
+        for i, (c, o) in enumerate(written):
+            if i >= n - 3:          # 最近 3 章：正文
+                parts.append(c)
+            else:                   # 更早：用大纲（该章大纲缺失才回退正文）
+                parts.append((o or "").strip() or c)
         return "\n".join(parts)
     finally:
         conn.close()
@@ -2352,6 +2594,106 @@ def _strip_think(chunk: str, state: dict) -> str:
             break
         buf = buf[end + len("</think>"):]
     return "".join(out)
+
+
+class _DuoOutlinePartExtractor:
+    """增量解析 Dify 流式 JSON，提取 "duo_outline_part" 字符串值。
+
+    Dify 的小说正文流现在以 JSON 对象文本形式到达（text_chunk 的 text 是 JSON 片段），
+    结构形如 {"duo_outline_part": "...", "free_pending_part": "..."}。本类边收边解析，
+    只输出 duo_outline_part 的字符串内容，并按 JSON 规则解码转义（\\n、\\t、\\"、\\\\、
+    \\uXXXX 等，含回车符）；一旦该字符串值闭合（遇到未转义的结束引号）即进入 done，
+    其后的一切内容（如 free_pending_part、代码围栏等）全部忽略、不再产出。
+
+    兼容 key 与值、以及转义序列跨 chunk 拆分到达。
+    """
+
+    _KEY = '"duo_outline_part"'
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.state = "seek"    # seek | colon | openq | value | done
+        self.pending_esc = ""  # 跨 chunk 的转义残片（'\\' 或 '\\u12'）
+        self.done = False      # duo_outline_part 是否已闭合
+
+    def feed(self, chunk: str) -> str:
+        if self.done:
+            return ""
+        self.buf += chunk or ""
+        out: list = []
+        i = 0
+        n = len(self.buf)
+        while i < n:
+            if self.state == "seek":
+                idx = self.buf.find(self._KEY, i)
+                if idx == -1:
+                    # 保留可能是 key 前缀的尾部（跨 chunk）
+                    keep = len(self._KEY) - 1
+                    i = max(i, n - keep)
+                    break
+                i = idx + len(self._KEY)
+                self.state = "colon"
+            elif self.state == "colon":
+                c = self.buf[i]
+                if c == ":":
+                    self.state = "openq"
+                    i += 1
+                elif c.isspace():
+                    i += 1
+                else:
+                    self.state = "seek"
+                    i += 1
+            elif self.state == "openq":
+                c = self.buf[i]
+                if c == '"':
+                    self.state = "value"
+                    i += 1
+                elif c.isspace():
+                    i += 1
+                else:
+                    # 值不是字符串（如 null）→ 视为结束
+                    self.state = "done"
+                    self.done = True
+                    break
+            elif self.state == "value":
+                c = self.buf[i]
+                if self.pending_esc:
+                    self.pending_esc += c
+                    esc = self.pending_esc
+                    if esc.startswith("\\u"):
+                        if len(esc) < 6:
+                            i += 1
+                            continue
+                        try:
+                            out.append(chr(int(esc[2:6], 16)))
+                        except ValueError:
+                            out.append(esc[2:6])
+                        self.pending_esc = ""
+                        i += 1
+                        continue
+                    mapping = {'"': '"', "\\": "\\", "/": "/",
+                               "b": "\b", "f": "\f", "n": "\n",
+                               "r": "\r", "t": "\t"}
+                    out.append(mapping.get(esc[1], esc[1]))
+                    self.pending_esc = ""
+                    i += 1
+                    continue
+                if c == "\\":
+                    self.pending_esc = "\\"
+                    i += 1
+                elif c == '"':
+                    self.state = "done"
+                    self.done = True
+                    i += 1
+                    break
+                else:
+                    out.append(c)
+                    i += 1
+            else:
+                break
+        # 丢弃已消费部分（done 时全清）
+        self.buf = "" if self.state == "done" else self.buf[i:]
+        return "".join(out)
 
 
 _CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
@@ -2981,7 +3323,7 @@ def _persist_new_novel_atomic(
     2..N(仅大纲)，全部因果写一次集中完成 → COMMIT。
     lead 形如 {"script_no","chapter","content","settings","meta",
               "choice_1","choice_2","choice_3"}；None 表示无合并。
-    这样"老小说的结尾 + 新小说(ch1 + 十章大纲)"同生共死：要么都在、要么都不在；
+    这样"老小说的结尾 + 新小说(ch1 + 全量大纲)"同生共死：要么都在、要么都不在；
     中间任何一步被新设备顶掉（conflict）都整批回滚，绝不留下
     "老结尾已落、新小说被拒"的无下一章占位死胡同。
     返回：
@@ -3101,36 +3443,66 @@ class OutlineSession:
     """
 
     def __init__(self, user_id: str, script_no: int, settings: dict,
+                 device_id: str = "", login_ts: Optional[int] = None,
                  the_script: Optional[str] = None):
         self.user_id = user_id
         self.script_no = script_no
         self.settings = dict(settings or {})
+        self.device_id = device_id
+        self.login_ts = login_ts
         self.the_script = the_script or ""   # 本次开新小说抽签组合出的故事底稿（the_script）
         self.ch1 = ""                    # 增量切出/兜底得到的第 1 章大纲（供驱动正文）
         self.chapters: dict = {}         # {chapter:int: outline:str}（check 通过后的全量 1..N）
         self.check: Optional[bool] = None
         self.error: Optional[str] = None
         self.rejected = False            # check_result != true
-        self.persisted = False           # 本小说是否已一次性原子落库
+        self.persisted = False           # 保留字段（新逻辑不再整本原子落库）
+        self.done_sent = False           # 是否已把 done 发给 App（发了就不能再"当场删除"）
+        self.persisted_chapters: set = set()  # 已落库（仅大纲占位）的章号
         self.ch1_event = asyncio.Event()
         self.done_event = asyncio.Event()
         self.last_activity = time.time() # 最近收到 Dify 大纲实质内容的时刻（驱动"大纲活动心跳"）
 
     def _activity(self) -> None:
         self.last_activity = time.time()
+        # 给"正在写"标记续命：TTL 按"最后一次活动"起算（而不是会话开始），
+        # 避免极端长会话（Dify 慢慢吐大纲）中途标记失效、被启动校验误删。
+        _OUTLINE_BUSY[self.user_id] = self.last_activity
 
     async def _on_ch1(self, text: str) -> None:
-        """第 1 章大纲增量切出：只记录并放行正文流；不建行（落库在整本齐后一次做）。"""
+        """第 1 章大纲增量切出：记录并放行正文流（落库由 _on_chapter 负责）。"""
         self.ch1 = (text or "").strip()
         self._activity()
         self.ch1_event.set()
 
+    async def _on_chapter(self, n: int, text: str) -> None:
+        """某章大纲就绪：1..39 立即建条目（仅大纲占位）；第 40 章暂不落库（等 check==true）。"""
+        if n == 1:
+            self.ch1 = (text or "").strip()
+            self._activity()
+            self.ch1_event.set()
+        if n >= OUTLINE_MAX_CHAPTERS:
+            return   # 第 40 章由 run() 在 check==true 后落库
+        if n in self.persisted_chapters:
+            return
+        st = _insert_outline_row(self.user_id, self.device_id, self.login_ts,
+                                 self.script_no, n, text)
+        if st == "ok":
+            self.persisted_chapters.add(n)
+        else:
+            logger.warning("OUTLINE 章大纲落库失败 s=%d ch=%d st=%s",
+                           self.script_no, n, st)
+
     async def run(self) -> None:
         """驱动大纲流直至结束；全程不写库。"""
+        # 标记"该用户正在写新小说"：App 冷启动的启动校验在此期间跳过整本删除
+        # （40 章大纲还在流式落库，不足 40 章属正常中间态，不能当残缺清库）。
+        _OUTLINE_BUSY[self.user_id] = time.time()
         try:
             result = await _request_outline_chapters(
                 self.settings, self.user_id, self.script_no,
                 on_chapter1=self._on_ch1, on_activity=self._activity,
+                on_chapter=self._on_chapter,
                 the_script=self.the_script,
             )
             self.chapters = result.get("chapters") or {}
@@ -3144,12 +3516,40 @@ class OutlineSession:
             if self.ch1 and not self.ch1_event.is_set():
                 self.ch1_event.set()
             self._activity()
-            if self.check is not True:
+            if self.check is True:
+                # 补落“尚未落库”的章（含第 40 章）：check==true 是第 40 章落库的前置条件。
+                merged: dict = dict(self.chapters)
+                if self.ch1 and 1 not in merged:
+                    merged[1] = self.ch1
+                for _ch in sorted(int(k) for k in merged):
+                    if _ch in self.persisted_chapters:
+                        continue
+                    _st = _insert_outline_row(
+                        self.user_id, self.device_id, self.login_ts,
+                        self.script_no, _ch, merged[_ch],
+                    )
+                    if _st == "ok":
+                        self.persisted_chapters.add(_ch)
+                    else:
+                        logger.warning("OUTLINE 补落章失败 s=%d ch=%d st=%s",
+                                       self.script_no, _ch, _st)
+            else:
+                # check 非 true（大纲最终判定未通过）→【立即】原子删除该本小说全部条目
+                # （含已回填、可能已被用户读到的第 1 章正文），不做任何保留/等待。
                 self.rejected = True
+                _st = _delete_script_rows(self.user_id, self.device_id,
+                                          self.login_ts, self.script_no)
                 logger.warning(
-                    "OUTLINE check 未通过（不落库）script_no=%s", self.script_no
+                    "OUTLINE check 未通过 → 原子删除 s=%d（delete=%s，done_sent=%s）",
+                    self.script_no, _st, self.done_sent,
                 )
-            # check 通过：不建行；等第 1 章正文 + 本会话都完成后由调用方原子落库
+                if self.done_sent:
+                    # App 的生成请求早已结束（第 1 章正文先 done）→ 当场发不出弹窗：
+                    # 登记"迟到驳回"通知，App 轮询 /api/story/notice 会立即取走并弹窗
+                    # 打断用户（若 App 没轮询，则下一次生成请求会补发 outline_rejected）。
+                    _mark_rejection(self.user_id, self.script_no)
+                    logger.warning(
+                        "OUTLINE 驳回通知已登记（等 App 取走）s=%d", self.script_no)
         except httpx.TimeoutException:
             self.error = "大纲生成超时"
             logger.warning("OUTLINE 超时 script_no=%s", self.script_no)
@@ -3163,23 +3563,25 @@ class OutlineSession:
             if not self.ch1_event.is_set():
                 self.ch1_event.set()   # 防止生成器死等；ch1 为空由调用方判失败
             self._activity()
+            # 大纲会话结束 → 清除"正在写"标记（此后冷启动的启动校验照常生效）
+            _OUTLINE_BUSY.pop(self.user_id, None)
             self.done_event.set()
 
 
 async def _outline_activity_events(session: OutlineSession, ev: asyncio.Event):
-    """等待 session 的某个事件，期间若 Dify 大纲近期有实质内容则节流发"大纲活动心跳"。
+    """等待 session 的某个事件，期间每约 15s 发一次"大纲活动心跳"，让 App 确认未断联。
 
-    每收到实质内容都会刷新 session.last_activity（由 _request 回调查到）；
-    本生成器约每 5s 一次、仅在"最近有活动"时 yield 心跳事件字典（由调用方 _sse 转发）。
-    Dify 真卡住 ≥30s → 无活动无心跳 → run() 读超时置 error → 本循环随 ev/error 退出。
-    绝不在"无内容"时无限发心跳。
+    只要服务端仍在等（ev 未置、session 无 error）就周期发心跳，与 Dify 是否刚有实质
+    内容无关——Dify 偶发 <30s 的停顿（40 章大纲 + 首章正文可能持续约 1~2 分钟）不会被
+    App 误判断网；若 Dify 真卡住 ≥30s，run() 读超时置 error → 本循环随 ev/error 退出 →
+    流关闭，App 超过 30s 无心跳即弹"疑似断网"提示。
     """
     last_hb = 0.0
     while True:
         if ev.is_set() or session.error is not None:
             return
         now = time.time()
-        if now - last_hb >= 5.0 and (now - session.last_activity) <= 6.0:
+        if now - last_hb >= 15.0:
             last_hb = now
             yield {"event": "heartbeat", "message": "正在等待完整大纲"}
         await asyncio.sleep(0.25)
@@ -3286,15 +3688,14 @@ async def generate_story(data: StoryInputData, request: Request):
     login_ts = claims.get("login_ts")
     _enforce_active_device(user_id, device_id)
 
-    # 防御性校验：续写必须有用户指引，禁止无指引生成新小说内容。
-    # 第一轮全新生成（库中无任何段落）允许空白 user_input；其余情况
-    # （时间树"从这里重写" rewrite_from>=0 / 已有正文的续写）一律要求
-    # user_input 非空白。必须放在任何数据库写入/截断【之前】，空白输入
-    # 不得破坏已有故事，也不得调用 Dify 无指引续写。
-    if not (data.user_input or "").strip():
-        _cnt = _get_story_count(user_id)
-        _is_rewrite = data.rewrite_from is not None and data.rewrite_from >= 0
-        if _cnt > 0 or _is_rewrite:
+    # 防御性校验：时间树"从这里重写"（rewrite_from>=0）必须携带用户指引，禁止无指引
+    # 重写已有故事。必须放在任何数据库写入/截断【之前】。
+    # 【2026-09-10 起放宽】普通续写允许空白 user_input：App 第 1 个按钮
+    # "继续生成后面情节"即以空 user_input 续写——目标章节由已落库的下一章大纲
+    # 占位行决定（不依赖 user_input），Dify 依 chapter_script（该章大纲）生成正文。
+    # 全新小说的第一轮生成同样允许空白。
+    if data.rewrite_from is not None and data.rewrite_from >= 0:
+        if not (data.user_input or "").strip():
             raise HTTPException(
                 status_code=400,
                 detail="续写需要用户输入指引，请先填写内容再继续",
@@ -3456,6 +3857,14 @@ async def generate_story(data: StoryInputData, request: Request):
     async def _generate_sse():
         nonlocal pre_case_meta, user_input_counter
         try:
+            # 上一轮开新小说的大纲判定为"非 true"（该本小说已被原子删除），而 App
+            # 当时已提前收到 done、没能当场弹窗：这里在其下一次生成请求上立刻补发
+            # outline_rejected（App 侧走与"当场驳回"完全一致的弹窗 + 清空重启）。
+            _late_rej = _consume_rejection(user_id)
+            if _late_rej is not None:
+                logger.warning("STREAM 补发 outline_rejected（迟到驳回）s=%s", _late_rej)
+                yield _sse({"event": "outline_rejected"})
+                return
             # ---- 目标章解析（2026-09 大纲化）----
             # 全新故事 / 无下一章占位行 → 开新小说（大纲流并发，ch1 就绪即写）；
             # 续写 → 读最新已写正文行，找下一章大纲占位行作为本次目标。
@@ -3518,7 +3927,9 @@ async def generate_story(data: StoryInputData, request: Request):
                     finally:
                         _pending_payload_confirm.pop(o_request_id, None)
                 session = OutlineSession(
-                    user_id, script_no, settings, the_script=o_script)
+                    user_id, script_no, settings,
+                    device_id=device_id, login_ts=login_ts,
+                    the_script=o_script)
                 sessions.append(session)
                 cur_session = session
                 asyncio.get_running_loop().create_task(session.run())
@@ -3580,14 +3991,19 @@ async def generate_story(data: StoryInputData, request: Request):
             # ---- RAG 检索：用户行动指引对【之前脚本】做双通道匹配，命中注入整章 ----
             # 排除当前正在生成的脚本（当前脚本的 LLM 已能拿到自身信息，不重复喂）。
             # 检索加了 RAG_RETRIEVE_TIMEOUT(3s) 兜底超时：拿不到就无感降级、放弃本轮 RAG。
+            # 检索查询：优先用户本轮指引；App 第 1 个按钮"继续生成后面情节"（空
+            # user_input）时退化为【当前章节大纲文本】，使该路径同样能取到记忆。
+            _rag_query = (data.user_input or "").strip() or (
+                (pre_case_meta or {}).get("chapter_text") or ""
+            ).strip()
             rag_context = ""
-            if _rag_enabled() and (data.user_input or "").strip():
+            if _rag_enabled() and _rag_query:
                 try:
                     rag_context = (
                         await asyncio.wait_for(
                             _retrieve_rag(
                                 user_id,
-                                data.user_input,
+                                _rag_query,
                                 (pre_case_meta or {}).get("script_id") or "",
                                 settings.get("player_name") or "",
                             ),
@@ -3775,7 +4191,7 @@ async def generate_story(data: StoryInputData, request: Request):
                     # 即触发一次审核；审核窗口每步前进 STORY_AUDIT_STEP 字（其余窗口前带
                     # OVERLAP 回溯重叠），审核通过后把新确认的正文送回 App（首段 chunk
                     # 打字机、其后 reveal）。
-                    full_text = ""          # 累计全部正文（<think> 已剥离）
+                    full_text = ""          # 累计全部正文（来自 duo_outline_part 解析结果）
                     displayed_len = 0       # 已发送给 App 的字符数
                     audit_no = 1            # 下一次审核序号 k（窗口 [STEP*(k-1)-OVERLAP, STEP*k)）
                     sent_first = False      # 是否已发送过首段 chunk
@@ -3783,8 +4199,11 @@ async def generate_story(data: StoryInputData, request: Request):
                     # 审核窗口基准偏移：正常为 0；违规修正覆盖违规段后重置为修正点，
                     # 之后窗口从该点重新编号（保持 400/50 增量审核不因变长改写而错位）。
                     _audit_base = 0
+                    # （无需"整段停审"标志：修正只推进到"已展示边界"，本段其余窗口照常送审弹窗）
                     outputs = {}
-                    think_state = {"in_think": False, "hold": ""}  # <think> 块剥离状态（跨 chunk）
+                    # Dify 正文流改为 JSON：{"duo_outline_part": "...", "free_pending_part": "..."}
+                    # 仅增量解析并解码 duo_outline_part 作为正文；该字段闭合后停止解析、忽略其余内容。
+                    duo_extractor = _DuoOutlinePartExtractor()
                     meta = _extract_story_meta({}, settings.get("language"))  # 后续变量（choice_1/2/3/music_style）；workflow_finished 时更新，失败用保底默认
 
                     async def _audit_pipeline(text_arg: str, final: bool, final_outputs: Optional[dict] = None):
@@ -3794,10 +4213,10 @@ async def generate_story(data: StoryInputData, request: Request):
                         - 每窗口审核是阻塞式 Dify 调用（最长 AUDIT_DIFY_TIMEOUT 秒），等待期间
                           每 15s yield 一个 heartbeat，重置客户端 30s 滚动计时；
                         - REJECT（违规）→ 尝试"违规修正"工作流（最多 REVISE_MAX_ATTEMPTS 轮）：
-                          把违规文本 + guardrail JSON 发给修正工作流，收到改写文本后覆盖
-                          text_arg/full_text 中的违规段、让客户端回滚到违规窗口起点（truncate
-                          事件），再按老逻辑整段重送审核；通过 → 整段 reveal 继续打字；
-                          已满 REVISE_MAX_ATTEMPTS 轮仍不过 → 【放行】直接送出（不再中止）；
+                          只把本窗【尚未展示】的新内容（不含上一窗已展示的 50 字重叠头）发给
+                          修正工作流，改写后从"已展示边界"起整段重送审核；通过 → 整段 reveal 继续打字；
+                          已满 REVISE_MAX_ATTEMPTS 轮仍不过 → 【放行】直接送出当前稿（本窗只放行一次，
+                          下一窗照常送审弹窗，各自最多弹 REVISE_MAX_ATTEMPTS 次）；
                           修正失败 / 未配置 / 用户确认超时 → 回退 yield abort（弹窗"重新输入"）；
                         - UNAVAILABLE（不可用）→ yield error；TIMEOUT（Dify 审核 30s 无返回）→
                           不 yield 任何事件直接结束（关闭流），客户端 30s 无数据自然弹
@@ -3812,41 +4231,53 @@ async def generate_story(data: StoryInputData, request: Request):
                             win_start: int,
                             win_end: int,
                         ):
-                            """违规窗口自动修正（async generator）：调修正 workflow（最多
-                            REVISE_MAX_ATTEMPTS 轮）覆盖违规段后整段重审。
-                            重审通过 → 整段发送（chunk/reveal），audit_aborted 保持 False；
-                            已满 cap 轮仍不过 → 【放行】（直接送出当前修正稿，audit_aborted=False）；
-                            修正失败/未配置/用户确认超时 → 已 yield abort 并置 audit_aborted=True。
+                            """违规窗口自动修正（async generator）。
+
+                            核心原则：只修正【尚未送审/尚未展示】的新内容，绝不回改已展示的
+                            50 字重叠头——这样同一段文字不会被反复重送，改写也不会再吞掉
+                            后面/已展示的文本：
+                            - 修正/重写起点 fix0 = 已展示边界 displayed_len（上一窗通过后的末尾；
+                              首个窗口为 0）。窗口的 [win_start, fix0)（重叠的 50 字）已随上一窗
+                              展示并通过，不再送修正流、也不在 text_arg 里回改；
+                            - 每次修正后把 [fix0:]（尚未展示的全部）重新送审：通过 → reveal；
+                              仍违规 → 继续修正；修满 REVISE_MAX_ATTEMPTS 轮仍不过 → 【放行】
+                              送出当前稿。本窗只放行这一次，下一窗照常送审/弹窗（每窗各自 5 次）；
+                            - 修正失败/未配置/用户确认超时 → 已 yield abort 并置 audit_aborted=True。
                             （async generator 不能 return 值，用 audit_aborted 作成功/失败信号。）
                             """
                             nonlocal text_arg, full_text, displayed_len, audit_no, sent_first, audit_aborted, _audit_base
                             attempts = 0
-                            cur_text = audit_text
+                            # 只从"已展示边界"开始修：fix0 之前的文本已展示、保持不动
+                            fix0 = displayed_len if displayed_len >= win_start else win_start
+                            # 待修正文本 = 本窗【新】部分 [fix0, win_end)（最多 400 字，不含重叠头）
+                            cur_text = text_arg[fix0:win_end]
+                            if not cur_text.strip():
+                                # 防御：窗口异常（fix0 已到 win_end 等）→ 退回整窗
+                                fix0 = win_start
+                                cur_text = text_arg[fix0:win_end]
                             cur_verdict = verdict
                             while True:
                                 attempts += 1
                                 logger.warning(
-                                    "STREAM audit REJECT → 修正第 %d 轮 win=[%d,%d) text_len=%d",
-                                    attempts, win_start, win_end, len(cur_text or ""),
+                                    "STREAM audit REJECT → 修正第 %d 轮 fix0=%d win=[%d,%d) text_len=%d",
+                                    attempts, fix0, win_start, win_end, len(cur_text or ""),
                                 )
                                 # REVISE_MAX_ATTEMPTS<=0 = 不限修正轮数（实验用）。
-                                # 已尝试满 cap 轮仍不过 → 【放行】：不再中止/不再弹窗/不再无限循环，
-                                # 直接把当前修正稿 cur_text 按"审核通过"送出，继续后续流程。
+                                # 本窗已尝试满 cap 轮仍不过 → 【放行】：不再中止/不再弹窗，直接送出
+                                # 当前稿。只对"这一个窗口片段"生效；下一窗照常送审、照常弹窗。
                                 if REVISE_MAX_ATTEMPTS > 0 and attempts > REVISE_MAX_ATTEMPTS:
                                     logger.warning(
-                                        "STREAM audit 已尝试 %d 轮修正仍不过 → 放行 "
-                                        "（不再中止）win=[%d,%d) len=%d",
-                                        attempts, win_start, win_end, len(cur_text or ""),
+                                        "STREAM audit 本窗已尝试 %d 轮仍不过 → 放行（不再中止）"
+                                        " fix0=%d len=%d",
+                                        attempts, fix0, len(cur_text or ""),
                                     )
                                     audit_aborted = False
-                                    if win_start > 0:
-                                        yield {
-                                            "event": "reveal",
-                                            "text": cur_text,
-                                            "outputs": {},
-                                        }
+                                    # 放行：把 fix0 之后尚未展示的文本整体送出（修正稿 + 后续尾部）
+                                    rest = text_arg[fix0:]
+                                    if fix0 > 0:
+                                        yield {"event": "reveal", "text": rest, "outputs": {}}
                                     else:
-                                        yield {"event": "chunk", "text": cur_text}
+                                        yield {"event": "chunk", "text": rest}
                                     displayed_len = len(text_arg)
                                     sent_first = True
                                     _audit_base = len(text_arg)
@@ -3860,8 +4291,8 @@ async def generate_story(data: StoryInputData, request: Request):
                                 _pending_revise_confirm[request_id] = confirm_ev
                                 try:
                                     logger.warning(
-                                        "STREAM 发出 revise_confirm request_id=%s text_len=%d",
-                                        request_id, len(cur_text or ""),
+                                        "STREAM 发出 revise_confirm request_id=%s fix0=%d text_len=%d",
+                                        request_id, fix0, len(cur_text or ""),
                                     )
                                     yield {
                                         "event": "revise_confirm",
@@ -3923,28 +4354,23 @@ async def generate_story(data: StoryInputData, request: Request):
                                         ModerationOutcome.REJECT, cur_text
                                     )
                                     return
-                                # 覆盖违规段（text_arg 与 full_text 同步更新，后续 text_chunk 沿用修正后正文）。
-                                # 第 1 轮 cur_text 只覆盖原违规窗口 [win_start, win_end) → 替换后保留 win_end 之后原尾部；
-                                # 第 2 轮起 cur_text = remainder = text_arg[win_start:]（覆盖到当前文本末尾，
+                                # 覆盖：只从 fix0（已展示边界）之后替换，绝不回改 fix0 之前的已展示
+                                # 文本（那正是"同一段文字被反复重送/吞字"的根源）。
+                                # 第 1 轮只覆盖 [fix0, win_end)：保留 win_end 之后的原尾部；
+                                # 第 2 轮起 cur_text = remainder = text_arg[fix0:]（覆盖到当前文本末尾，
                                 # 且 text_arg 长度已在上一轮替换后改变）：若仍按旧的 win_end 保留"尾部"
-                                # 会截进已修正文本、造成重复/丢字 → 改为整体替换 win_start 之后全部内容
+                                # 会截进已修正文本、造成重复/丢字 → 改为整体替换 fix0 之后全部内容
                                 # （revised 已把 remainder 整体重写，无需再留尾部）。
                                 text_arg = (
-                                    text_arg[:win_start]
+                                    text_arg[:fix0]
                                     + revised
                                     + (text_arg[win_end:] if attempts == 1 else "")
                                 )
                                 full_text = text_arg
-                                # 让客户端把当前段回滚到违规窗口起点，避免重叠区重复。
-                                # 关键：仅当本段【已经 reveal 过内容】（displayed_len>0）才需要回滚；
-                                # 若首窗即违规（displayed_len==0），客户端还没有本段的文本框，
-                                # 此刻发 truncate 会把上一段（如跨小说时"老小说末章"那个已完成的文本框）
-                                # 误清空 → 造成"老小说文本消失"。displayed_len==0 时跳过 truncate，
-                                # 修正后的整段会由下方 chunk/reveal 全新建立文本框，无需回滚。
-                                if displayed_len > 0:
-                                    yield {"event": "truncate", "keep": win_start}
-                                # 重审修正后的剩余部分（老逻辑：送审核 Dify）
-                                remainder = text_arg[win_start:]
+                                # 不发送 truncate：fix0 == displayed_len（已展示边界），fix0 之前
+                                # 的内容从未被修改；只需把 fix0 之后未展示的文本补发即可，无重叠重复。
+                                # 重审修正后的剩余未展示部分（老逻辑：送审核 Dify）
+                                remainder = text_arg[fix0:]
                                 audit_task = asyncio.create_task(
                                     _moderate_story(remainder)
                                 )
@@ -3969,7 +4395,7 @@ async def generate_story(data: StoryInputData, request: Request):
                                     )
                                     return
                                 # 重审通过：整段发送（首段 chunk / 续段 reveal）
-                                if win_start > 0:
+                                if fix0 > 0:
                                     yield {
                                         "event": "reveal",
                                         "text": remainder,
@@ -4118,7 +4544,9 @@ async def generate_story(data: StoryInputData, request: Request):
                                         sel_key, STORY_STREAM_SOURCE,
                                     )
                                     continue
-                            txt = _strip_think(edata.get("text", "") or "", think_state)
+                            # Dify text 现为 JSON 片段：增量抽取 duo_outline_part（已解码转义/回车符）；
+                            # 该字段闭合后 duo_extractor 进入 done，后续内容一律忽略、不再产出。
+                            txt = duo_extractor.feed(edata.get("text", "") or "")
                             if txt:
                                 full_text += txt
                                 # 增量审核（async generator，等待 Dify 期间自带 15s 心跳）
@@ -4165,31 +4593,39 @@ async def generate_story(data: StoryInputData, request: Request):
                                 None,
                             )
                             if _pending_sess is not None:
-                                # ---- 新小说：两线都齐才一次性原子落库 ----
-                                # 等大纲(1..N + check)收尾（期间按 Dify 实质内容发活动心跳）
-                                if not _pending_sess.done_event.is_set():
-                                    async for _ev in _outline_activity_events(
-                                        _pending_sess, _pending_sess.done_event
-                                    ):
-                                        yield _sse(_ev)
+                                # ---- 新小说：大纲已随流【逐章】落库（仅占位）----
+                                # 只要“第 2 章大纲”已就位即可 done（不必等整份大纲/check），
+                                # 这样用户读完第 1 章即可继续；若大纲先结束（单章小说/check 结果）
+                                # 则按结束态处理。等待期间每 15s 给 App 发心跳。
+                                _last_hb = 0.0
+                                while (not _pending_sess.done_event.is_set()
+                                       and 2 not in _pending_sess.persisted_chapters):
+                                    if _pending_sess.error is not None:
+                                        break
+                                    _now_hb = time.time()
+                                    if _now_hb - _last_hb >= 15.0:
+                                        _last_hb = _now_hb
+                                        yield _sse({"event": "heartbeat",
+                                                    "message": "正在生成大纲"})
+                                    await asyncio.sleep(0.25)
                                 if _pending_sess.error is not None:
                                     logger.warning(
-                                        "STREAM outline 会话失败（静默关闭，未落库）s=%d err=%s",
+                                        "STREAM outline 会话失败（静默关闭）s=%d err=%s",
                                         _sn, _pending_sess.error,
                                     )
                                     return
-                                if (_pending_sess.rejected
-                                        or _pending_sess.check is not True):
-                                    # 合规不过：未落库 → 专属"大纲尺度过大"弹窗 → 重新开始
+                                # 大纲已结束且未通过 check → run() 已原子删除全部条目 → 弹窗提示
+                                if (_pending_sess.done_event.is_set()
+                                        and (_pending_sess.rejected
+                                             or _pending_sess.check is not True)):
                                     logger.warning(
-                                        "STREAM outline_rejected s=%d（未落库）", _sn)
+                                        "STREAM outline_rejected s=%d（已原子删除）", _sn)
                                     yield _sse({"event": "outline_rejected"})
                                     return
+                                _has_next = 2 in _pending_sess.persisted_chapters
                                 _chapters = (_pending_sess.chapters
                                              or {1: _pending_sess.ch1})
-                                _n_max = (max(int(k) for k in _chapters)
-                                          if _chapters else 1)
-                                _new_is_last = _n_max <= 1
+                                _new_is_last = not _has_next
                                 _c1 = meta.get("choice_1") or ""
                                 _c2 = (meta.get("action_a") or "") if not _new_is_last else ""
                                 _c3 = (meta.get("action_b") or "") if not _new_is_last else ""
@@ -4197,54 +4633,52 @@ async def generate_story(data: StoryInputData, request: Request):
                                 fmeta["choice_1"] = _c1
                                 fmeta["choice_2"] = _c2
                                 fmeta["choice_3"] = _c3
-                                _merged_lead = _defer_lead
-                                _st = _persist_new_novel_atomic(
-                                    user_id, device_id, login_ts, _sn,
-                                    settings, fmeta,
-                                    _pending_sess.ch1 or "",
-                                    final_segment,
-                                    _chapters,
+                                # 第 1 章条目（仅大纲占位）已随大纲流落库 → 逐章原子回填完整正文
+                                _st = _fill_content_row(
+                                    user_id, device_id, login_ts, _sn, 1,
+                                    final_segment, settings, meta,
                                     choice_1=_c1, choice_2=_c2, choice_3=_c3,
-                                    lead=_merged_lead,
                                 )
                                 if _st == "conflict":
                                     logger.warning(
-                                        "STREAM 落库口令不符（被顶掉）→ conflict s=%d", _sn)
+                                        "STREAM 第1章回填口令不符（被顶掉）→ conflict s=%d", _sn)
                                     yield _sse({"event": "conflict",
                                                 "reason": "multi_client"})
                                     return
                                 if _st != "ok":
                                     logger.warning(
-                                        "STREAM 整本原子落库失败（静默关闭）s=%d", _sn)
+                                        "STREAM 第1章回填失败（静默关闭）s=%d", _sn)
                                     return
                                 _pending_sess.persisted = True
                                 segment_ended = True
                                 _defer_lead = None
                                 logger.warning(
-                                    "STREAM 整本原子落库 ok s=%d chs=%d is_last=%s lead=%s",
-                                    _sn, len(_chapters), _new_is_last,
-                                    _merged_lead is not None)
-                                # RAG：新小说第 1 章正文已落库 → 人名登记 + 原文切块嵌入
+                                    "STREAM 第1章正文回填 ok s=%d chs=%d is_last=%s",
+                                    _sn, len(_chapters), _new_is_last)
+                                # RAG：第 1 章正文已落库 → 人名登记 + 原文切块嵌入
                                 _schedule_rag_after_persist(
                                     user_id, _sn, 1, final_segment,
                                     meta.get("characters") or [])
-                                # RAG：合并进来的"老小说末章"正文同样已落库 → 一并触发 RAG
-                                if _merged_lead is not None:
-                                    _schedule_rag_after_persist(
-                                        user_id,
-                                        int(_merged_lead["script_no"]),
-                                        int(_merged_lead["chapter"]),
-                                        _merged_lead.get("content") or "",
-                                        (_merged_lead.get("meta") or {}).get("characters") or [])
                                 if not _new_is_last:
+                                    # 下一章（第2章）大纲已随流落库 → 输入框可显示。
+                                    # 注意：done 一发本请求即结束，而大纲的【最终合规判定】
+                                    # 要等整份大纲流完（约 1~1.5 分钟）才到；若届时判定为
+                                    # "非 true"，服务器会立即原子删除该本小说，App 只能靠
+                                    # 轮询 /api/story/notice 第一时间收到并弹窗打断用户。
+                                    # 故此处把"判定是否尚未到达"如实告诉 App（verdict_pending）。
+                                    _pending_sess.done_sent = True
                                     yield _sse({"event": "done",
-                                                "outputs": {**outputs, **fmeta}})
+                                                "outputs": {**outputs, **fmeta,
+                                                            "next_outline_ready": True,
+                                                            "verdict_pending": not _pending_sess.done_event.is_set()}})
                                     return
                                 # 仅一章：视为"末章" → 自动开新小说
                                 switch_guard += 1
                                 if switch_guard >= 5:
+                                    # 无下一章（末章/单章）→ 输入框不显示
                                     yield _sse({"event": "done",
-                                                "outputs": {**outputs, **fmeta}})
+                                                "outputs": {**outputs, **fmeta,
+                                                            "next_outline_ready": False}})
                                     return
                                 logger.warning("STREAM 单章小说收尾，自动开新小说 s=%d", _sn)
                                 current_case_content = ""
@@ -4265,74 +4699,44 @@ async def generate_story(data: StoryInputData, request: Request):
                             fmeta["choice_3"] = _c3
 
                             if _is_last:
-                                # 本段是老小说"末章"（大纲耗尽），流程会在同一条 worker 内
-                                # 自动开新小说 → 不立刻单章落库；把"老小说结尾"暂存为 lead，
-                                # 待新小说(ch1+大纲)完整后由整本原子落库与它【同一条写事务】提交，
-                                # 保证"老结尾 + 新小说"同生共死：要么都在、要么都不在。
-                                # （否则两个提交之间被新设备顶掉 → 老结尾已落、新小说被拒，
-                                #   数据库停留在"末章有正文却无下一章占位"的无输入框死胡同。）
-                                logger.warning(
-                                    "STREAM 老小说末章 s=%d ch=%d 暂存 lead，待与新小说原子落库",
-                                    _sn, _ch)
-                                _defer_lead = {
-                                    "script_no": _sn,
-                                    "chapter": _ch,
-                                    "content": final_segment,
-                                    "settings": settings,
-                                    "meta": dict(meta),
-                                    "choice_1": _c1,
-                                    "choice_2": _c2,
-                                    "choice_3": _c3,
-                                }
+                                # 老小说"末章"（大纲耗尽）：其正文已完整 → 立即【逐章原子回填】；
+                                # 之后在同一条 worker 内自动开新小说（各自独立原子，不再跨本合并）。
+                                _st2 = _fill_content_row(
+                                    user_id, device_id, login_ts, _sn, _ch,
+                                    final_segment, settings, meta,
+                                    choice_1=_c1, choice_2=_c2, choice_3=_c3,
+                                )
+                                if _st2 == "conflict":
+                                    logger.warning(
+                                        "STREAM fill 口令不符（被顶掉）→ conflict s=%d ch=%d",
+                                        _sn, _ch)
+                                    yield _sse({"event": "conflict",
+                                                "reason": "multi_client"})
+                                    return
+                                if _st2 == "ok":
+                                    logger.warning(
+                                        "STREAM 末章落库 ok s=%d ch=%d len=%d",
+                                        _sn, _ch, len(final_segment))
+                                    # RAG：末章正文已落库 → 人名登记 + 原文切块嵌入
+                                    _schedule_rag_after_persist(
+                                        user_id, _sn, _ch, final_segment,
+                                        meta.get("characters") or [])
+                                else:
+                                    logger.warning(
+                                        "STREAM 末章落库失败 s=%d ch=%d", _sn, _ch)
                                 switch_guard += 1
                                 if switch_guard >= 5:
-                                    # 连续自动开新小说已达护栏上限，不再开下一本：
-                                    # 老小说到此确实收尾 → 把暂存的末章单独落库并收尾。
-                                    _st2 = _fill_content_row(
-                                        user_id, device_id, login_ts,
-                                        _defer_lead["script_no"],
-                                        _defer_lead["chapter"],
-                                        _defer_lead["content"],
-                                        _defer_lead["settings"],
-                                        _defer_lead["meta"],
-                                        choice_1=_defer_lead["choice_1"],
-                                        choice_2=_defer_lead["choice_2"],
-                                        choice_3=_defer_lead["choice_3"],
-                                    )
-                                    if _st2 == "conflict":
-                                        logger.warning(
-                                            "STREAM fill 口令不符（被顶掉）→ conflict s=%d ch=%d",
-                                            _sn, _ch)
-                                        yield _sse({"event": "conflict",
-                                                    "reason": "multi_client"})
-                                        return
-                                    if _st2 == "ok":
-                                        logger.warning(
-                                            "STREAM 末章单独落库 ok s=%d ch=%d len=%d",
-                                            _sn, _ch, len(final_segment))
-                                        # RAG：末章正文已落库 → 人名登记 + 原文切块嵌入
-                                        _schedule_rag_after_persist(
-                                            user_id, _sn, _ch, final_segment,
-                                            meta.get("characters") or [])
-                                    else:
-                                        logger.warning(
-                                            "STREAM 末章单独落库失败 s=%d ch=%d", _sn, _ch)
-                                    _defer_lead = None
+                                    # 无下一章（末章）→ 输入框不显示
                                     yield _sse({"event": "done",
-                                                "outputs": {**outputs, **fmeta}})
+                                                "outputs": {**outputs, **fmeta,
+                                                            "next_outline_ready": False}})
                                     return
                                 logger.warning(
-                                    "STREAM 大纲耗尽（末章暂存），自动开新小说 s=%d", _sn)
+                                    "STREAM 大纲耗尽（末章已落库），自动开新小说 s=%d", _sn)
                                 current_case_content = ""
                                 async for _ev in _open_novel_events(_sn + 1):
                                     yield _sse(_ev)
                                 if pre_case_meta is None:
-                                    # 新小说没能开起来：守"同生共死"，暂存末章一并放弃（不落库）。
-                                    # 本请求无 done → App 走网络异常重启 → 以数据库为准回退到
-                                    # chN-1 + chN 占位 → 用户可重续 chN，不丢故事也不留半截状态。
-                                    logger.warning(
-                                        "STREAM 开新小说失败，暂存末章一并放弃（原子）s=%d", _sn)
-                                    _defer_lead = None
                                     return
                                 segment_ended = True
                                 break
@@ -4364,7 +4768,9 @@ async def generate_story(data: StoryInputData, request: Request):
                                     meta.get("characters") or [])
                             segment_ended = True
                             logger.warning("STREAM done (options) s=%d ch=%d", _sn, _ch)
-                            yield _sse({"event": "done", "outputs": {**outputs, **fmeta}})
+                            # 非末章：下一章大纲占位已在库 → 输入框可显示
+                            yield _sse({"event": "done", "outputs": {
+                                **outputs, **fmeta, "next_outline_ready": True}})
                             return
 
                         elif etype in ("error", "workflow_failed"):
@@ -4390,7 +4796,10 @@ async def generate_story(data: StoryInputData, request: Request):
                                 _defer_lead = None
                             # 未收到 workflow_finished（无氛围等推演输出），按新规则不落库，仅推送正文
                             logger.warning("STREAM fallback skip persist (无氛围) final_len=%d", len(full_text))
-                            yield _sse({"event": "done", "outputs": {**outputs, **meta}})
+                            _next_ready = _find_placeholder(
+                                user_id, _sn, _ch + 1) is not None
+                            yield _sse({"event": "done", "outputs": {
+                                **outputs, **meta, "next_outline_ready": _next_ready}})
                         else:
                             logger.warning("STREAM fallback empty_output full_len=%d sent_first=%s", len(full_text), sent_first)
                             yield _sse({"event": "error", "code": "empty_output", "message": "服务器未返回有效的小说正文，请检查额度是否已用尽，或稍后重试"})
@@ -4432,6 +4841,24 @@ async def generate_story(data: StoryInputData, request: Request):
                 _gen_release(user_id, device_id, login_ts)
 
         worker = asyncio.create_task(_pump())
+        # 生成 worker 存活期间持续每 15s 给 App 推一次心跳：只要服务器还在等 Dify /
+        # 审核 / 修正确认（即 worker 未结束），App 就能持续收到正面信号、其 30s 空闲
+        # 计时被不断重置——哪怕 Dify 正文尚不足一个审核窗口（<400 字）也不会被误判"断网"。
+        # worker 结束后本 ticker 随 worker.done() 退出，不再发心跳；若 Dify 真停发超过
+        # 30s，httpx 读超时会让 _generate_sse 正常收尾（queue None）→ 客户端收不到 done
+        # 走既有"疑似断网/重启"逻辑，不会因此无限等。
+        async def _heartbeat_ticker():
+            try:
+                while not worker.done():
+                    await asyncio.sleep(15)
+                    if worker.done():
+                        return
+                    await queue.put(_sse({"event": "heartbeat",
+                                          "message": "生成进行中"}))
+            except asyncio.CancelledError:
+                pass
+
+        hb = asyncio.create_task(_heartbeat_ticker())
         try:
             while True:
                 item = await queue.get()
@@ -4441,6 +4868,8 @@ async def generate_story(data: StoryInputData, request: Request):
         finally:
             # 客户端断联：标记并【不取消】后台 worker，让服务器继续完成 Dify 收尾与落库。
             _conn_state["client_gone"] = True
+            if not hb.done():
+                hb.cancel()
             if not worker.done():
                 logger.info("STREAM 客户端断联，后台生成任务继续执行（不取消）")
 
@@ -4717,6 +5146,24 @@ def _dedup_story_segments_by_script(user_id: str, rows: list) -> list:
         conn.close()
 
 
+@app.get("/api/story/notice")
+async def story_notice(request: Request):
+    """轻量轮询：上一轮"开新小说"的大纲最终判定是否已到达、是否为驳回。
+
+    返回 {"rejected": bool, "pending": bool}：
+    - pending=true：大纲会话仍在写（判定尚未到达）→ App 继续轮询；
+    - rejected=true：判定为"非 true"，该本小说已被服务器【立即原子删除】→
+      App 立刻弹"尺度过大，请重新生成"对话框打断用户。读取即消费（只弹一次）。
+    """
+    token = _extract_token(None, request)
+    claims = validate_token(token)
+    user_id = claims["user_id"]
+    rejected = _consume_rejection(user_id) is not None
+    if rejected:
+        logger.warning("NOTICE App 取走迟到驳回通知 user=%s", user_id[:8])
+    return {"rejected": rejected, "pending": _outline_busy(user_id)}
+
+
 @app.get("/api/story")
 async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     """获取该用户的小说正文数组（每段一行，seq 即数组下标）。
@@ -4732,6 +5179,24 @@ async def story_get(request: Request, before_seq: int = -1, limit: int = 0):
     user_id = claims["user_id"]
     device_id = claims["device_id"]
     _enforce_active_device(user_id, device_id)
+    # ---- 启动校验：当前（最新）脚本必须【恰好】OUTLINE_MAX_CHAPTERS 章 ----
+    # 前缺/后缺都算不足 → 原子删除该脚本全部条目（写入可分批，删除必须原子），
+    # 再由下面的 next_needed 逻辑决定：有更老完本 → 自动开新小说；无储备 → 回设置重来。
+    # 仅在“初始拉取”（before_seq<0；非向上懒加载更早段）时执行，避免懒加载误删。
+    # 注意：不因"有会话在写"而跳过——App 每次启动都会 device/activate 铸新 login_ts，
+    # 旧会话的落库已被写者守卫全部拒绝（写不进任何数据），所以"还在写所以不能校验"
+    # 不成立；残缺本就该在这里被清掉（重启后不全就全删）。
+    if before_seq < 0:
+        _s_latest = _latest_script_no(user_id)
+        if _s_latest is not None:
+            _cnt = _count_script_chapters(user_id, _s_latest)
+            if _cnt != OUTLINE_MAX_CHAPTERS:
+                logger.warning(
+                    "STORY 启动校验：脚本 %d 章节数 %d != %d → 原子删除",
+                    _s_latest, _cnt, OUTLINE_MAX_CHAPTERS,
+                )
+                _delete_script_rows(user_id, device_id, claims.get("login_ts"),
+                                    _s_latest)
     conn = _db()
     try:
         if limit > 0 and before_seq >= 0:

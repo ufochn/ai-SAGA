@@ -25,6 +25,9 @@ import 'package:ai_saga/logic/storage_service.dart';
 import 'package:ai_saga/logic/story_service.dart';
 import 'package:ai_saga/logic/sync_service.dart';
 import 'package:ai_saga/logic/security_service.dart';
+import 'package:ai_saga/logic/sound_service.dart';
+import 'package:ai_saga/logic/text_width.dart';
+import 'package:ai_saga/widgets/novel_launch_progress.dart';
 import 'package:ai_saga/widgets/setup_confirmation_page.dart';
 
 /// 上插更早内容时用于"无闪"补偿的滚动控制器。
@@ -181,7 +184,7 @@ class HomeContent extends StatefulWidget {
 }
 
 class _HomeContentState extends State<HomeContent>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final _CompensatingScrollController _scrollController =
       _CompensatingScrollController();
   late final PageController _pageController;
@@ -207,6 +210,9 @@ class _HomeContentState extends State<HomeContent>
   bool _blackoutBarsDark = false;
   bool _blackoutBarsApplied = false;
 
+  /// 是否已收到首段正文（置 true 后等待屏切 100% + "接收完毕"并淡出揭示正文）。
+  bool _launchContentReady = false;
+
   /// 流式小说正文：每次生成的内容单独存为数组的一个元素。
   final List<String> _storyTexts = [];
 
@@ -231,6 +237,12 @@ class _HomeContentState extends State<HomeContent>
 
   /// 上一次从服务器拉取更早内容的时刻（用于防止一次上滑连发多批拉取）
   DateTime _lastServerLoad = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 冷启动后待恢复的阅读位置：文档底部之上多少像素（-1 = 无/无需恢复）
+  double _pendingRestoreFromBottom = -1;
+
+  /// 保存阅读位置的节流计时器（滚动时防抖写盘）
+  Timer? _savePosDebounce;
 
   /// 冷启动同步门禁：为 true 时正在从服务器拉取数据（暂不开放后续功能）
   bool _startupSyncing = false;
@@ -280,6 +292,19 @@ class _HomeContentState extends State<HomeContent>
   /// 后续生成期间保持可见（仅灰化禁用），不再随流式阶段消失。
   bool _storyInputsShown = false;
 
+  /// 下一章大纲是否已就位（服务器 done 事件带 next_outline_ready）：
+  /// 未就位时即使本轮已收到推荐，也【不显示】底部三个输入框，避免用户在下一章
+  /// 大纲尚未落库时点击继续，被误判为“末章”而开启新小说。缺省 true（向后兼容）。
+  bool _nextOutlineReady = true;
+
+  /// 迟到判定轮询：第 1 章正文已 done（本次生成请求已结束），但大纲的【最终合规
+  /// 判定】要等整份大纲流完（约 1~1.5 分钟）才到。App 无推送通道，故每 4 秒轻量问
+  /// 一次服务器；判定一到且为"非 true"（服务器已【立即】原子删除该本小说）就立刻
+  /// 弹"尺度过大"对话框打断用户。
+  Timer? _verdictPollTimer;
+  DateTime? _verdictPollDeadline;
+  bool _outlineRejectedHandled = false;
+
   /// 启动自愈"自动开新小说"是否已触发过：仅本次会话触发一次，
   /// 避免同步重试/重建时重复自动发起生成。
   bool _autoNextNovelStarted = false;
@@ -306,6 +331,7 @@ class _HomeContentState extends State<HomeContent>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_onScroll);
 
     // 新/老用户判定以服务器为准：所有用户冷启动都先到服务器验证身份。
@@ -346,6 +372,8 @@ class _HomeContentState extends State<HomeContent>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _savePosDebounce?.cancel();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _pageController.dispose();
@@ -353,15 +381,27 @@ class _HomeContentState extends State<HomeContent>
     _blackoutController.dispose();
     _transitionStepTimer?.cancel();
     _restoreSystemBars();
+    _verdictPollTimer?.cancel();
     _choice2Ctrl.dispose();
     _choice3Ctrl.dispose();
     _streamedSegmentHeight.dispose();
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 切后台/被杀前保存当前阅读位置，便于下次打开接续
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      _saveReadingPosition();
+    }
+  }
+
   /// 滚动监听：向上滚动到顶部时，若仍有更早的内容则平滑加载到当前内容上方
   void _onScroll() {
     if (!_scrollController.hasClients || _loadingPrevious) return;
+    _scheduleSaveReadingPosition(); // 阅读位置防抖保存
     // 已在最顶部且还有更早内容（内存未揭示完或服务器还有更早段）时才加载
     if (_visibleStartIndex <= 0 && _storyStartIndex <= 0) return;
     final double pixels = _scrollController.position.pixels;
@@ -490,6 +530,70 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
+  /// 阅读位置存储 key（按设备唯一标识隔离，避免多账号互相覆盖）
+  String get _readingPosKey =>
+      'reading_pos_${StorageService.getUserUniqueId()}';
+
+  /// 保存当前阅读位置：记录"文档底部之上多少像素"，以及最新一段的绝对 seq，
+  /// 供下次打开校验故事未变后恢复。
+  void _saveReadingPosition() {
+    if (!mounted || !_scrollController.hasClients) return;
+    if (_setupStep != 5 || _storyTexts.isEmpty) return;
+    // 生成中不定稿：不保存半截/中间态位置
+    if (_storyStreaming) return;
+    final double fromBottom =
+        (_scrollController.position.maxScrollExtent -
+                _scrollController.position.pixels)
+            .clamp(0.0, double.infinity);
+    final int latestAbs = _storyStartIndex + _storyTexts.length - 1;
+    StorageService.saveLocalString(
+      _readingPosKey,
+      '$latestAbs|${fromBottom.toStringAsFixed(1)}',
+    );
+  }
+
+  /// 滚动期间防抖保存阅读位置（约 1.2s 一次）
+  void _scheduleSaveReadingPosition() {
+    _savePosDebounce?.cancel();
+    _savePosDebounce = Timer(const Duration(milliseconds: 1200), () {
+      if (!mounted) return;
+      _saveReadingPosition();
+    });
+  }
+
+  /// 冷启动恢复阅读位置：把视野拉回上次退出时位置（距文档底部 [fromBottom] 像素）。
+  /// 若该位置比冷启动尾部窗口还靠前，会自动分批上拉加载更早章节直到够到。
+  Future<void> _restoreReadingPosition(double fromBottom) async {
+    if (!mounted) return;
+    // 1) 先把内存里已加载的更早段全部揭示出来（不请求服务器）
+    if (_visibleStartIndex != 0 && _storyTexts.isNotEmpty) {
+      setState(() {
+        _visibleStartIndex = 0;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+    }
+    // 2) 视野要落的位置若比当前窗口更靠前：分批上拉更早内容，直到高度够或到小说开头
+    int guard = 0;
+    while (guard++ < 50 && mounted && _scrollController.hasClients) {
+      final double max = _scrollController.position.maxScrollExtent;
+      if (max + 2 >= fromBottom || _storyStartIndex <= 0) break;
+      final int beforeStart = _storyStartIndex;
+      await _loadPreviousSegment();
+      // 等布局更新（最多约 1.2s）
+      for (int i = 0; i < 20; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+        if (!mounted || !_scrollController.hasClients) return;
+        if (_scrollController.position.maxScrollExtent + 2 >= fromBottom) break;
+        if (!_loadingPrevious && _storyStartIndex == beforeStart) break;
+      }
+      if (!_loadingPrevious && _storyStartIndex == beforeStart) break;
+    }
+    if (!mounted || !_scrollController.hasClients) return;
+    final double max = _scrollController.position.maxScrollExtent;
+    _scrollController.jumpTo((max - fromBottom).clamp(0.0, max));
+    _scheduleSaveReadingPosition(); // 若被 clamp 到边界，落定后写回正确值
+  }
+
   /// 冷启动同步门禁：上传公钥 → 服务器更新硬件公钥 → 拉取全部数据单方面刷新本地。
   /// 成功后用同步后的数据重建内存；失败显示错误并提供重试。
   Future<void> _performStartupSync() async {
@@ -527,15 +631,21 @@ class _HomeContentState extends State<HomeContent>
                 ? snap.scriptIds[i]
                 : '');
           }
-          // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）
+          // 恢复每段对应的"用户本轮实际选择"节点（跨重启持久；未选择为空）。
+          // 注意：最新一段（数组最后一个）若带着 user_choice，说明那是"上一次生成失败、
+          // 正文未产出"时写入的悬空选择（成功续写后该段不再是最后一段，其选择才有下文）。
+          // 重启后新文本既然没有出现，就不应再显示那次失败的选择 → 跳过最新一段。
           _choices.clear();
+          final int newestAbs = _storyStartIndex + snap.segments.length - 1;
           for (int i = 0; i < snap.segments.length; i++) {
+            final int segAbs = _storyStartIndex + i;
             final uc = i < snap.userChoices.length ? snap.userChoices[i] : '';
+            if (segAbs == newestAbs) continue; // 悬空选择：其新文本未产出，不显示
             if (uc.trim().isNotEmpty) {
               _choices.add(
                 _ChoiceRecord(
                   text: uc,
-                  segmentIndex: _storyStartIndex + i,
+                  segmentIndex: segAbs,
                   startOffset: 0,
                 ),
               );
@@ -545,18 +655,13 @@ class _HomeContentState extends State<HomeContent>
             _sessionStreamStartIndex = _storyTexts.length;
             _visibleStartIndex = _storyTexts.length - 1;
           }
-          // 用最新一段的推荐选择（choice_2/3）预填第 2、3 个输入框；
-          // 第 1 个输入框保持空白（自由输入，不预填）
-          if (snap.choices.isNotEmpty) {
-            final lastChoices = snap.choices.last;
-            final c2 = lastChoices.length > 1 ? lastChoices[1] : '';
-            final c3 = lastChoices.length > 2 ? lastChoices[2] : '';
-            _choice2Ctrl.text = c2;
-            _inputChoice2 = c2;
-            _choice3Ctrl.text = c3;
-            _inputChoice3 = c3;
-          }
-          // 推荐选择已就绪：标记为已有并激活输入区，最新段输入框可显示
+          // 第 2/3 个输入框（主角想说 / 主角想做）不预填：默认为空。
+          // 用户想输入就输入；不输入则点"继续生成后面情节"（空 user_input 续写）。
+          _choice2Ctrl.clear();
+          _inputChoice2 = '';
+          _choice3Ctrl.clear();
+          _inputChoice3 = '';
+          // 输入区已就绪：标记为已有并激活输入区，最新段输入区可显示
           _hasRecommendedActions = true;
           _storyInputsShown = true;
           _setupStep = 5;
@@ -581,11 +686,37 @@ class _HomeContentState extends State<HomeContent>
         _startupSyncError = null;
       });
       if (isOldUser) {
+        // 读取上次阅读位置：故事未变（最新一段绝对 seq 一致）且非"需要自动开新小说"
+        // 时才恢复，让打开后仍停留在上次退出时看到的内容。
+        _pendingRestoreFromBottom = -1;
+        final String? saved = StorageService.getLocalString(_readingPosKey);
+        if (saved != null) {
+          final parts = saved.split('|');
+          if (parts.length == 2) {
+            final savedLatest = int.tryParse(parts[0]);
+            final savedFromBottom = double.tryParse(parts[1]);
+            final int currentLatest =
+                _storyStartIndex + _storyTexts.length - 1;
+            if (savedLatest != null &&
+                savedLatest == currentLatest &&
+                savedFromBottom != null &&
+                savedFromBottom > 0 &&
+                !snap.nextNeeded) {
+              _pendingRestoreFromBottom = savedFromBottom;
+            }
+          }
+        }
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients) {
-            // 重启回到正文页：让最后一段文本的首行顶到屏幕最上方。
-            // 有"上拉加载更早"空白区（_storyStartIndex>0）时跳过该空白区，
-            // 否则回到顶部；内容不足一屏时 maxScrollExtent 为 0，落在 0 即可。
+          if (!_scrollController.hasClients) return;
+          if (_pendingRestoreFromBottom >= 0) {
+            // 有可恢复的阅读位置：回到上次退出时看到的内容
+            final double d = _pendingRestoreFromBottom;
+            _pendingRestoreFromBottom = -1;
+            _restoreReadingPosition(d);
+          } else {
+            // 兜底（无记录/故事已更新/需自动开新小说）：让最后一段文本的首行
+            // 顶到屏幕最上方。有"上拉加载更早"空白区（_storyStartIndex>0）时跳过
+            // 该空白区，否则回到顶部；内容不足一屏时 maxScrollExtent 为 0，落在 0 即可。
             final double target = _storyStartIndex > 0
                 ? _earlierPullHeight
                 : 0.0;
@@ -721,14 +852,61 @@ class _HomeContentState extends State<HomeContent>
   /// 占位回调（LightAuthPage 授权完成后由 push 返回值触发重试）。
   static void _dummyAuthComplete() {}
 
-  /// 是否显示正文下方的三个输入框：
+  /// 第 1 个按钮（原第 1 个输入框位置，已无输入框）："继续生成后面情节"。
+  /// 点击即以空 user_input 续写——服务器按已落库的下一章大纲生成后续情节。
+  /// 生成/接收中置灰禁用（视觉与输入框内的按钮完全一致）。
+  Widget _buildContinuePlotButton() {
+    final isDark = AppTheme.isDark(context);
+    final bool canPress = !_storyStreaming;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Opacity(
+        opacity: canPress ? 1.0 : 0.4,
+        child: SizedBox(
+          height: 44,
+          width: double.infinity,
+          child: CupertinoButton.filled(
+            onPressed: canPress
+                ? () {
+                    SoundService.playConfirm();
+                    // 空 user_input：直接按下一章大纲续写
+                    _onContinueWithoutInput();
+                  }
+                : null,
+            borderRadius: BorderRadius.circular(10),
+            padding: EdgeInsets.zero,
+            // 禁用时也用蓝色填充（靠外层 Opacity 整体变淡）
+            color: isDark ? AppTheme.buttonFillDark : AppTheme.buttonFillLight,
+            disabledColor: isDark
+                ? AppTheme.buttonFillDark
+                : AppTheme.buttonFillLight,
+            child: Text(
+              _getContinuePlotButtonText(),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.buttonText,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 是否显示正文下方的输入区（按钮"继续生成后面情节" + 两个输入框）：
   /// - 已有正文且输入区已激活（_storyInputsShown）：保持可见；
-  /// - 生成/接收中：保持可见，但输入框与按钮置灰禁用（不消失、不可输入/点击）；
+  /// - 生成/接收中：保持可见，但按钮与输入框置灰禁用（不消失、不可输入/点击）；
   /// - 正文彻底显示完成（收到 done）或违规中止：可见、可输入；
   /// - 尚无正文（首次生成前）或输入区尚未激活：隐藏。
   bool get _storyInputsVisible =>
       _storyTexts.isNotEmpty &&
       _storyInputsShown &&
+      // 新增硬条件：下一章大纲必须已就位，否则不显示输入框
+      // （避免下一章大纲尚未落库时用户点继续 → 误判末章 → 开启新小说）。
+      _nextOutlineReady &&
       // 新一段生成中/打字未完成：先不显示其输入框。
       // 注意 _storyTyped 会在"首段450字打完、reveal 后半段还没来"时短暂为 true，
       // 所以必须同时要求 _storyStreaming 已结束（收到 done）才显示，避免闪烁。
@@ -741,11 +919,17 @@ class _HomeContentState extends State<HomeContent>
     return (h / 4).clamp(80.0, 280.0);
   }
 
-  void _onInput1Confirm(String text) => _continueStory(text);
+  /// 第 1 个按钮"继续生成后面情节"：无输入框，user_input 为空
+  /// （直接按已落库的下一章大纲生成后续情节）。
+  void _onContinueWithoutInput() => _continueStory('', allowEmptyInput: true);
 
-  void _onInput2Confirm(String text) => _continueStory(text);
+  /// 第 2 个输入框（主角想说：）：user_input = "主角想说：" + 用户输入
+  void _onInput2Confirm(String text) =>
+      _continueStory('${_getSayPrefixText()}${text.trim()}');
 
-  void _onInputConfirm(String text) => _continueStory(text);
+  /// 第 3 个输入框（主角想做：）：user_input = "主角想做：" + 用户输入
+  void _onInputConfirm(String text) =>
+      _continueStory('${_getDoPrefixText()}${text.trim()}');
 
   /// 收到服务器返回的后续变量后，把两个推荐选择（choice_2/3，LLM② 推荐的两项行动）
   /// 分别填入第 2、3 个输入框（覆盖上一轮的旧推荐）；LLM 未返回正常值时由服务器
@@ -756,20 +940,30 @@ class _HomeContentState extends State<HomeContent>
     final choice2 = outputs['choice_2'] as String? ?? '';
     final choice3 = outputs['choice_3'] as String? ?? '';
     final got = choice2.isNotEmpty || choice3.isNotEmpty;
+    // 服务器 done 事件携带“下一章大纲是否已就位”；缺省不改（沿用上次/默认 true）
+    final nro = outputs['next_outline_ready'];
+    if (nro is bool) _nextOutlineReady = nro;
+    // 服务器 done 事件同时携带"大纲最终判定是否尚未到达"（verdict_pending）：
+    // 未到达 → 启动轮询，判定一旦为"非 true"（服务器已立即删库）就马上弹窗打断用户。
+    final vp = outputs['verdict_pending'];
+    if (vp is bool) {
+      if (vp) {
+        _startVerdictPolling();
+      } else {
+        _stopVerdictPolling();
+      }
+    }
     if (!mounted) return;
     setState(() {
       if (got) {
         _hasRecommendedActions = true;
-        _storyInputsShown = true; // 收到推荐即激活输入区（此后生成期间保持可见灰化）
+        // 激活输入区的前提：本轮确有推荐【且】下一章大纲已就位
+        _storyInputsShown = _nextOutlineReady;
       }
-      if (choice2.isNotEmpty && choice2 != _inputChoice2) {
-        _choice2Ctrl.text = choice2;
-        _inputChoice2 = choice2;
-      }
-      if (choice3.isNotEmpty && choice3 != _inputChoice3) {
-        _choice3Ctrl.text = choice3;
-        _inputChoice3 = choice3;
-      }
+      // 第 2/3 个输入框（主角想说 / 主角想做）不再预填推荐行动：
+      // 服务器下发的 choice_2/choice_3（Dify LLM② 推荐的两项行动）只作为该段的
+      // 选项快照保存在 _segmentChoices 中（时间树卡片可回看），两个输入框保持
+      // 空白，由用户自行输入或直接点"继续生成后面情节"。
       // 保存最新一段的 choice_1/2/3 快照（与服务器保存一致），
       // 使该段成为历史段后其输入框能显示"生成那一刻"的推荐/选项文本。
       if (_storyTexts.isNotEmpty) {
@@ -779,6 +973,65 @@ class _HomeContentState extends State<HomeContent>
     });
   }
 
+  /// 启动"迟到判定"轮询（每 4 秒一次，最多 6 分钟）。
+  ///
+  /// 只在服务器告知"本轮开新小说的大纲最终判定尚未到达"（done.verdict_pending=true）
+  /// 时启动。判定一到且为"非 true"：服务器已【立即】原子删除该本小说，这里立刻弹
+  /// "尺度过大，请重新生成"打断用户；判定通过或已离开正文页则停止轮询。
+  void _startVerdictPolling() {
+    _verdictPollTimer?.cancel();
+    _verdictPollDeadline = DateTime.now().add(const Duration(minutes: 6));
+    _verdictPollTimer = Timer.periodic(const Duration(seconds: 4), (t) async {
+      if (!mounted || _outlineRejectedHandled) {
+        t.cancel();
+        return;
+      }
+      final deadline = _verdictPollDeadline;
+      if (deadline != null && DateTime.now().isAfter(deadline)) {
+        t.cancel(); // 兜底：最多轮询 6 分钟
+        return;
+      }
+      if (_setupStep != 5) {
+        t.cancel(); // 已离开正文页（回设定/菜单）：停止轮询
+        return;
+      }
+      final notice = await StoryService.fetchStoryNotice();
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (notice == null) return; // 网络失败：下一轮再试
+      if (notice['rejected'] == true) {
+        t.cancel();
+        _onLateOutlineRejected();
+        return;
+      }
+      if (notice['pending'] != true) {
+        t.cancel(); // 判定已到且通过 → 无需再轮询
+      }
+    });
+  }
+
+  void _stopVerdictPolling() {
+    _verdictPollTimer?.cancel();
+    _verdictPollTimer = null;
+  }
+
+  /// 迟到的"大纲尺度过大"判定：该本小说已被服务器立即删除 → 立刻弹窗打断用户。
+  /// 弹窗确认后的收尾与"当场驳回"完全一致（清空服务器正文 + 重启回全新故事流程）。
+  void _onLateOutlineRejected() {
+    if (!mounted || _outlineRejectedHandled) return;
+    _outlineRejectedHandled = true;
+    setState(() {
+      _storyStreaming = false;
+      storyStreamingNotifier.value = false;
+      _storyTyped = true;
+      _hasRecommendedActions = false;
+      _storyInputsShown = false;
+    });
+    _showOutlineRejectedDialog();
+  }
+
   /// 任一输入框确认后：把输入作为 user_input，连同用户设定请求续写生成，
   /// 新内容在屏幕上接力显示（作为 _storyTexts 数组的新元素，由打字机继续揭示）。
   Future<void> _continueStory(
@@ -786,6 +1039,8 @@ class _HomeContentState extends State<HomeContent>
     // 启动自愈"自动开新小说"：true 时允许空输入（老小说已写满、数据库无新小说，
     // App 打开自动发起生成下一本），且不记录"用户选择"节点。
     bool autoNext = false,
+    // 第 1 个按钮"继续生成后面情节"：允许空 user_input（按下一章大纲续写）
+    bool allowEmptyInput = false,
     int retryDepth = 0,
     int? rewriteFrom,
     String? choice1,
@@ -793,7 +1048,11 @@ class _HomeContentState extends State<HomeContent>
     String? choice3,
   }) async {
     if (!mounted) return;
-    if (!autoNext && userInput.trim().isEmpty) return;
+    if (!autoNext && !allowEmptyInput && userInput.trim().isEmpty) return;
+    // 本轮随行上传的三个选项值：必须在下面 setState 清空/重置输入框之前取好
+    final String sendChoice1 = choice1 ?? _inputChoice1;
+    final String sendChoice2 = choice2 ?? _inputChoice2;
+    final String sendChoice3 = choice3 ?? _inputChoice3;
     // 记录本次续写开始前的段数：断流出错时据此丢弃未传完的段落
     final int preStreamLen = _storyTexts.length;
     // 新一段内容是否已作为数组新元素创建（每次续写独占一个数组元素）
@@ -832,12 +1091,12 @@ class _HomeContentState extends State<HomeContent>
       // 自动开新小说也不改写老小说末章的选项快照（保留其历史按钮显示）。
       if (!autoNext) {
         _segmentChoices[choiceSegAbs] = [
-          choice1 ?? _inputChoice1,
-          choice2 ?? _inputChoice2,
-          choice3 ?? _inputChoice3,
+          sendChoice1,
+          sendChoice2,
+          sendChoice3,
         ];
       }
-      // 时间树"从这里重写"：被重写段现在是"最新一段"，其选项改由页面底部三个输入框
+      // 时间树"从这里重写"：被重写段现在是"最新一段"，其选项改由页面底部输入框
       // 显示。把全局输入框同步为该段选项，避免残留删除前最新段的选项。
       if (rewriteFrom != null) {
         _inputChoice1 = choice1 ?? '';
@@ -845,6 +1104,14 @@ class _HomeContentState extends State<HomeContent>
         _inputChoice3 = choice3 ?? '';
         _choice2Ctrl.text = _inputChoice2;
         _choice3Ctrl.text = _inputChoice3;
+      } else if (!autoNext) {
+        // 普通续写（含"继续生成后面情节"的空输入）：本轮内容已提交并已快照，
+        // 清空底部两个输入框，使下一轮回到"为空即置灰"的默认状态。
+        _choice2Ctrl.clear();
+        _choice3Ctrl.clear();
+        _inputChoice1 = '';
+        _inputChoice2 = '';
+        _inputChoice3 = '';
       }
     });
     // 点击继续后：平滑下移半屏，为即将生成的新内容预留空白区（顶部提示 + 空白）。
@@ -865,10 +1132,11 @@ class _HomeContentState extends State<HomeContent>
     try {
       await StoryService.generateStoryStream(
         userInput: userInput,
-        // 时间树"从这里重新开始"时传入被重写段的三个输入值；否则用最新输入框的值
-        choice1: choice1 ?? _inputChoice1,
-        choice2: choice2 ?? _inputChoice2,
-        choice3: choice3 ?? _inputChoice3,
+        // 时间树"从这里重新开始"时传入被重写段的三个输入值；否则用本轮输入框的值
+        // （已在 setState 清空输入框前取好，避免取到空值）
+        choice1: sendChoice1,
+        choice2: sendChoice2,
+        choice3: sendChoice3,
         rewriteFrom: rewriteFrom,
         onDeviceConflict: _onDeviceConflict,
         onConflict: _onMultiClientConflict,
@@ -876,6 +1144,8 @@ class _HomeContentState extends State<HomeContent>
         // 大纲合规未通过：清除本次残缺内容后弹多语言提示（话术统一"尺度过大"）
         onOutlineRejected: () {
           if (!mounted) return;
+          _stopVerdictPolling();
+          _outlineRejectedHandled = true; // 已当场弹窗：禁止轮询再弹一次
           setState(() {
             if (_storyTexts.length > preStreamLen) {
               _storyTexts.removeRange(preStreamLen, _storyTexts.length);
@@ -889,8 +1159,8 @@ class _HomeContentState extends State<HomeContent>
         // 同请求内开启新的一段（老小说末章自动续 → 新小说第一章）：下段正文另起文本框
         onSegmentBegin: _onSegmentBegin,
         // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
-        onDebugPayload: (payload, requestId) {
-          _showDebugPayloadDialog(payload, requestId);
+        onDebugPayload: (payload, requestId, onUserConfirm) {
+          _showDebugPayloadDialog(payload, requestId, onUserConfirm);
         },
         onReviseConfirm: (text, verdict, requestId) {
           _showReviseConfirmDialog(text, verdict, requestId);
@@ -1512,36 +1782,34 @@ class _HomeContentState extends State<HomeContent>
                                 child: Column(
                                   children: [
                                     const SizedBox(height: 12),
-                                    TextInputPanel(
-                                      placeholder: _getFirstInputPlaceholder(),
-                                      confirmText:
-                                          _getLatestContinueButtonText(),
-                                      buttonBelow: true,
-                                      disabled: _storyStreaming,
-                                      onConfirm: _onInput1Confirm,
-                                      onChanged: (v) => _inputChoice1 = v,
-                                    ),
+                                    // 第 1 个输入框已去掉：改为纯按钮"继续生成后面情节"，
+                                    // 点击即以空 user_input 续写（按下一章大纲生成后续情节）
+                                    _buildContinuePlotButton(),
                                     const SizedBox(height: 12),
+                                    // 第 2 个输入框：前缀"主角想说："，默认空
                                     TextInputPanel(
-                                      placeholder:
-                                          _getRecommendedActionPlaceholder(),
+                                      label: _getSayPrefixText(),
+                                      placeholder: _getInputPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
                                       disabled: _storyStreaming,
                                       controller: _choice2Ctrl,
+                                      overLimitCheck: isStoryInputOverLimit,
                                       onConfirm: _onInput2Confirm,
                                       onChanged: (v) => _inputChoice2 = v,
                                     ),
                                     const SizedBox(height: 12),
+                                    // 第 3 个输入框：前缀"主角想做："，默认空
                                     TextInputPanel(
-                                      placeholder:
-                                          _getRecommendedActionPlaceholder(),
+                                      label: _getDoPrefixText(),
+                                      placeholder: _getInputPlaceholder(),
                                       confirmText:
                                           _getLatestContinueButtonText(),
                                       buttonBelow: true,
                                       disabled: _storyStreaming,
                                       controller: _choice3Ctrl,
+                                      overLimitCheck: isStoryInputOverLimit,
                                       onConfirm: _onInputConfirm,
                                       onChanged: (v) => _inputChoice3 = v,
                                     ),
@@ -1571,63 +1839,14 @@ class _HomeContentState extends State<HomeContent>
             child: AnimatedBuilder(
               animation: _blackoutController,
               builder: (context, _) {
-                final double v = _blackoutController.value; // 0..1，共 15s
-                // 黑屏不透明度：0-4/15（4s）渐入全黑；4/15-11/15（7s）保持全黑；
-                // 11/15-1（4s）渐亮。
-                // 注意：transform 入参必须 clamp 到 [0,1]——动画末尾 v=1 或 t=1 时，
-                // 除减法的浮点精度会算出 1.0000000000000002 / -2.2e-16 这类越界值，
-                // Curves.easeInOut.transform 会断言失败，在 debug 模式整屏闪红。
-                final double blackOpacity;
-                if (v <= 4 / 15) {
-                  blackOpacity = Curves.easeInOut.transform(
-                    (v / (4 / 15)).clamp(0.0, 1.0),
-                  );
-                } else if (v <= 11 / 15) {
-                  blackOpacity = 1.0;
-                } else {
-                  blackOpacity =
-                      1 -
-                      Curves.easeInOut.transform(
-                        ((v - 11 / 15) / (4 / 15)).clamp(0.0, 1.0),
-                      );
-                }
-                // 提示文字不透明度：仅 4/15-2/3（6s）内先渐显、再渐隐。
-                double textOpacity = 0.0;
-                if (v >= 4 / 15 && v <= 2 / 3) {
-                  final double t = (v - 4 / 15) / (2 / 5);
-                  if (t < 0.3) {
-                    textOpacity = Curves.easeInOut.transform(
-                      (t / 0.3).clamp(0.0, 1.0),
-                    );
-                  } else if (t <= 0.7) {
-                    textOpacity = 1.0;
-                  } else {
-                    textOpacity = Curves.easeInOut.transform(
-                      (1 - (t - 0.7) / 0.3).clamp(0.0, 1.0),
-                    );
-                  }
-                }
+                final double a = _blackoutController.value.clamp(0.0, 1.0);
+                // 整层黑度随动画淡入/淡出：等待期间 a=1（全黑 + 进度条/分阶段文案）；
+                // 收到首段正文后由 _onLaunchContentReady 触发 a 从 1→0 渐亮揭示正文。
                 return Opacity(
-                  opacity: blackOpacity,
+                  opacity: a,
                   child: ColoredBox(
                     color: CupertinoColors.black,
-                    child: Center(
-                      child: Opacity(
-                        opacity: textOpacity,
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 32),
-                          child: Text(
-                            _getEnteringWorldText(),
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: CupertinoColors.white,
-                              fontSize: 18,
-                              height: 1.6,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
+                    child: NovelLaunchProgress(completed: _launchContentReady),
                   ),
                 );
               },
@@ -1662,6 +1881,9 @@ class _HomeContentState extends State<HomeContent>
     if (!mounted) return;
     // 重新生成时中止上一次可能残留的"进入你的世界"动画（取消切页计时、停止黑屏动画）
     _abortBlackoutTransition();
+    // 全新生成：停掉上一轮的"迟到判定"轮询并复位标记
+    _stopVerdictPolling();
+    _outlineRejectedHandled = false;
 
     setState(() {
       _storyTexts.clear();
@@ -1679,25 +1901,29 @@ class _HomeContentState extends State<HomeContent>
       _storyInputsShown = false; // 全新生成：输入区先隐藏，待首轮收到推荐后再激活
       _streamedSegmentHeight.value = 0; // 新正文从 0 高度开始测量
     });
-    // 启动"进入你的世界"动画：4s 渐黑 → 6s 文字渐显渐隐 → 1s 全黑 → 4s 渐亮。
-    // 期间 LLM 照常生成（onChunk 等只负责正文数据与打字机，不干预黑屏动画）。
-    // 动画期间把系统状态栏/导航栏设为深色，避免纯黑背景下系统栏露出亮条。
+    // 启动"等待首段正文"的全黑进度屏（替代原固定 15s 动画）：0.7s 快速渐入全黑后，
+    // 持续显示进度条 + 分阶段文案（时间脚本约 2 分钟上限，因 40 章大纲 + 首章正文
+    // 可能耗时较长）。期间 LLM 照常生成（onChunk 等只负责正文数据与打字机，不干预
+    // 黑屏）；收到首段正文（onChunk/onReveal → _onLaunchContentReady）才切 100% 并
+    // 渐亮揭示；若超过 30s 无任何数据/心跳由 story 层 onStalled 判定断联并中止
+    // （走 _abortBlackoutTransition，弹现有"疑似断网"弹窗）。
+    _launchContentReady = false;
     _applyBlackoutSystemBars();
-    // 黑屏期间隐藏右上角菜单按钮，随"渐亮"阶段与屏幕一起淡入（不破坏全黑沉浸）
+    // 黑屏期间隐藏右上角菜单按钮，随揭示渐亮与屏幕一起淡入（不破坏全黑沉浸）
     menuRevealNotifier.value = 0.0;
+    _blackoutController.removeListener(_onBlackoutTick);
     _blackoutController.addListener(_onBlackoutTick);
-    _blackoutController.forward().whenComplete(() {
-      if (!mounted) return;
-      _blackoutController.removeListener(_onBlackoutTick);
-      menuRevealNotifier.value = 1.0;
-      _restoreSystemBars();
-      setState(() {
-        _blackoutActive = false;
-      });
-    });
-    // 第 6 秒（已全黑）切入正式主页面：此刻黑屏已稳定完全不透明，AnimatedSwitcher
-    // 对设置确认页的交叉淡出被盖住（设置页不闪回），随后渐亮直接露出正文。
-    _transitionStepTimer = Timer(const Duration(seconds: 6), () {
+    _blackoutController.value = 0.0;
+    // 0.7s 快速渐入全黑（期间盖住设置确认页）
+    _blackoutController.animateTo(
+      1.0,
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeInOut,
+    );
+    // 全黑稳定后切入正式主页面：黑屏已完全不透明，AnimatedSwitcher 对设置确认页的
+    // 交叉淡出被盖住（设置页不闪回）；正文一到即可在渐亮中露出。
+    _transitionStepTimer?.cancel();
+    _transitionStepTimer = Timer(const Duration(milliseconds: 900), () {
       if (!mounted) return;
       setState(() {
         _setupStep = 5;
@@ -1725,13 +1951,14 @@ class _HomeContentState extends State<HomeContent>
         onConflict: _onMultiClientConflict,
         onStalled: _onStreamStalled,
         // 【调试】服务器调 Dify 前先把 payload 发回 App 弹窗，确认后才放行
-        onDebugPayload: (payload, requestId) {
-          _showDebugPayloadDialog(payload, requestId);
+        onDebugPayload: (payload, requestId, onUserConfirm) {
+          _showDebugPayloadDialog(payload, requestId, onUserConfirm);
         },
         onReviseConfirm: (text, verdict, requestId) {
           _showReviseConfirmDialog(text, verdict, requestId);
         },
-        // 大纲合规未通过：清除本次残缺内容后弹多语言提示（话术统一"尺度过大"）
+        // 大纲合规未通过：清除本次残缺内容后弹多语言提示（话术统一"尺度过大"）；
+        // 先结束等待黑屏（进度屏），让弹窗显示在正文主页面之上。
         onOutlineRejected: () {
           if (!mounted) return;
           setState(() {
@@ -1742,11 +1969,16 @@ class _HomeContentState extends State<HomeContent>
             storyStreamingNotifier.value = false;
             _storyTyped = true;
           });
+          _abortBlackoutTransition();
           _showOutlineRejectedDialog();
         },
         onChunk: (text) {
           if (!mounted) return;
-          if (text.trim().isNotEmpty) hadContent = true;
+          if (text.trim().isNotEmpty) {
+            hadContent = true;
+            // 收到首段正文：结束等待屏（切 100% + 渐亮揭示），幂等
+            _onLaunchContentReady();
+          }
           setState(() {
             if (_storyTexts.isEmpty) {
               // 首次生成：正文存入数组下标 0
@@ -1760,7 +1992,11 @@ class _HomeContentState extends State<HomeContent>
         },
         onReveal: (text, outputs) {
           if (!mounted) return;
-          if (text.trim().isNotEmpty) hadContent = true;
+          if (text.trim().isNotEmpty) {
+            hadContent = true;
+            // 收到首段正文：结束等待屏（切 100% + 渐亮揭示），幂等
+            _onLaunchContentReady();
+          }
           // 剩余部分不再一次性显示，由打字机以不断加速的方式接续打出
           setState(() {
             if (_storyTexts.isEmpty) {
@@ -1910,20 +2146,51 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 黑屏动画每帧回调：在"渐亮"阶段（最后 4s，v 从 11/15 → 1）把右上角菜单按钮
-  /// 的不透明度同步到内容亮度，随屏幕一起淡入。
+  /// 黑屏动画每帧回调：把右上角菜单按钮的不透明度与黑屏层亮度反向同步
+  /// （黑屏越黑菜单越隐；渐亮揭示时随屏幕一起淡入）。
   void _onBlackoutTick() {
-    final double v = _blackoutController.value;
-    final double t = ((v - 11 / 15) / (4 / 15)).clamp(0.0, 1.0);
-    menuRevealNotifier.value = Curves.easeInOut.transform(t).clamp(0.0, 1.0);
+    final double v = _blackoutController.value.clamp(0.0, 1.0);
+    menuRevealNotifier.value = (1.0 - v).clamp(0.0, 1.0);
   }
 
-  /// 中止"进入你的世界"动画（出错/违规/卡死时立即结束黑屏，不再等完整 15s 走完）。
+  /// 收到首段正文（打字机流开始）：等待屏切 100% + "接收完毕，精彩现在开始"，
+  /// 短暂停留后把黑屏层从 1→0 渐亮揭示正文（此后正文直接显示）。
+  void _onLaunchContentReady() {
+    if (!mounted || !_blackoutActive || _launchContentReady) return;
+    _transitionStepTimer?.cancel();
+    _transitionStepTimer = null;
+    setState(() {
+      _launchContentReady = true;
+      _setupStep = 5;
+      showMenuNotifier.value = true;
+    });
+    // 先让"接收完毕"与 100% 进度停留约 1.1s，再 1.6s 渐亮揭示正文。
+    Future<void>.delayed(const Duration(milliseconds: 1100), () {
+      if (!mounted || !_blackoutActive) return;
+      _blackoutController.animateTo(
+        0.0,
+        duration: const Duration(milliseconds: 1600),
+        curve: Curves.easeInOut,
+      ).whenComplete(() {
+        if (!mounted) return;
+        _blackoutController.removeListener(_onBlackoutTick);
+        menuRevealNotifier.value = 1.0;
+        _restoreSystemBars();
+        setState(() {
+          _blackoutActive = false;
+          _launchContentReady = false;
+        });
+      });
+    });
+  }
+
+  /// 中止"进入你的世界"动画（出错/违规/卡死时立即结束黑屏）。
   /// 取消切页计时、停止黑屏动画、恢复系统栏样式，并移除黑屏覆盖层。
   void _abortBlackoutTransition() {
     _transitionStepTimer?.cancel();
     _transitionStepTimer = null;
     _blackoutController.removeListener(_onBlackoutTick);
+    _launchContentReady = false;
     menuRevealNotifier.value = 1.0;
     if (_blackoutController.isAnimating) {
       _blackoutController.stop();
@@ -2069,31 +2336,6 @@ class _HomeContentState extends State<HomeContent>
     }
   }
 
-  /// 全黑时显示的"即将进入你创造的世界"提示文字
-  String _getEnteringWorldText() {
-    switch (StorageService.getLanguage()) {
-      case 'zh-TW':
-        return '即將進入您自己創造的、充滿了鬼命案以及愛的世界';
-      case 'yue':
-        return '即將進入您自己創造嘅、充滿咗鬼兇案同埋愛嘅世界';
-      case 'en':
-        return 'You are about to enter the world you created — a world of ghost murders and love';
-      case 'es':
-        return 'Estás a punto de entrar en el mundo que creaste, lleno de asesinatos fantasmales y amor';
-      case 'fr':
-        return "Vous êtes sur le point d'entrer dans le monde que vous avez créé, rempli de meurtres de fantômes et d'amour";
-      case 'de':
-        return 'Du bist dabei, die Welt zu betreten, die du erschaffen hast – voller Geistermorde und Liebe';
-      case 'pt':
-        return 'Você está prestes a entrar no mundo que criou, cheio de assassinatos fantasmagóricos e amor';
-      case 'ja':
-        return 'あなたが創り上げた、鬼の殺人事件と愛に満ちた世界へまもなく入ります';
-      case 'ko':
-        return '당신이 창조한 귀신 살인 사건과 사랑으로 가득한 세계로 곧 들어갑니다';
-      default:
-        return '即将进入您自己创造的、充满了鬼杀人事件以及爱的世界';
-    }
-  }
 
   /// 生成失败弹窗标题
   String _getErrorTitleText() {
@@ -2195,6 +2437,86 @@ class _HomeContentState extends State<HomeContent>
         return '위 안내에 따라 이야기를 계속하기';
       default:
         return '按照上面指引继续故事';
+    }
+  }
+
+  /// 第 1 个按钮文字（本地化）：继续生成后面情节
+  /// （无输入框；点击即以空 user_input 按下一章大纲续写）
+  String _getContinuePlotButtonText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '繼續生成後面情節';
+      case 'yue':
+        return '繼續生成後面嘅情節';
+      case 'en':
+        return 'Continue generating the following plot';
+      case 'es':
+        return 'Seguir generando la trama posterior';
+      case 'fr':
+        return 'Continuer à générer la suite de l\'intrigue';
+      case 'de':
+        return 'Die weitere Handlung weiter generieren';
+      case 'pt':
+        return 'Continuar gerando o enredo seguinte';
+      case 'ja':
+        return 'この先の筋書きを生成し続ける';
+      case 'ko':
+        return '이후 줄거리 계속 생성하기';
+      default:
+        return '继续生成后面情节';
+    }
+  }
+
+  /// 第 2 个输入框前缀（本地化）：主角想说：
+  /// 既是输入框左侧的标签，也是提交时 user_input 的前缀
+  String _getSayPrefixText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+        return '主角想說：';
+      case 'yue':
+        return '主角想講：';
+      case 'en':
+        return 'The protagonist wants to say: ';
+      case 'es':
+        return 'El protagonista quiere decir: ';
+      case 'fr':
+        return 'Le protagoniste veut dire : ';
+      case 'de':
+        return 'Der Protagonist möchte sagen: ';
+      case 'pt':
+        return 'O protagonista quer dizer: ';
+      case 'ja':
+        return '主人公が言いたいこと：';
+      case 'ko':
+        return '주인공이 하고 싶은 말: ';
+      default:
+        return '主角想说：';
+    }
+  }
+
+  /// 第 3 个输入框前缀（本地化）：主角想做：
+  /// 既是输入框左侧的标签，也是提交时 user_input 的前缀
+  String _getDoPrefixText() {
+    switch (StorageService.getLanguage()) {
+      case 'zh-TW':
+      case 'yue':
+        return '主角想做：';
+      case 'en':
+        return 'The protagonist wants to do: ';
+      case 'es':
+        return 'El protagonista quiere hacer: ';
+      case 'fr':
+        return 'Le protagoniste veut faire : ';
+      case 'de':
+        return 'Der Protagonist möchte tun: ';
+      case 'pt':
+        return 'O protagonista quer fazer: ';
+      case 'ja':
+        return '主人公がしたいこと：';
+      case 'ko':
+        return '주인공이 하고 싶은 행동: ';
+      default:
+        return '主角想做：';
     }
   }
 
@@ -3299,6 +3621,7 @@ class _HomeContentState extends State<HomeContent>
   Future<void> _showDebugPayloadDialog(
     Map<String, dynamic> payload,
     String requestId,
+    void Function() onUserConfirm,
   ) async {
     if (!mounted) return;
     debugPrint('[dialog] _showDebugPayloadDialog id=$requestId');
@@ -3335,6 +3658,11 @@ class _HomeContentState extends State<HomeContent>
           CupertinoDialogAction(
             isDefaultAction: true,
             onPressed: () async {
+              // 用户点击"确认发送"= 生成真正开始：App 先给自己补一次心跳，
+              // 把 30s 空闲计时重置为从此刻起算（此前等待/阅读 JSON 已消耗的
+              // 预算作废），随后才通知服务器放行 Dify——确保 Dify 首段静默期
+              // 不会因残留预算不足而把 App 提前误判断网。
+              onUserConfirm();
               // 通知服务器放行本次生成（服务器收到后才真正调 Dify）
               final ok = await StoryService.confirmPayload(requestId);
               debugPrint('[dialog] confirmPayload id=$requestId ok=$ok');

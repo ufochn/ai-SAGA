@@ -5,8 +5,8 @@
 功能（直接列出并编辑服务器数据库中的全部子数据库/表）：
 - 在 127.0.0.1 上启动一个只读本机的 HTTP 服务（绑定回环地址，外网无法访问；
   并对请求做 Host / Origin 本地校验，防止 DNS 重绑定 / 跨站请求）。
-- 通过 SSH（复用 ~/.ssh/ai_saga_deploy，与 deploy_helper.sh 相同）进入服务器上的
-  Docker 容器，用容器内的 python3+sqlite3 读取 / 写入数据库。
+- 通过 SSH（密钥路径由环境变量 AI_SAGA_SSH_KEY 指定，默认取标准占位）进入服务器上的
+  Docker 容器（容器名由 AI_SAGA_CONTAINER 指定），用容器内 python3+sqlite3 读写数据库。
 - 浏览器打开 http://127.0.0.1:<port> 即可看到顶部「子数据库切换按钮」：
   点击任意按钮，以类似 Excel 的表格展示该表全部数据；每一行都配「保存本行」
   按钮，改完点它即可把本行所有改动格子写回数据库对应行。
@@ -60,8 +60,9 @@ if not HOST:
 if not HOST:
     HOST = "YOUR_SERVER_IP"
 USER = os.environ.get("AI_SAGA_USER", "root")
-KEY = os.environ.get("AI_SAGA_SSH_KEY", os.path.expanduser("~/.ssh/ai_saga_deploy"))
-CONTAINER = os.environ.get("AI_SAGA_CONTAINER", "my-audit-app")
+# 运维标识（密钥文件名 / 容器名）不写死在仓库：默认使用中性占位，实际值一律走环境变量。
+KEY = os.environ.get("AI_SAGA_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
+CONTAINER = os.environ.get("AI_SAGA_CONTAINER", "your-container-name")
 DB_PATH = os.environ.get("AI_SAGA_DB_PATH", "/code/data/ai_saga.db")
 TABLE = os.environ.get("AI_SAGA_TABLE", "story_segments")   # 默认/初始选中的表（小说正文核心表）
 MAX_ROWS = int(os.environ.get("AI_SAGA_MAX_ROWS", "2000"))   # 单表一次最多显示行数（防浏览器卡死）

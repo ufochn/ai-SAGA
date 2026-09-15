@@ -16,6 +16,23 @@ int weightedCharCount(String text) {
 /// 特质输入是否超过字数上限（宽字符=3、窄字符=1，全部累加不超过 150）。
 bool isTraitsOverLimit(String text) => weightedCharCount(text) > 150;
 
+/// 正文底部"主角想说 / 主角想做"输入框的字数上限判定：
+/// 宽字符（汉字/日文/韩文/全角符号）不超过 50 个，
+/// 窄字符（拉丁字母/数字/半角标点）不超过 200 个；
+/// 任一项超出即视为超限（与别处一致：不截断输入，仅文字变红 + 按钮置灰禁用）。
+bool isStoryInputOverLimit(String text) {
+  var wide = 0;
+  var narrow = 0;
+  for (final rune in text.runes) {
+    if (isWideChar(rune)) {
+      wide++;
+    } else {
+      narrow++;
+    }
+  }
+  return wide > 50 || narrow > 200;
+}
+
 /// 是否为宽字符（一个汉字/日文/韩文 ≈ 两个英文字母的宽度）。
 bool isWideChar(int r) {
   if (r >= 0x1100 && r <= 0x11FF) return true; // 谚文字母
